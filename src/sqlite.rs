@@ -3,6 +3,7 @@ use crate::provider::{
     is_terminal, DequeueRequest, ListFilter, StateProvider, WorkflowStatus, STATUS_CANCELLED,
     STATUS_DELAYED, STATUS_ENQUEUED, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
 };
+use crate::serialize::{self, Serializer};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -14,7 +15,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      application_version, queue_name, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
-     created_at, updated_at";
+     serialization, created_at, updated_at";
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -24,6 +25,9 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
 /// restarts; `sqlite::memory:` is handy for tests within a single process.
 pub struct SqliteProvider {
     pool: SqlitePool,
+    /// Format used when *encoding* stored values; decoding follows each row's
+    /// recorded format. See [`crate::Serializer`].
+    serializer: Serializer,
 }
 
 impl SqliteProvider {
@@ -38,12 +42,21 @@ impl SqliteProvider {
             .max_connections(5)
             .connect_with(opts)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     /// Build a provider from an existing pool.
     pub fn from_pool(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            serializer: Serializer::default(),
+        }
+    }
+
+    /// Choose the format new values are encoded with (see [`crate::Serializer`]).
+    pub fn with_serializer(mut self, serializer: Serializer) -> Self {
+        self.serializer = serializer;
+        self
     }
 }
 
@@ -51,17 +64,20 @@ fn ms_to_dt(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
 }
 
-fn parse_opt(s: Option<String>) -> Option<Value> {
-    s.and_then(|t| serde_json::from_str(&t).ok())
-}
-
 fn row_to_status(row: &sqlx::sqlite::SqliteRow) -> WorkflowStatus {
+    let fmt: Option<String> = row.try_get("serialization").ok().flatten();
+    let fmt = fmt.as_deref();
+    let inputs: Option<String> = row.try_get("inputs").ok().flatten();
+    let output: Option<String> = row.try_get("output").ok().flatten();
     WorkflowStatus {
         id: row.get("workflow_uuid"),
         name: row.get("name"),
         status: row.get("status"),
-        input: parse_opt(row.try_get("inputs").ok().flatten()).unwrap_or(Value::Null),
-        output: parse_opt(row.try_get("output").ok().flatten()),
+        input: serialize::decode_opt(fmt, inputs.as_deref())
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Null),
+        output: serialize::decode_opt(fmt, output.as_deref()).ok().flatten(),
         error: row.try_get("error").ok().flatten(),
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
@@ -97,13 +113,13 @@ impl StateProvider for SqliteProvider {
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
-                  created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  serialization, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
         .bind(&s.name)
-        .bind(serde_json::to_string(&s.input)?)
+        .bind(self.serializer.encode(&s.input)?)
         .bind(&s.status)
         .bind(&s.executor_id)
         .bind(&s.app_version)
@@ -114,6 +130,7 @@ impl StateProvider for SqliteProvider {
         .bind(s.timeout_ms)
         .bind(s.deadline_ms)
         .bind(s.delay_until_ms)
+        .bind(self.serializer.name())
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
         .execute(&self.pool)
@@ -145,7 +162,7 @@ impl StateProvider for SqliteProvider {
         output: Option<&Value>,
         error: Option<&str>,
     ) -> Result<()> {
-        let output_str = output.map(serde_json::to_string).transpose()?;
+        let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
         let now = Utc::now().timestamp_millis();
         let completed = is_terminal(status).then_some(now);
         sqlx::query(
@@ -170,13 +187,20 @@ impl StateProvider for SqliteProvider {
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<Value>> {
         let row = sqlx::query(
-            "SELECT output FROM operation_outputs WHERE workflow_uuid = ? AND function_id = ?",
+            "SELECT output, serialization FROM operation_outputs
+             WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
         .bind(seq)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|r| parse_opt(r.get::<Option<String>, _>("output"))))
+        match row {
+            Some(r) => serialize::decode_opt(
+                r.get::<Option<String>, _>("serialization").as_deref(),
+                r.get::<Option<String>, _>("output").as_deref(),
+            ),
+            None => Ok(None),
+        }
     }
 
     async fn record_step_result(
@@ -187,25 +211,32 @@ impl StateProvider for SqliteProvider {
         value: Value,
     ) -> Result<Value> {
         sqlx::query(
-            "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name, output)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
         .bind(workflow_id)
         .bind(seq)
         .bind(name)
-        .bind(serde_json::to_string(&value)?)
+        .bind(self.serializer.encode(&value)?)
+        .bind(self.serializer.name())
         .execute(&self.pool)
         .await?;
 
         let row = sqlx::query(
-            "SELECT output FROM operation_outputs WHERE workflow_uuid = ? AND function_id = ?",
+            "SELECT output, serialization FROM operation_outputs
+             WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
         .bind(seq)
         .fetch_one(&self.pool)
         .await?;
-        Ok(parse_opt(row.get::<Option<String>, _>("output")).unwrap_or(Value::Null))
+        Ok(serialize::decode_opt(
+            row.get::<Option<String>, _>("serialization").as_deref(),
+            row.get::<Option<String>, _>("output").as_deref(),
+        )?
+        .unwrap_or(Value::Null))
     }
 
     async fn dequeue_workflows(&self, req: &DequeueRequest) -> Result<Vec<WorkflowStatus>> {
@@ -319,13 +350,14 @@ impl StateProvider for SqliteProvider {
         // The FK on destination_uuid rejects sends to nonexistent workflows.
         sqlx::query(
             "INSERT INTO notifications
-                 (message_uuid, destination_uuid, topic, message, created_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?)",
+                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(destination_id)
         .bind(topic)
-        .bind(serde_json::to_string(&message)?)
+        .bind(self.serializer.encode(&message)?)
+        .bind(self.serializer.name())
         .bind(Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
@@ -343,7 +375,7 @@ impl StateProvider for SqliteProvider {
         // otherwise lose the message.
         let mut tx = self.pool.begin().await?;
 
-        let claimed: Option<String> = sqlx::query_scalar(
+        let claimed: Option<(String, Option<String>)> = sqlx::query_as(
             "UPDATE notifications SET consumed = TRUE
              WHERE message_uuid = (
                  SELECT message_uuid FROM notifications
@@ -351,55 +383,65 @@ impl StateProvider for SqliteProvider {
                  ORDER BY created_at_epoch_ms ASC
                  LIMIT 1
              )
-             RETURNING message",
+             RETURNING message, serialization",
         )
         .bind(workflow_id)
         .bind(topic)
         .fetch_optional(&mut *tx)
         .await?;
 
-        let Some(message) = claimed else {
+        let Some((message, fmt)) = claimed else {
             return Ok(None);
         };
 
+        // Checkpoint the consumed message verbatim, keeping its format so a
+        // replay decodes it the same way.
         sqlx::query(
-            "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name, output)
-             VALUES (?, ?, ?, ?)
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization)
+             VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
         .bind(workflow_id)
         .bind(seq)
         .bind(step_name)
         .bind(&message)
+        .bind(&fmt)
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
-        Ok(serde_json::from_str(&message).ok())
+        Ok(Some(serialize::decode(fmt.as_deref(), &message)?))
     }
 
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
         sqlx::query(
-            "INSERT INTO workflow_events (workflow_uuid, key, value) VALUES (?, ?, ?)
-             ON CONFLICT (workflow_uuid, key) DO UPDATE SET value = excluded.value",
+            "INSERT INTO workflow_events (workflow_uuid, key, value, serialization)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT (workflow_uuid, key)
+             DO UPDATE SET value = excluded.value, serialization = excluded.serialization",
         )
         .bind(workflow_id)
         .bind(key)
-        .bind(serde_json::to_string(&value)?)
+        .bind(self.serializer.encode(&value)?)
+        .bind(self.serializer.name())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>> {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT value FROM workflow_events WHERE workflow_uuid = ? AND key = ?",
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT value, serialization FROM workflow_events WHERE workflow_uuid = ? AND key = ?",
         )
         .bind(workflow_id)
         .bind(key)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|v| serde_json::from_str(&v).ok()))
+        match row {
+            Some((value, fmt)) => Ok(Some(serialize::decode(fmt.as_deref(), &value)?)),
+            None => Ok(None),
+        }
     }
 
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
@@ -472,9 +514,9 @@ impl StateProvider for SqliteProvider {
 
         let inserted = sqlx::query(
             "INSERT INTO workflow_status
-                 (workflow_uuid, status, name, inputs, executor_id, application_version,
-                  forked_from, recovery_attempts, created_at, updated_at)
-             SELECT ?, ?, name, inputs, '', ?, ?, 0, ?, ?
+                 (workflow_uuid, status, name, inputs, serialization, executor_id,
+                  application_version, forked_from, recovery_attempts, created_at, updated_at)
+             SELECT ?, ?, name, inputs, serialization, '', ?, ?, 0, ?, ?
              FROM workflow_status WHERE workflow_uuid = ?",
         )
         .bind(new_id)
@@ -500,8 +542,10 @@ impl StateProvider for SqliteProvider {
         if start_step > 0 {
             sqlx::query(
                 "INSERT INTO operation_outputs
-                     (workflow_uuid, function_id, function_name, output, error, child_workflow_id)
-                 SELECT ?, function_id, function_name, output, error, child_workflow_id
+                     (workflow_uuid, function_id, function_name, output, error,
+                      child_workflow_id, serialization)
+                 SELECT ?, function_id, function_name, output, error,
+                        child_workflow_id, serialization
                  FROM operation_outputs WHERE workflow_uuid = ? AND function_id < ?",
             )
             .bind(new_id)
