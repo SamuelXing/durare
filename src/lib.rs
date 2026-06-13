@@ -42,6 +42,7 @@ mod memory;
 mod postgres;
 mod provider;
 mod queue;
+mod serialize;
 mod sqlite;
 
 pub use context::{DurableContext, StepOptions};
@@ -56,6 +57,7 @@ pub use provider::{
     STATUS_PENDING, STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
+pub use serialize::Serializer;
 pub use sqlite::SqliteProvider;
 
 /// The `#[workflow]` attribute macro — the Rust analog of `@DBOS.workflow()`.

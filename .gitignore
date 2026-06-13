@@ -2,3 +2,5 @@
 Cargo.lock
 **/*.rs.bk
 .env
+# Internal Go-parity development tracker; not for the public repo.
+/PARITY.md
