@@ -3,7 +3,7 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
-    STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -108,5 +108,30 @@ async fn launch_and_shutdown_drain() -> Result<()> {
     let out = handle.get_result().await?;
     assert_eq!(out, 2);
     engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A workflow that runs past its timeout is cancelled: get_result fails and the
+/// status row is CANCELLED with a deadline-exceeded reason.
+#[tokio::test]
+async fn workflow_timeout_cancels() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("slow", |ctx: DurableContext, _: ()| async move {
+        ctx.step("long", || async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Ok::<_, Error>(1_i64)
+        })
+        .await
+    });
+
+    let mut opts = WorkflowOptions::with_id("wf-timeout");
+    opts.timeout = Some(Duration::from_millis(80));
+    let mut handle = engine.run_workflow::<_, i64>("slow", (), opts).await?;
+
+    assert!(
+        handle.get_result().await.is_err(),
+        "a workflow exceeding its timeout must not succeed"
+    );
+    assert_eq!(handle.get_status().await?.status, STATUS_CANCELLED);
     Ok(())
 }

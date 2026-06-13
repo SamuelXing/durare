@@ -57,6 +57,9 @@ pub struct WorkflowRegistration {
     pub name: &'static str,
     /// Builds the type-erased handler. Typically `|| durust::erase(my_fn)`.
     pub builder: fn() -> WorkflowFn,
+    /// A cron spec (6-field, second precision) if this is a scheduled workflow;
+    /// emitted by `#[workflow(schedule = "...")]`. `None` otherwise.
+    pub schedule: Option<&'static str>,
 }
 
 inventory::collect!(WorkflowRegistration);
@@ -64,8 +67,8 @@ inventory::collect!(WorkflowRegistration);
 /// Per-workflow start options — the Rust analog of Go's `WithWorkflowID`,
 /// `WithDeduplicationID`, `WithQueue`, `WithPriority`, `WithTimeout`.
 ///
-/// `timeout` is persisted (and the deadline fixed when the workflow starts),
-/// but deadline *enforcement* is not implemented yet.
+/// `timeout` fixes a deadline when the workflow starts (at claim time for
+/// queued workflows); a run that overruns it is cancelled.
 #[derive(Clone, Default)]
 pub struct WorkflowOptions {
     /// Explicit idempotency key. If `None`, a uuid is generated.
@@ -103,6 +106,9 @@ pub struct DurableEngine {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
     queues: HashMap<String, Arc<WorkflowQueue>>,
+    /// `(workflow_name, cron_spec)` for `#[workflow(schedule = …)]` workflows;
+    /// each gets a scheduler task in [`launch`](Self::launch).
+    scheduled: Vec<(String, String)>,
     executor_id: String,
     app_version: String,
     /// Recovery re-dispatches beyond this count park the workflow in
@@ -134,13 +140,18 @@ impl DurableEngine {
     ) -> Result<Self> {
         provider.init().await?;
         let mut workflows = HashMap::new();
+        let mut scheduled = Vec::new();
         for reg in inventory::iter::<WorkflowRegistration> {
             workflows.insert(reg.name.to_string(), (reg.builder)());
+            if let Some(spec) = reg.schedule {
+                scheduled.push((reg.name.to_string(), spec.to_string()));
+            }
         }
         Ok(Self {
             provider,
             workflows,
             queues: HashMap::new(),
+            scheduled,
             executor_id: uuid::Uuid::new_v4().to_string(),
             app_version: app_version.into(),
             max_recovery_attempts: 100,
@@ -180,21 +191,36 @@ impl DurableEngine {
         self.queues.insert(queue.name.clone(), Arc::new(queue));
     }
 
-    /// Start background processing: one dispatcher task per registered queue.
-    /// (The cron scheduler and deadline sweeps will also hook in here once
-    /// implemented.) Call once per launch; safe to call again after `shutdown`.
+    /// Start background processing: one dispatcher task per registered queue and
+    /// one scheduler task per `#[workflow(schedule = …)]` workflow. Workflow
+    /// timeouts are enforced inline per run, so they need no separate sweep. Call
+    /// once per launch; safe to call again after `shutdown`.
     pub async fn launch(&self) -> Result<()> {
         self.shutting_down.store(false, Ordering::SeqCst);
-        let mut dispatchers = self.dispatchers.lock().expect("dispatcher lock poisoned");
+        let bg = Background {
+            provider: self.provider.clone(),
+            executor_id: self.executor_id.clone(),
+            app_version: self.app_version.clone(),
+            shutting_down: self.shutting_down.clone(),
+            inflight: self.inflight.clone(),
+        };
+        let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
-            dispatchers.push(tokio::spawn(queue_dispatch_loop(
+            tasks.push(tokio::spawn(queue_dispatch_loop(
                 queue.clone(),
-                self.provider.clone(),
                 self.workflows.clone(),
-                self.executor_id.clone(),
-                self.app_version.clone(),
-                self.shutting_down.clone(),
-                self.inflight.clone(),
+                bg.clone(),
+            )));
+        }
+        for (name, spec) in &self.scheduled {
+            let Some(handler) = self.workflows.get(name).cloned() else {
+                continue;
+            };
+            tasks.push(tokio::spawn(schedule_loop(
+                name.clone(),
+                spec.clone(),
+                handler,
+                bg.clone(),
             )));
         }
         Ok(())
@@ -302,19 +328,25 @@ impl DurableEngine {
             return Ok(WorkflowHandle::polling(id, self.provider.clone()));
         }
 
-        Ok(self.spawn_local(id, handler, canonical.input))
+        Ok(self.spawn_local(id, handler, canonical.input, canonical.deadline_ms))
     }
 
     /// Spawn a workflow run on a task and return a handle owning it. Each task
     /// holds a drain guard so [`shutdown`](Self::shutdown) can wait it out.
-    fn spawn_local<O>(&self, id: String, handler: WorkflowFn, input: Value) -> WorkflowHandle<O> {
+    fn spawn_local<O>(
+        &self,
+        id: String,
+        handler: WorkflowFn,
+        input: Value,
+        deadline_ms: Option<i64>,
+    ) -> WorkflowHandle<O> {
         let provider = self.provider.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         let task_id = id.clone();
         let join = tokio::spawn(async move {
             let _guard = InflightGuard(inflight);
-            run_to_completion(handler, provider, task_id, input).await
+            run_to_completion(handler, provider, task_id, input, deadline_ms).await
         });
         WorkflowHandle::local(id, self.provider.clone(), join)
     }
@@ -450,7 +482,7 @@ impl DurableEngine {
             .get(&row.name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-        Ok(self.spawn_local(id.to_string(), handler, row.input))
+        Ok(self.spawn_local(id.to_string(), handler, row.input, row.deadline_ms))
     }
 
     /// Fork a workflow from `start_step` — the Rust analog of Go's
@@ -480,7 +512,7 @@ impl DurableEngine {
             .get(&row.name)
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-        Ok(self.spawn_local(new_id, handler, row.input))
+        Ok(self.spawn_local(new_id, handler, row.input, row.deadline_ms))
     }
 
     /// Re-run every incomplete workflow of this engine's application version,
@@ -531,6 +563,7 @@ impl DurableEngine {
                     self.provider.clone(),
                     record.id.clone(),
                     record.input.clone(),
+                    record.deadline_ms,
                 )
                 .await;
                 resumed += 1;
@@ -544,6 +577,17 @@ impl DurableEngine {
         }
         Ok(resumed)
     }
+}
+
+/// Shared context handed to the background loops (queue dispatch, scheduler):
+/// the state backend, this process's identity, and the lifecycle signals.
+#[derive(Clone)]
+struct Background {
+    provider: Arc<dyn StateProvider>,
+    executor_id: String,
+    app_version: String,
+    shutting_down: Arc<AtomicBool>,
+    inflight: Arc<AtomicUsize>,
 }
 
 /// Decrements the in-flight counter when a workflow task ends (even on panic).
@@ -564,13 +608,16 @@ impl Drop for InflightGuard {
 /// base on success, and is jittered so multiple executors don't poll in step.
 async fn queue_dispatch_loop(
     queue: Arc<WorkflowQueue>,
-    provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
-    executor_id: String,
-    app_version: String,
-    shutting_down: Arc<AtomicBool>,
-    inflight: Arc<AtomicUsize>,
+    bg: Background,
 ) {
+    let Background {
+        provider,
+        executor_id,
+        app_version,
+        shutting_down,
+        inflight,
+    } = bg;
     let local_running = Arc::new(AtomicUsize::new(0));
     let mut interval = queue.base_polling_interval;
 
@@ -628,7 +675,14 @@ async fn queue_dispatch_loop(
                             let _local = local_guard;
                             // Terminal state is recorded by run_to_completion;
                             // a handle observing this workflow polls it.
-                            let _ = run_to_completion(handler, provider, wf.id, wf.input).await;
+                            let _ = run_to_completion(
+                                handler,
+                                provider,
+                                wf.id,
+                                wf.input,
+                                wf.deadline_ms,
+                            )
+                            .await;
                         });
                     }
                 }
@@ -663,9 +717,31 @@ async fn run_to_completion(
     provider: Arc<dyn StateProvider>,
     id: String,
     input: Value,
+    deadline_ms: Option<i64>,
 ) -> Result<Value> {
     let ctx = DurableContext::new(id.clone(), provider.clone());
-    match handler(ctx, input).await {
+    let run = handler(ctx, input);
+
+    // Enforce a workflow deadline if one was set: when it elapses, the run
+    // future is dropped (cancelled at its next await) and the workflow is
+    // marked CANCELLED, mirroring Go's deadline-driven cancellation.
+    let result = match deadline_ms {
+        Some(dl) => {
+            let remaining = (dl - chrono::Utc::now().timestamp_millis()).max(0) as u64;
+            match tokio::time::timeout(Duration::from_millis(remaining), run).await {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    provider
+                        .set_workflow_status(&id, STATUS_CANCELLED, None, Some("deadline exceeded"))
+                        .await?;
+                    return Err(Error::Timeout);
+                }
+            }
+        }
+        None => run.await,
+    };
+
+    match result {
         Ok(output) => {
             provider
                 .set_workflow_status(&id, STATUS_SUCCESS, Some(&output), None)
@@ -685,6 +761,88 @@ async fn run_to_completion(
                 .set_workflow_status(&id, STATUS_ERROR, None, Some(&e.to_string()))
                 .await?;
             Err(e)
+        }
+    }
+}
+
+/// Per-schedule cron loop: at each tick, start the workflow under a
+/// deterministic id derived from the tick time, so the run happens exactly once
+/// even across multiple executors (the idempotent status insert is the
+/// arbiter). Mirrors the Go SDK's `sched-{name}-{time}` scheme.
+async fn schedule_loop(name: String, spec: String, handler: WorkflowFn, bg: Background) {
+    let Background {
+        provider,
+        executor_id,
+        app_version,
+        shutting_down,
+        inflight,
+    } = bg;
+    use std::str::FromStr;
+    let schedule = match cron::Schedule::from_str(&spec) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                workflow = %name, schedule = %spec, error = %e,
+                "invalid cron schedule; scheduler not started for this workflow"
+            );
+            return;
+        }
+    };
+
+    loop {
+        if shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(next) = schedule.after(&chrono::Utc::now()).next() else {
+            return;
+        };
+        let wait = (next - chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        tokio::time::sleep(wait).await;
+        if shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // Deterministic per-tick id; the scheduled time is the workflow input.
+        let wf_id = format!("sched-{name}-{}", next.to_rfc3339());
+        let input = Value::String(next.to_rfc3339());
+        let mut row = WorkflowStatus::new(
+            &wf_id,
+            &name,
+            input,
+            STATUS_PENDING,
+            &executor_id,
+            &app_version,
+        );
+        row.started_at_ms = Some(chrono::Utc::now().timestamp_millis());
+
+        match provider.insert_workflow_status(row).await {
+            Ok(canonical) => {
+                // We run the tick only if our insert created the row (its
+                // executor_id is ours) and it is not already finished. A
+                // different executor that won the insert runs it instead.
+                if canonical.executor_id == executor_id && !is_terminal(&canonical.status) {
+                    inflight.fetch_add(1, Ordering::SeqCst);
+                    let provider = provider.clone();
+                    let handler = handler.clone();
+                    let guard = InflightGuard(inflight.clone());
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        let _ = run_to_completion(
+                            handler,
+                            provider,
+                            wf_id,
+                            canonical.input,
+                            canonical.deadline_ms,
+                        )
+                        .await;
+                    });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(workflow = %name, error = %e, "failed to persist scheduled tick");
+            }
         }
     }
 }
