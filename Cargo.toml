@@ -22,6 +22,9 @@ sqlx = { version = "0.7", features = ["runtime-tokio", "tls-rustls", "postgres",
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+# Failpoints for the `order` example's crash-recovery demo. The `failpoints`
+# feature makes `fail_point!` active; it is compiled out otherwise.
+fail = { version = "0.5", features = ["failpoints"] }
 
 [[example]]
 name = "order"

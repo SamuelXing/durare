@@ -1,13 +1,15 @@
 //! Order-processing demo: charge → ship → email, with durable checkpoints.
 //!
-//! Run it twice to see crash recovery (requires Postgres so state survives a
-//! process restart):
+//! Run it twice to see crash recovery. State must survive a process restart, so
+//! use a persistent backend (Postgres here; SQLite works too). The crash is
+//! injected with a [fail-rs](https://github.com/tikv/fail-rs) failpoint named
+//! `after_charge`:
 //!
 //! ```text
 //! export DATABASE_URL=postgres://localhost:5432/durust
 //!
-//! # Run 1: crashes right after charging the card.
-//! CRASH_AFTER_CHARGE=1 cargo run --example order
+//! # Run 1: the `after_charge` failpoint exits the process right after charging.
+//! FAILPOINTS=after_charge=return cargo run --example order
 //!
 //! # Run 2: recover() resumes the same workflow. Notice the card is NOT
 //! # charged again — the charge step is served from its checkpoint.
@@ -50,11 +52,13 @@ async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
         .await?;
     println!("  charge_id = {charge_id}");
 
-    // Simulate a hard crash between steps.
-    if std::env::var("CRASH_AFTER_CHARGE").is_ok() {
-        println!("  !! simulating crash after charge — exiting");
+    // Simulate a hard crash between steps via a failpoint. Activate it with
+    // `FAILPOINTS=after_charge=return` (see the module docs); otherwise this is
+    // a no-op and the workflow runs straight through.
+    fail::fail_point!("after_charge", |_| {
+        println!("  !! failpoint `after_charge` fired — crashing after charge");
         std::process::exit(1);
-    }
+    });
 
     // STEP 2
     let shipment_id = ctx
@@ -80,6 +84,9 @@ async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Read the FAILPOINTS env var so the `after_charge` failpoint can be armed.
+    let _failpoints = fail::FailScenario::setup();
+
     // Pick a backend: Postgres if DATABASE_URL is set, else in-memory.
     let provider: Arc<dyn StateProvider> = match std::env::var("DATABASE_URL") {
         Ok(url) => {
