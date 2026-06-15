@@ -98,7 +98,7 @@ async fn sqlite_patch_is_durable_across_replay() -> Result<()> {
             let patched = ctx.patch("feat").await?;
             let v = ctx
                 .step("work", || async {
-                    WORK_RUNS.fetch_add(1, Ordering::SeqCst);
+                    WORK_RUNS.fetch_add(1, Ordering::Relaxed);
                     Ok::<_, Error>(10_i64)
                 })
                 .await?;
@@ -118,7 +118,7 @@ async fn sqlite_patch_is_durable_across_replay() -> Result<()> {
     }
 
     assert_eq!(
-        WORK_RUNS.load(Ordering::SeqCst),
+        WORK_RUNS.load(Ordering::Relaxed),
         1,
         "the post-patch step runs exactly once across the replay"
     );
@@ -142,7 +142,7 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
             let _ = ctx.patch("feat").await?;
             let v = ctx
                 .step("work", || async {
-                    WORK_RUNS.fetch_add(1, Ordering::SeqCst);
+                    WORK_RUNS.fetch_add(1, Ordering::Relaxed);
                     Ok::<_, Error>(5_i64)
                 })
                 .await?;
@@ -160,7 +160,7 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
             ctx.deprecate_patch("feat").await?;
             let v = ctx
                 .step("work", || async {
-                    WORK_RUNS.fetch_add(1, Ordering::SeqCst);
+                    WORK_RUNS.fetch_add(1, Ordering::Relaxed);
                     Ok::<_, Error>(5_i64)
                 })
                 .await?;
@@ -171,7 +171,7 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
     }
 
     assert_eq!(
-        WORK_RUNS.load(Ordering::SeqCst),
+        WORK_RUNS.load(Ordering::Relaxed),
         1,
         "work runs once: deprecate_patch consumed the marker slot, keeping seq aligned"
     );
