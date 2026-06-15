@@ -155,14 +155,14 @@ impl DurableContext {
     }
 
     fn next_seq(&self) -> i32 {
-        self.seq.fetch_add(1, Ordering::SeqCst)
+        self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The current step index — the `seq` the next durable operation will use,
     /// i.e. how many durable operations (steps, sleeps, sends, child workflows)
     /// this execution has performed so far.
     pub fn current_step_id(&self) -> i32 {
-        self.seq.load(Ordering::SeqCst)
+        self.seq.load(Ordering::Relaxed)
     }
 
     /// Start a **child workflow** from within this workflow and return a handle
