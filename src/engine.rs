@@ -249,7 +249,7 @@ impl DurableEngine {
     /// timeouts are enforced inline per run, so they need no separate sweep. Call
     /// once per launch; safe to call again after `shutdown`.
     pub async fn launch(&self) -> Result<()> {
-        self.shutting_down.store(false, Ordering::SeqCst);
+        self.shutting_down.store(false, Ordering::Relaxed);
         let rt = self.runtime();
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
@@ -277,7 +277,7 @@ impl DurableEngine {
     /// Stop the queue dispatchers and wait for in-flight workflow tasks started
     /// here to drain (up to `timeout`).
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
-        self.shutting_down.store(true, Ordering::SeqCst);
+        self.shutting_down.store(true, Ordering::Relaxed);
         // Stop claiming new work first, then drain what is already running. An
         // aborted dispatcher can leave a freshly claimed workflow PENDING; the
         // next launch's recover() re-runs it from its checkpoints.
@@ -290,7 +290,7 @@ impl DurableEngine {
             d.abort();
         }
         let deadline = std::time::Instant::now() + timeout;
-        while self.inflight.load(Ordering::SeqCst) > 0 {
+        while self.inflight.load(Ordering::Acquire) > 0 {
             if std::time::Instant::now() >= deadline {
                 break;
             }
@@ -690,7 +690,7 @@ impl Runtime {
         auth: AuthContext,
     ) -> JoinHandle<Result<Value>> {
         let rt = self.clone();
-        self.inflight.fetch_add(1, Ordering::SeqCst);
+        self.inflight.fetch_add(1, Ordering::Relaxed);
         let guard = InflightGuard(self.inflight.clone());
         tokio::spawn(async move {
             let _guard = guard;
@@ -751,7 +751,7 @@ impl Runtime {
 struct InflightGuard(Arc<AtomicUsize>);
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -776,7 +776,7 @@ async fn queue_dispatch_loop(
     let mut interval = queue.base_polling_interval;
 
     loop {
-        if shutting_down.load(Ordering::SeqCst) {
+        if shutting_down.load(Ordering::Relaxed) {
             return;
         }
 
@@ -787,7 +787,7 @@ async fn queue_dispatch_loop(
 
         // Worker concurrency is enforced here, against this process's running
         // count; the DB-side checks handle the cross-executor limits.
-        let local = local_running.load(Ordering::SeqCst);
+        let local = local_running.load(Ordering::Relaxed);
         let max_tasks = (match queue.worker_concurrency {
             Some(wc) => wc.saturating_sub(local),
             None => queue.max_tasks_per_iteration,
@@ -819,8 +819,8 @@ async fn queue_dispatch_loop(
                             );
                             continue;
                         };
-                        inflight.fetch_add(1, Ordering::SeqCst);
-                        local_running.fetch_add(1, Ordering::SeqCst);
+                        inflight.fetch_add(1, Ordering::Relaxed);
+                        local_running.fetch_add(1, Ordering::Relaxed);
                         let rt = rt.clone();
                         let inflight_guard = InflightGuard(inflight.clone());
                         let local_guard = InflightGuard(local_running.clone());
@@ -952,7 +952,7 @@ async fn schedule_loop(
     };
 
     loop {
-        if shutting_down.load(Ordering::SeqCst) {
+        if shutting_down.load(Ordering::Relaxed) {
             return;
         }
         let Some(next) = schedule.after(&chrono::Utc::now()).next() else {
@@ -962,7 +962,7 @@ async fn schedule_loop(
             .to_std()
             .unwrap_or(Duration::ZERO);
         tokio::time::sleep(wait).await;
-        if shutting_down.load(Ordering::SeqCst) {
+        if shutting_down.load(Ordering::Relaxed) {
             return;
         }
 
@@ -985,7 +985,7 @@ async fn schedule_loop(
                 // executor_id is ours) and it is not already finished. A
                 // different executor that won the insert runs it instead.
                 if canonical.executor_id == executor_id && !is_terminal(&canonical.status) {
-                    inflight.fetch_add(1, Ordering::SeqCst);
+                    inflight.fetch_add(1, Ordering::Relaxed);
                     let rt = rt.clone();
                     let handler = handler.clone();
                     let guard = InflightGuard(inflight.clone());
