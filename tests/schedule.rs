@@ -55,3 +55,37 @@ async fn cron_fires_once_per_tick_across_executors() -> Result<()> {
     assert!(rows.iter().all(|r| r.id.starts_with("sched-cron_tick-")));
     Ok(())
 }
+
+/// The registry lists both auto- and manually-registered workflows (sorted, with
+/// schedules surfaced), and the scheduled-only view drops the unscheduled ones.
+#[tokio::test]
+async fn lists_registered_and_scheduled_workflows() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("manual_noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, durust::Error>(())
+    });
+
+    let all = engine.list_registered_workflows();
+    // The manual workflow is present and unscheduled.
+    assert!(all
+        .iter()
+        .any(|w| w.name == "manual_noop" && w.cron_schedule.is_none()));
+    // The auto-registered cron workflow carries its schedule.
+    let tick = all
+        .iter()
+        .find(|w| w.name == "cron_tick")
+        .expect("cron_tick is auto-registered in this binary");
+    assert_eq!(tick.cron_schedule.as_deref(), Some("* * * * * *"));
+    // Sorted by name.
+    let names: Vec<&str> = all.iter().map(|w| w.name.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+
+    // Scheduled-only keeps cron_tick, drops manual_noop.
+    let scheduled = engine.list_scheduled_workflows();
+    assert!(scheduled.iter().all(|w| w.cron_schedule.is_some()));
+    assert!(scheduled.iter().any(|w| w.name == "cron_tick"));
+    assert!(!scheduled.iter().any(|w| w.name == "manual_noop"));
+    Ok(())
+}
