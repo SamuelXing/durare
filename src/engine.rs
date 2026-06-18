@@ -69,6 +69,18 @@ pub struct WorkflowRegistration {
 
 inventory::collect!(WorkflowRegistration);
 
+/// A workflow registered on a [`DurableEngine`], as reported by
+/// [`DurableEngine::list_registered_workflows`]. The `name` is the identifier
+/// the workflow is registered and persisted under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredWorkflow {
+    /// The name the workflow is registered under.
+    pub name: String,
+    /// The cron schedule (6-field, second precision) for a
+    /// `#[workflow(schedule = "...")]` workflow; `None` for an unscheduled one.
+    pub cron_schedule: Option<String>,
+}
+
 /// Per-workflow start options.
 ///
 /// `timeout` fixes a deadline when the workflow starts (at claim time for
@@ -283,6 +295,36 @@ impl DurableEngine {
         let mut queues: Vec<WorkflowQueue> = self.queues.values().map(|q| (**q).clone()).collect();
         queues.sort_by(|a, b| a.name.cmp(&b.name));
         queues
+    }
+
+    /// All workflows registered on this engine — both `#[durust::workflow]`
+    /// auto-registrations and manual [`register`](Self::register) calls — sorted
+    /// by name. Each entry carries its cron schedule if it is a scheduled
+    /// workflow.
+    pub fn list_registered_workflows(&self) -> Vec<RegisteredWorkflow> {
+        let schedules: HashMap<&str, &str> = self
+            .scheduled
+            .iter()
+            .map(|(name, spec)| (name.as_str(), spec.as_str()))
+            .collect();
+        let mut out: Vec<RegisteredWorkflow> = self
+            .workflows
+            .keys()
+            .map(|name| RegisteredWorkflow {
+                name: name.clone(),
+                cron_schedule: schedules.get(name.as_str()).map(|s| s.to_string()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// The subset of [`list_registered_workflows`](Self::list_registered_workflows)
+    /// that are scheduled (have a cron schedule), sorted by name.
+    pub fn list_scheduled_workflows(&self) -> Vec<RegisteredWorkflow> {
+        let mut out = self.list_registered_workflows();
+        out.retain(|w| w.cron_schedule.is_some());
+        out
     }
 
     /// Start background processing: one dispatcher task per registered queue and
