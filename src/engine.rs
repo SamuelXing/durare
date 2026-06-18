@@ -1459,6 +1459,13 @@ async fn schedule_fire_loop(
             .await
         {
             Ok((canonical, queued)) => {
+                // Test hook: simulate an abrupt failure of the scheduling
+                // process right after the tick is persisted but before it runs
+                // (and before `last_fired_at` is stamped). Recovery must then
+                // complete the orphaned PENDING tick exactly once. A no-op unless
+                // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
+                fail::fail_point!("schedule_tick_after_persist", |_| {});
+
                 // A queued tick is left for a dispatcher to claim. A direct tick
                 // runs here only if our idempotent insert created the row (its
                 // executor is ours) and it is not already finished.
