@@ -1224,3 +1224,35 @@ async fn sqlite_application_versions_persist() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// A `Client` and an engine over the same SQLite file: the client enqueues, the
+/// engine runs it, the client observes the result.
+#[tokio::test]
+async fn sqlite_client_enqueues_work_an_engine_runs() -> Result<()> {
+    use durust::{Client, WorkflowQueue};
+    let (url, path) = temp_db_url("client");
+
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("double", |ctx: DurableContext, n: i64| async move {
+        ctx.step("mul", || async { Ok::<_, Error>(n * 2) }).await
+    });
+    engine.register_queue(WorkflowQueue::new("q"));
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    let opts = WorkflowOptions {
+        workflow_id: Some("job-1".to_string()),
+        ..Default::default()
+    };
+    let mut handle = client.enqueue::<_, i64>("q", "double", 21i64, opts).await?;
+    assert_eq!(handle.get_result().await?, 42);
+    assert_eq!(
+        client.list_workflows(&ListFilter::default()).await?.len(),
+        1
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}

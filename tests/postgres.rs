@@ -964,3 +964,42 @@ async fn pg_application_versions() -> Result<()> {
     );
     Ok(())
 }
+
+/// An out-of-process `Client` enqueues work over Postgres that a separate engine
+/// (sharing the database) claims and runs; the client observes the result. The
+/// queue and workflow names are uuid-suffixed so parallel tests don't cross-claim.
+#[tokio::test]
+async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
+    use durust::{Client, WorkflowHandle, WorkflowQueue};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_client_enqueues_work_an_engine_runs: DATABASE_URL unset");
+        return Ok(());
+    };
+    let wf = format!("double-{}", uuid::Uuid::new_v4());
+    let queue = format!("q-{}", uuid::Uuid::new_v4());
+    let job = format!("job-{}", uuid::Uuid::new_v4());
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(&wf, |ctx: DurableContext, n: i64| async move {
+        ctx.step("mul", || async { Ok::<_, Error>(n * 2) }).await
+    });
+    engine.register_queue(WorkflowQueue::new(&queue));
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    let opts = WorkflowOptions {
+        workflow_id: Some(job.clone()),
+        ..Default::default()
+    };
+    let mut handle = client.enqueue::<_, i64>(&queue, &wf, 21i64, opts).await?;
+    assert_eq!(handle.get_result().await?, 42);
+
+    let steps = client.get_workflow_steps(&job).await?;
+    assert!(steps.iter().any(|s| s.name == "mul"));
+    let mut again: WorkflowHandle<i64> = client.retrieve_workflow(&job).await?;
+    assert_eq!(again.get_result().await?, 42);
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

@@ -34,6 +34,7 @@
 //! # }
 //! ```
 
+mod client;
 mod context;
 mod engine;
 mod error;
@@ -46,6 +47,7 @@ mod schedule;
 mod serialize;
 mod sqlite;
 
+pub use client::Client;
 pub use context::{AuthContext, DurableContext, StepOptions};
 pub use engine::{
     erase, DurableEngine, RegisteredWorkflow, WorkflowFn, WorkflowOptions, WorkflowRegistration,
