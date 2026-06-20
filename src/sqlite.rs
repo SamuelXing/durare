@@ -672,6 +672,22 @@ impl StateProvider for SqliteProvider {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE workflow_status
+             SET status = ?, queue_name = ?, executor_id = '',
+                 started_at_epoch_ms = NULL, updated_at = ?
+             WHERE workflow_uuid = ?",
+        )
+        .bind(STATUS_ENQUEUED)
+        .bind(queue)
+        .bind(Utc::now().timestamp_millis())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());

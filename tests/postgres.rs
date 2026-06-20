@@ -437,16 +437,21 @@ async fn pg_bulk_ops() -> Result<()> {
     };
     let tag = uuid::Uuid::new_v4();
     let id = |s: &str| format!("{s}-{tag}");
+    // A unique app version isolates this test's internal-queue work from other
+    // parallel tests' engines sharing the database (the dispatch version gate).
+    let ver = format!("v-{tag}");
 
     let provider = PostgresProvider::connect(&url).await?;
-    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    let mut engine = DurableEngine::new_with_version(Arc::new(provider), &ver).await?;
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
+    // Resume re-queues work for a dispatcher, so the engine must be live.
+    engine.launch().await?;
     let provider = PostgresProvider::connect(&url).await?;
 
     let seed = |wid: String, status: &str, parent: Option<String>| {
-        let mut s = WorkflowStatus::new(wid, "noop", serde_json::Value::Null, status, "", "0.1.0");
+        let mut s = WorkflowStatus::new(wid, "noop", serde_json::Value::Null, status, "", &ver);
         s.parent_workflow_id = parent;
         s
     };

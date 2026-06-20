@@ -6,7 +6,7 @@
 //!
 //! [`DurableEngine`]: crate::DurableEngine
 
-use crate::engine::{parse_cron, parse_timezone, WorkflowOptions};
+use crate::engine::{parse_cron, parse_timezone, WorkflowOptions, INTERNAL_QUEUE};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
@@ -205,6 +205,63 @@ impl Client {
     /// `parent_workflow_id` is removed too. Missing ids are skipped.
     pub async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
         self.provider.delete_workflows(ids, delete_children).await
+    }
+
+    /// Resume a cancelled (or otherwise non-terminal) workflow: re-queue it onto
+    /// the internal queue so a dispatcher on a live engine re-runs it from its
+    /// checkpoints. Returns a polling handle. Errors if the workflow is missing or
+    /// already `SUCCESS`/`ERROR`.
+    pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
+        if !self.provider.resume_workflow(id).await? {
+            return Err(Error::app(format!(
+                "workflow `{id}` cannot be resumed (missing or already completed)"
+            )));
+        }
+        self.requeue_for_rerun(id).await?;
+        Ok(WorkflowHandle::polling(
+            id.to_string(),
+            self.provider.clone(),
+        ))
+    }
+
+    /// Resume many workflows in one round-trip; returns a polling handle for each
+    /// id actually transitioned (skipped ids yield no handle).
+    pub async fn resume_workflows<O>(&self, ids: &[String]) -> Result<Vec<WorkflowHandle<O>>> {
+        let resumed = self.provider.resume_workflows(ids).await?;
+        let mut handles = Vec::with_capacity(resumed.len());
+        for id in resumed {
+            self.requeue_for_rerun(&id).await?;
+            handles.push(WorkflowHandle::polling(id, self.provider.clone()));
+        }
+        Ok(handles)
+    }
+
+    /// Fork a workflow from `start_step`: a new workflow reuses the original's
+    /// checkpoints for steps `< start_step` and re-executes from there. Queued
+    /// onto the internal queue for a dispatcher to run; returns a polling handle.
+    /// The new id comes from `opts.workflow_id` or is generated.
+    pub async fn fork_workflow<O>(
+        &self,
+        original_id: &str,
+        start_step: i32,
+        opts: WorkflowOptions,
+    ) -> Result<WorkflowHandle<O>> {
+        let new_id = opts
+            .workflow_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.provider
+            .fork_workflow(original_id, &new_id, start_step, "")
+            .await?;
+        self.requeue_for_rerun(&new_id).await?;
+        Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
+    }
+
+    /// Put an existing row onto the internal queue so a dispatcher on a live
+    /// engine re-runs it. Re-execution always uses the internal queue (it is
+    /// always dispatched), so it makes progress regardless of which user queues
+    /// the executors listen to.
+    async fn requeue_for_rerun(&self, id: &str) -> Result<()> {
+        self.provider.enqueue_existing(id, INTERNAL_QUEUE).await
     }
 
     /// Reschedule a `DELAYED` workflow to become eligible `delay` from now. A

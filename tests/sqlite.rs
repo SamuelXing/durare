@@ -575,6 +575,8 @@ async fn sqlite_management() -> Result<()> {
             .await?;
         Ok::<_, Error>(b)
     });
+    // Resume/fork re-queue work for a dispatcher, so the engine must be live.
+    engine.launch().await?;
 
     engine.start_typed::<_, i64>("pipeline", "wf-1", ()).await?;
 
@@ -638,6 +640,7 @@ async fn sqlite_management() -> Result<()> {
     let mut resumed = engine.resume_workflow::<i64>("wf-3").await?;
     assert_eq!(resumed.get_result().await?, 15);
 
+    engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);
     Ok(())
 }
@@ -653,6 +656,8 @@ async fn sqlite_bulk_ops() -> Result<()> {
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
+    // Resume re-queues work for a dispatcher, so the engine must be live.
+    engine.launch().await?;
     let provider = SqliteProvider::connect(&url).await?;
 
     let seed = |id: &str, status: &str, parent: Option<&str>| {
@@ -708,6 +713,7 @@ async fn sqlite_bulk_ops() -> Result<()> {
     assert!(provider.get_workflow_status("c").await?.is_none());
     assert!(provider.get_workflow_status("gc").await?.is_none());
 
+    engine.shutdown(Duration::from_secs(1)).await?;
     let _ = std::fs::remove_file(path);
     Ok(())
 }

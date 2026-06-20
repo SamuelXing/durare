@@ -32,6 +32,20 @@ const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// schedule takes effect promptly.
 const SCHEDULE_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Name of the always-on internal queue every engine dispatches. Out-of-process
+/// callers (a [`Client`](crate::Client)) and the engine itself route re-executed
+/// work with no user queue (resume / fork of a direct run) here, so any live
+/// engine claims and runs it — rather than relying on a restart's recovery.
+pub(crate) const INTERNAL_QUEUE: &str = "_dbos_internal_queue";
+
+/// The internal queue, polled faster than the 1s default so re-executed work
+/// starts promptly.
+fn internal_queue() -> WorkflowQueue {
+    let mut q = WorkflowQueue::new(INTERNAL_QUEUE);
+    q.base_polling_interval = Duration::from_millis(100);
+    q
+}
+
 /// A type-erased workflow handler: takes a context + JSON input, returns JSON output.
 pub type WorkflowFn = Arc<
     dyn Fn(DurableContext, Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>>
@@ -221,10 +235,12 @@ impl DurableEngine {
                 scheduled.push((reg.name.to_string(), spec.to_string()));
             }
         }
+        let mut queues = HashMap::new();
+        queues.insert(INTERNAL_QUEUE.to_string(), Arc::new(internal_queue()));
         Ok(Self {
             provider,
             workflows,
-            queues: HashMap::new(),
+            queues,
             listen_filter: None,
             scheduled,
             executor_id: uuid::Uuid::new_v4().to_string(),
@@ -303,7 +319,12 @@ impl DurableEngine {
     /// All queues registered on this engine, sorted by name. Includes queues this
     /// process does not dispatch (see [`listen_queues`](Self::listen_queues)).
     pub fn list_registered_queues(&self) -> Vec<WorkflowQueue> {
-        let mut queues: Vec<WorkflowQueue> = self.queues.values().map(|q| (**q).clone()).collect();
+        let mut queues: Vec<WorkflowQueue> = self
+            .queues
+            .values()
+            .filter(|q| q.name != INTERNAL_QUEUE)
+            .map(|q| (**q).clone())
+            .collect();
         queues.sort_by(|a, b| a.name.cmp(&b.name));
         queues
     }
@@ -541,9 +562,10 @@ impl DurableEngine {
 
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
-            // Skip queues this process is configured not to listen to.
+            // Skip queues this process is configured not to listen to. The
+            // internal queue is always dispatched (re-execution depends on it).
             if let Some(listen) = &self.listen_filter {
-                if !listen.contains(&queue.name) {
+                if queue.name != INTERNAL_QUEUE && !listen.contains(&queue.name) {
                     continue;
                 }
             }
@@ -883,34 +905,30 @@ impl DurableEngine {
         self.provider.cancel_workflow(id).await
     }
 
-    /// Resume a cancelled (or otherwise non-terminal) workflow. The workflow is
-    /// returned to `PENDING` and re-run from its checkpoints; the returned handle
-    /// tracks the new run. Errors if the workflow does not exist or is already
-    /// `SUCCESS`/`ERROR`.
+    /// Resume a cancelled (or otherwise non-terminal) workflow. It is re-queued
+    /// onto the internal queue and a dispatcher — on any live engine — re-runs it
+    /// from its checkpoints; the returned handle tracks it by polling. Errors if
+    /// the workflow does not exist or is already `SUCCESS`/`ERROR`. Requires a
+    /// launched engine to make progress.
     pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         if !self.provider.resume_workflow(id).await? {
             return Err(Error::app(format!(
                 "workflow `{id}` cannot be resumed (missing or already completed)"
             )));
         }
-        let row = self
-            .provider
-            .get_workflow_status(id)
-            .await?
-            .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
-        let rt = self.runtime();
-        let handler = rt
-            .workflows
-            .get(&row.name)
-            .cloned()
-            .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-        let auth = AuthContext::from_status(&row);
-        let join = rt.spawn_owned(id.to_string(), handler, row.input, row.deadline_ms, auth);
-        Ok(WorkflowHandle::local(
+        self.requeue_for_rerun(id).await?;
+        Ok(WorkflowHandle::polling(
             id.to_string(),
             self.provider.clone(),
-            join,
         ))
+    }
+
+    /// Put an existing row onto the internal queue so a dispatcher re-runs it.
+    /// Re-execution always uses the internal queue (not the workflow's original
+    /// user queue): it is always dispatched, so a resumed/forked workflow makes
+    /// progress regardless of which user queues a process listens to.
+    async fn requeue_for_rerun(&self, id: &str) -> Result<()> {
+        self.provider.enqueue_existing(id, INTERNAL_QUEUE).await
     }
 
     /// Cancel many workflows in one round-trip. Each that exists and is not
@@ -922,27 +940,15 @@ impl DurableEngine {
     }
 
     /// Resume many workflows in one round-trip. Each that exists and is not
-    /// `SUCCESS`/`ERROR` returns to `PENDING` and is re-dispatched here; the
-    /// returned handles track exactly those runs (skipped ids yield no handle, so
-    /// the result may be shorter than `ids`).
+    /// `SUCCESS`/`ERROR` is re-queued (its own queue, or the internal queue) for a
+    /// dispatcher to re-run; the returned polling handles track exactly those
+    /// (skipped ids yield no handle, so the result may be shorter than `ids`).
     pub async fn resume_workflows<O>(&self, ids: &[String]) -> Result<Vec<WorkflowHandle<O>>> {
         let resumed = self.provider.resume_workflows(ids).await?;
-        let rt = self.runtime();
         let mut handles = Vec::with_capacity(resumed.len());
         for id in resumed {
-            let row = self
-                .provider
-                .get_workflow_status(&id)
-                .await?
-                .ok_or_else(|| Error::UnknownWorkflow(id.clone()))?;
-            let handler = rt
-                .workflows
-                .get(&row.name)
-                .cloned()
-                .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-            let auth = AuthContext::from_status(&row);
-            let join = rt.spawn_owned(id.clone(), handler, row.input, row.deadline_ms, auth);
-            handles.push(WorkflowHandle::local(id, self.provider.clone(), join));
+            self.requeue_for_rerun(&id).await?;
+            handles.push(WorkflowHandle::polling(id, self.provider.clone()));
         }
         Ok(handles)
     }
@@ -981,8 +987,9 @@ impl DurableEngine {
 
     /// Fork a workflow from `start_step`. Creates a new workflow that reuses the
     /// original's checkpoints for steps `< start_step` and re-executes from
-    /// there. The new id comes from `opts.workflow_id` or is generated; the
-    /// returned handle tracks the forked run.
+    /// there. The new id comes from `opts.workflow_id` or is generated; the fork
+    /// is queued onto the internal queue for a dispatcher to run, and the
+    /// returned handle tracks it by polling.
     pub async fn fork_workflow<O>(
         &self,
         original_id: &str,
@@ -995,20 +1002,8 @@ impl DurableEngine {
         self.provider
             .fork_workflow(original_id, &new_id, start_step, &self.app_version)
             .await?;
-        let row = self
-            .provider
-            .get_workflow_status(&new_id)
-            .await?
-            .ok_or_else(|| Error::UnknownWorkflow(new_id.clone()))?;
-        let rt = self.runtime();
-        let handler = rt
-            .workflows
-            .get(&row.name)
-            .cloned()
-            .ok_or_else(|| Error::UnknownWorkflow(row.name.clone()))?;
-        let auth = AuthContext::from_status(&row);
-        let join = rt.spawn_owned(new_id.clone(), handler, row.input, row.deadline_ms, auth);
-        Ok(WorkflowHandle::local(new_id, self.provider.clone(), join))
+        self.requeue_for_rerun(&new_id).await?;
+        Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
     }
 
     /// Re-run every incomplete workflow of this engine's application version,

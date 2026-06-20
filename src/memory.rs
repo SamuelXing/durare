@@ -604,6 +604,18 @@ impl StateProvider for InMemoryProvider {
         Ok(true)
     }
 
+    async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if let Some(row) = g.workflows.get_mut(id) {
+            row.status = STATUS_ENQUEUED.to_string();
+            row.queue_name = Some(queue.to_string());
+            row.executor_id = String::new();
+            row.started_at_ms = None;
+            row.updated_at = Utc::now();
+        }
+        Ok(())
+    }
+
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
         let mut g = self.inner.lock().await;
         let now = Utc::now();
