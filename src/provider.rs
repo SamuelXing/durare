@@ -602,6 +602,12 @@ pub trait StateProvider: Send + Sync {
     /// re-dispatches it.
     async fn resume_workflow(&self, id: &str) -> Result<bool>;
 
+    /// Route an existing row to a queue: set it `ENQUEUED` on `queue`, clearing
+    /// the owning executor and start time so a dispatcher claims it fresh. Used
+    /// to re-execute a resumed/forked workflow on a running engine without
+    /// re-running it locally. A no-op if the id is gone.
+    async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()>;
+
     /// Cancel many workflows in one round-trip. Each existing, non-terminal id is
     /// set `CANCELLED` (same effect as [`cancel_workflow`](Self::cancel_workflow));
     /// missing or already-terminal ids are silently skipped (no error). An empty

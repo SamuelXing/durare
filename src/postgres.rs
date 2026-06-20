@@ -692,6 +692,22 @@ impl StateProvider for PostgresProvider {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE workflow_status
+             SET status = $2, queue_name = $3, executor_id = '',
+                 started_at_epoch_ms = NULL, updated_at = $4
+             WHERE workflow_uuid = $1",
+        )
+        .bind(id)
+        .bind(STATUS_ENQUEUED)
+        .bind(queue)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());

@@ -348,3 +348,150 @@ async fn client_created_schedule_fires_on_engine() -> Result<()> {
     assert!(!rows.is_empty(), "scheduled ticks were persisted");
     Ok(())
 }
+
+/// A client resumes a cancelled workflow: it is re-queued onto the internal
+/// queue and a live engine's dispatcher re-runs it from its checkpoints.
+#[tokio::test]
+async fn client_resumes_a_cancelled_workflow() -> Result<()> {
+    use durust::{StateProvider, WorkflowHandle, WorkflowStatus, STATUS_PENDING};
+    static S1: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("two_step", |ctx: DurableContext, _: ()| async move {
+        ctx.step("s0", || async { Ok::<_, Error>(1i64) }).await?;
+        let v = ctx
+            .step("s1", || async {
+                S1.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(2i64)
+            })
+            .await?;
+        Ok::<_, Error>(v)
+    });
+    engine.launch().await?;
+
+    // A direct workflow with step 0 already checkpointed, then cancelled.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "w",
+            "two_step",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "",
+            "0.1.0",
+        ))
+        .await?;
+    provider
+        .record_step_result("w", 0, "s0", serde_json::json!(1), None)
+        .await?;
+    let client = Client::new(provider.clone());
+    client.cancel_workflow("w").await?;
+
+    // Resume from the client → the engine's internal dispatcher re-runs it.
+    let mut h: WorkflowHandle<i64> = client.resume_workflow("w").await?;
+    assert_eq!(h.get_result().await?, 2);
+    assert_eq!(
+        S1.load(Ordering::SeqCst),
+        1,
+        "s1 ran once; s0 replayed from its checkpoint"
+    );
+
+    // Resuming a completed workflow errors.
+    assert!(client.resume_workflow::<i64>("w").await.is_err());
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// Re-execution always uses the internal queue, never the workflow's own queue:
+/// a workflow on a user queue this process does NOT listen to still re-runs on
+/// resume, because the internal queue is always dispatched.
+#[tokio::test]
+async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
+    use durust::WorkflowHandle;
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("job", |_ctx: DurableContext, _: ()| async move {
+        RAN.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, Error>(())
+    });
+    engine.register_queue(WorkflowQueue::new("orders"));
+    // Listen to a different queue: "orders" gets no dispatcher here, but the
+    // internal queue is always dispatched.
+    engine.listen_queues(["something-else"]);
+    engine.launch().await?;
+
+    let client = Client::new(provider.clone());
+    client
+        .enqueue::<_, ()>(
+            "orders",
+            "job",
+            (),
+            WorkflowOptions {
+                workflow_id: Some("j1".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        RAN.load(Ordering::SeqCst),
+        0,
+        "an un-listened queue is not dispatched, so it does not run"
+    );
+
+    // Cancel then resume: re-queued onto the internal queue, it runs — it would
+    // hang here if resume put it back on the un-listened "orders" queue.
+    client.cancel_workflow("j1").await?;
+    let mut h: WorkflowHandle<()> = client.resume_workflow("j1").await?;
+    h.get_result().await?;
+    assert_eq!(RAN.load(Ordering::SeqCst), 1, "resume ran it via the internal queue");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// A client forks a workflow from a step; the fork is re-queued and a live engine
+/// runs it, reusing checkpoints before the fork point.
+#[tokio::test]
+async fn client_forks_a_workflow() -> Result<()> {
+    use durust::WorkflowHandle;
+    static SECOND: AtomicUsize = AtomicUsize::new(0);
+    let provider = Arc::new(InMemoryProvider::new());
+
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("pipeline", |ctx: DurableContext, _: ()| async move {
+        let a = ctx
+            .step("first", || async { Ok::<_, Error>(10i64) })
+            .await?;
+        let b = ctx
+            .step("second", || async {
+                SECOND.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(a + 5)
+            })
+            .await?;
+        Ok::<_, Error>(b)
+    });
+    engine.launch().await?;
+
+    // Original run via the engine.
+    let _: i64 = engine
+        .run_workflow::<_, i64>("pipeline", (), WorkflowOptions::with_id("orig"))
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(SECOND.load(Ordering::SeqCst), 1);
+
+    // Client forks from step 1: step 0 reused, step 1 re-executes on the engine.
+    let client = Client::new(provider.clone());
+    let mut forked: WorkflowHandle<i64> = client
+        .fork_workflow("orig", 1, WorkflowOptions::with_id("forked"))
+        .await?;
+    assert_eq!(forked.get_result().await?, 15);
+    assert_eq!(SECOND.load(Ordering::SeqCst), 2, "fork re-ran step 1");
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

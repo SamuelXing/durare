@@ -76,6 +76,8 @@ async fn cancel_then_resume() -> Result<()> {
             .await?;
         Ok::<_, Error>(b)
     });
+    // Resume re-queues the workflow for a dispatcher, so the engine must be live.
+    engine.launch().await?;
 
     // Seed a PENDING workflow with step 0 already checkpointed, then cancel it
     // so the next execution stops cooperatively.
@@ -115,6 +117,7 @@ async fn cancel_then_resume() -> Result<()> {
 
     // Resuming a completed workflow is an error.
     assert!(engine.resume_workflow::<i64>("wf-cancel").await.is_err());
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -137,6 +140,8 @@ async fn fork_reuses_checkpoints() -> Result<()> {
             .await?;
         Ok::<_, Error>(b)
     });
+    // Fork re-queues the new workflow for a dispatcher, so the engine must be live.
+    engine.launch().await?;
 
     // Original run completes; both steps execute once.
     let orig: i64 = engine.start_typed("pipeline", "wf-orig", ()).await?;
@@ -156,6 +161,7 @@ async fn fork_reuses_checkpoints() -> Result<()> {
 
     let row = provider.get_workflow_status("wf-fork").await?.unwrap();
     assert_eq!(row.forked_from.as_deref(), Some("wf-orig"));
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -277,6 +283,8 @@ async fn bulk_cancel_and_resume() -> Result<()> {
     engine.register("noop", |_ctx: DurableContext, _: ()| async move {
         Ok::<_, Error>(())
     });
+    // Resume re-queues workflows for a dispatcher, so the engine must be live.
+    engine.launch().await?;
 
     // Two pending workflows to act on, one pending left untouched, one already
     // completed.
@@ -320,6 +328,7 @@ async fn bulk_cancel_and_resume() -> Result<()> {
     }
     assert_eq!(status_of(&provider, "wf-1").await, STATUS_SUCCESS);
     assert_eq!(status_of(&provider, "wf-2").await, STATUS_SUCCESS);
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
