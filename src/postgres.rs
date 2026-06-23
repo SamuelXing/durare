@@ -203,13 +203,17 @@ impl StateProvider for PostgresProvider {
     ) -> Result<()> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
         let now = Utc::now().timestamp_millis();
-        let completed = is_terminal(status).then_some(now);
+        let terminal = is_terminal(status);
+        let completed = terminal.then_some(now);
+        // Reaching a terminal state frees the queue-scoped deduplication slot so
+        // the same deduplication id can be enqueued again.
         sqlx::query(
             "UPDATE workflow_status
              SET status = $2,
                  output = COALESCE($3, output),
                  error  = COALESCE($4, error),
                  completed_at = COALESCE($5, completed_at),
+                 deduplication_id = CASE WHEN $7 THEN NULL ELSE deduplication_id END,
                  updated_at = $6
              WHERE workflow_uuid = $1",
         )
@@ -219,6 +223,7 @@ impl StateProvider for PostgresProvider {
         .bind(error)
         .bind(completed)
         .bind(now)
+        .bind(terminal)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -878,11 +883,14 @@ impl StateProvider for PostgresProvider {
         .await?;
         let attempts = attempts.unwrap_or(0) as i32;
         if attempts > max {
-            sqlx::query("UPDATE workflow_status SET status = $2 WHERE workflow_uuid = $1")
-                .bind(id)
-                .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE workflow_status SET status = $2, deduplication_id = NULL \
+                 WHERE workflow_uuid = $1",
+            )
+            .bind(id)
+            .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(attempts)

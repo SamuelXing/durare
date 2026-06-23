@@ -1318,3 +1318,58 @@ async fn pg_enqueue_dedup_and_app_version() -> Result<()> {
         .await?;
     Ok(())
 }
+
+/// A deduplication id is released once its holder reaches a terminal state, so
+/// the same id can be enqueued again afterward.
+#[tokio::test]
+async fn pg_dedup_slot_frees_on_completion() -> Result<()> {
+    use durust::{Client, WorkflowHandle, STATUS_SUCCESS};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_dedup_slot_frees_on_completion: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let queue = format!("dq-{tag}");
+    let dedup = format!("once-{tag}");
+    let d1 = format!("d1-{tag}");
+    let d3 = format!("d3-{tag}");
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let client = Client::new(provider.clone());
+
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            1i64,
+            WorkflowOptions::with_id(&d1).dedup_id(&dedup),
+        )
+        .await?;
+    // The partial unique index rejects a colliding dedup id while d1 is active.
+    assert!(client
+        .enqueue::<_, i64>(
+            &queue,
+            "wf",
+            2i64,
+            WorkflowOptions::with_id(format!("d2-{tag}")).dedup_id(&dedup),
+        )
+        .await
+        .is_err());
+
+    // Completing d1 nulls its deduplication_id, freeing the slot.
+    provider
+        .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
+        .await?;
+
+    let third: WorkflowHandle<i64> = client
+        .enqueue(
+            &queue,
+            "wf",
+            3i64,
+            WorkflowOptions::with_id(&d3).dedup_id(&dedup),
+        )
+        .await?;
+    assert_eq!(third.id(), d3);
+
+    client.delete_workflows(&[d1, d3], false).await?;
+    Ok(())
+}

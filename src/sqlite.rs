@@ -201,13 +201,17 @@ impl StateProvider for SqliteProvider {
     ) -> Result<()> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
         let now = Utc::now().timestamp_millis();
-        let completed = is_terminal(status).then_some(now);
+        let terminal = is_terminal(status);
+        let completed = terminal.then_some(now);
+        // Reaching a terminal state frees the queue-scoped deduplication slot so
+        // the same deduplication id can be enqueued again.
         sqlx::query(
             "UPDATE workflow_status
              SET status = ?,
                  output = COALESCE(?, output),
                  error  = COALESCE(?, error),
                  completed_at = COALESCE(?, completed_at),
+                 deduplication_id = CASE WHEN ? THEN NULL ELSE deduplication_id END,
                  updated_at = ?
              WHERE workflow_uuid = ?",
         )
@@ -215,6 +219,7 @@ impl StateProvider for SqliteProvider {
         .bind(output_str)
         .bind(error)
         .bind(completed)
+        .bind(terminal)
         .bind(now)
         .bind(id)
         .execute(&self.pool)
@@ -863,11 +868,14 @@ impl StateProvider for SqliteProvider {
         .await?;
         let attempts = attempts.unwrap_or(0) as i32;
         if attempts > max {
-            sqlx::query("UPDATE workflow_status SET status = ? WHERE workflow_uuid = ?")
-                .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE workflow_status SET status = ?, deduplication_id = NULL \
+                 WHERE workflow_uuid = ?",
+            )
+            .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(attempts)

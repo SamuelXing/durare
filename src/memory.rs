@@ -132,6 +132,9 @@ impl StateProvider for InMemoryProvider {
             let now = Utc::now();
             if is_terminal(status) {
                 row.completed_at_ms = Some(now.timestamp_millis());
+                // Reaching a terminal state frees the queue-scoped deduplication
+                // slot so the same deduplication id can be enqueued again.
+                row.dedup_id = None;
             }
             row.updated_at = now;
         }
@@ -764,6 +767,7 @@ impl StateProvider for InMemoryProvider {
         let attempts = row.recovery_attempts;
         if attempts > max {
             row.status = STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string();
+            row.dedup_id = None;
             row.updated_at = Utc::now();
         }
         Ok(attempts)

@@ -678,3 +678,49 @@ async fn client_enqueue_dedup_and_app_version() -> Result<()> {
         .is_err());
     Ok(())
 }
+
+/// A deduplication id is released once its holder reaches a terminal state, so
+/// the same id can be enqueued again afterward.
+#[tokio::test]
+async fn client_dedup_slot_frees_on_completion() -> Result<()> {
+    use durust::{StateProvider, WorkflowHandle, STATUS_SUCCESS};
+    let provider = Arc::new(InMemoryProvider::new());
+    let client = Client::new(provider.clone());
+
+    // The first enqueue holds the dedup slot.
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            1i64,
+            WorkflowOptions::with_id("d1").dedup_id("once"),
+        )
+        .await?;
+    // While the holder is active a colliding dedup id is rejected.
+    assert!(client
+        .enqueue::<_, i64>(
+            "dq",
+            "wf",
+            2i64,
+            WorkflowOptions::with_id("d2").dedup_id("once")
+        )
+        .await
+        .is_err());
+
+    // Completing the holder releases the slot.
+    provider
+        .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
+        .await?;
+
+    // The same dedup id now starts a fresh workflow rather than colliding.
+    let third: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            3i64,
+            WorkflowOptions::with_id("d3").dedup_id("once"),
+        )
+        .await?;
+    assert_eq!(third.id(), "d3");
+    Ok(())
+}

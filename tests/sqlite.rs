@@ -333,17 +333,17 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
         Ok::<_, Error>(n * 2)
     });
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
-    engine.launch().await?;
 
+    // Enqueue before launching the dispatcher so wf-q-1 still holds its dedup
+    // slot (it is ENQUEUED, not yet completed) when the duplicate is attempted.
     let mut opts = WorkflowOptions::with_id("wf-q-1");
     opts.dedup_id = Some("only-once".to_string());
     let mut handle = engine
         .enqueue::<_, i64>("q", "double", 21_i64, opts)
         .await?;
-    assert_eq!(handle.get_result().await?, 42);
 
     // Different workflow id, same dedup id on the same queue → unique index
-    // violation from the INSERT.
+    // violation from the INSERT while wf-q-1 is still active.
     let mut opts = WorkflowOptions::with_id("wf-q-2");
     opts.dedup_id = Some("only-once".to_string());
     let err = match engine.enqueue::<_, i64>("q", "double", 1_i64, opts).await {
@@ -351,6 +351,10 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
         Err(e) => e,
     };
     assert_eq!(err.code(), durust::ErrorCode::QueueDeduplicated);
+
+    // Now launch the dispatcher and let wf-q-1 run to completion.
+    engine.launch().await?;
+    assert_eq!(handle.get_result().await?, 42);
 
     // The destination FK is enforced: sending to an unknown id is typed.
     let err = engine
@@ -1392,6 +1396,56 @@ async fn sqlite_enqueue_dedup_return_existing() -> Result<()> {
         )
         .await?;
     assert_eq!(again.id(), first.id());
+
+    drop(client);
+    drop(provider);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// A deduplication id is released once its holder reaches a terminal state, so
+/// the same id can be enqueued again afterward.
+#[tokio::test]
+async fn sqlite_dedup_slot_frees_on_completion() -> Result<()> {
+    use durust::{Client, StateProvider, WorkflowHandle};
+    let (url, path) = temp_db_url("dedupfree");
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    provider.init().await?;
+    let client = Client::new(provider.clone());
+
+    let first: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            1i64,
+            WorkflowOptions::with_id("d1").dedup_id("once"),
+        )
+        .await?;
+    // The partial unique index rejects a colliding dedup id while d1 is active.
+    assert!(client
+        .enqueue::<_, i64>(
+            "dq",
+            "wf",
+            2i64,
+            WorkflowOptions::with_id("d2").dedup_id("once")
+        )
+        .await
+        .is_err());
+
+    // Completing d1 nulls its deduplication_id, freeing the slot.
+    provider
+        .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
+        .await?;
+
+    let third: WorkflowHandle<i64> = client
+        .enqueue(
+            "dq",
+            "wf",
+            3i64,
+            WorkflowOptions::with_id("d3").dedup_id("once"),
+        )
+        .await?;
+    assert_eq!(third.id(), "d3");
 
     drop(client);
     drop(provider);
