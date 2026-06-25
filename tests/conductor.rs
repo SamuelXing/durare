@@ -127,3 +127,49 @@ async fn conductor_requires_api_key_and_url() -> Result<()> {
     assert!(no_url.is_err(), "missing URL is rejected");
     Ok(())
 }
+
+#[tokio::test]
+async fn conductor_closes_gracefully_on_shutdown() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // Server: complete one exchange, signal readiness, then read until it sees
+    // the client's Close frame (the graceful closing handshake).
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let _ = exchange(&mut ws, json!({"type":"executor_info","request_id":"r1"})).await;
+        ready_tx.send(()).unwrap();
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => continue, // skip pings / other frames
+                Some(Err(_)) | None => return false,
+            }
+        }
+    });
+
+    let engine = Arc::new(DurableEngine::new(Arc::new(InMemoryProvider::new())).await?);
+    engine.launch().await?;
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+        },
+    )?;
+
+    // Only shut down once the client is connected and has answered a request.
+    ready_rx.await.unwrap();
+    conductor.shutdown(Duration::from_secs(2)).await?;
+
+    assert!(
+        server.await.unwrap(),
+        "server observed the client's Close frame"
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

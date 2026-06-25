@@ -53,6 +53,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
 const INITIAL_RECONNECT_WAIT: Duration = Duration::from_secs(1);
 const MAX_RECONNECT_WAIT: Duration = Duration::from_secs(30);
+// How long to drive the closing handshake (drain the peer's Close echo) before
+// giving up and dropping the connection.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Configuration for [`Conductor::start`].
 pub struct ConductorConfig {
@@ -97,10 +100,17 @@ impl Conductor {
         Ok(Conductor { token, task })
     }
 
-    /// Signal the connection loop to stop and wait up to `timeout` for it.
-    pub async fn shutdown(mut self, timeout: Duration) -> Result<()> {
+    /// Signal the connection loop to stop and wait up to `timeout` for it to
+    /// finish its graceful close. If the grace period elapses (e.g. a wedged
+    /// write), the background task is aborted so it cannot linger detached —
+    /// dropping a `JoinHandle` alone does not stop a task.
+    pub async fn shutdown(self, timeout: Duration) -> Result<()> {
         self.token.cancel();
-        let _ = tokio::time::timeout(timeout, &mut self.task).await;
+        let abort = self.task.abort_handle();
+        if tokio::time::timeout(timeout, self.task).await.is_err() {
+            tracing::warn!("conductor did not stop within timeout; aborting");
+            abort.abort();
+        }
         Ok(())
     }
 }
@@ -144,6 +154,15 @@ async fn connection_loop(
 
 /// Serve one connection until it drops or shutdown is signalled. Returns `true`
 /// if we are stopping (do not reconnect), `false` if the link merely dropped.
+///
+/// Cancel safety: only the *waiting* futures sit in the `select!` head
+/// (cancellation, the ping tick, the read deadline). All message processing
+/// runs in a branch **body**, which `select!` never interrupts — so an in-flight
+/// `handle_message` (DB work + its response write) always completes before
+/// cancellation is observed on the next turn. A request is therefore never torn
+/// mid-processing, and an inbound frame is only consumed when its read branch
+/// actually wins (so the select race never drops a message). On cancellation we
+/// run the closing handshake via [`close_gracefully`] rather than dropping.
 async fn serve(
     ws: &mut WsStream,
     engine: &Arc<DurableEngine>,
@@ -157,7 +176,7 @@ async fn serve(
     loop {
         tokio::select! {
             _ = token.cancelled() => {
-                let _ = ws.send(Message::Close(None)).await;
+                close_gracefully(ws).await;
                 return true;
             }
             _ = ping.tick() => {
@@ -188,6 +207,19 @@ async fn serve(
             }
         }
     }
+}
+
+/// Complete the WebSocket closing handshake: send a Close frame (flushing any
+/// final response already in the sink), then drain the peer's remaining frames
+/// until it echoes Close — bounded by [`CLOSE_DRAIN_TIMEOUT`]. This releases the
+/// connection cleanly instead of resetting it. Best-effort: a dead peer just
+/// makes the drain return early.
+async fn close_gracefully(ws: &mut WsStream) {
+    if ws.close(None).await.is_err() {
+        return; // peer already gone; nothing to drain
+    }
+    let drain = async { while let Some(Ok(_)) = ws.next().await {} };
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, drain).await;
 }
 
 /// The base fields every conductor message carries.
