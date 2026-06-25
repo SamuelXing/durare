@@ -10,9 +10,12 @@
 //! (`cancel`, `resume`, `delete`, `fork_workflow`, `list_workflows`,
 //! `list_queued_workflows`, `get_workflow`, `list_steps`), and schedule
 //! management (`list_schedules`, `get_schedule`, `pause_schedule`,
-//! `resume_schedule`, `backfill_schedule`, `trigger_schedule`). Every other
-//! message type is answered with a well-formed "unknown message type" error
-//! until its handler lands, so the link stays healthy as coverage grows.
+//! `resume_schedule`, `backfill_schedule`, `trigger_schedule`), and the
+//! registry/analytics messages (`list_queues`, `get_queue`,
+//! `list_application_versions`, `set_latest_application_version`,
+//! `get_workflow_aggregates`, `get_step_aggregates`). Every other message type
+//! is answered with a well-formed "unknown message type" error until its
+//! handler lands, so the link stays healthy as coverage grows.
 //!
 //! Opt-in, like the admin server:
 //! ```no_run
@@ -37,8 +40,10 @@
 use crate::engine::{DurableEngine, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::provider::{
-    ListFilter, StepInfo, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
+    ListFilter, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_PENDING,
 };
+use crate::queue::WorkflowQueue;
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -323,6 +328,12 @@ async fn handle_message(
         "resume_schedule" => handle_schedule_toggle(engine, ws, rid, text, false).await,
         "backfill_schedule" => handle_backfill_schedule(engine, ws, rid, text).await,
         "trigger_schedule" => handle_trigger_schedule(engine, ws, rid, text).await,
+        "list_queues" => handle_list_queues(engine, ws, rid).await,
+        "get_queue" => handle_get_queue(engine, ws, rid, text).await,
+        "list_application_versions" => handle_list_versions(engine, ws, rid).await,
+        "set_latest_application_version" => handle_set_latest_version(engine, ws, rid, text).await,
+        "get_workflow_aggregates" => handle_workflow_aggregates(engine, ws, rid, text).await,
+        "get_step_aggregates" => handle_step_aggregates(engine, ws, rid, text).await,
         other => {
             tracing::warn!(msg_type = other, "unknown conductor message type");
             let resp = base_response(other, rid, Some("Unknown message type".to_string()));
@@ -761,6 +772,273 @@ fn format_schedule(s: &WorkflowSchedule, load_context: bool) -> Value {
         "automatic_backfill": s.automatic_backfill,
         "cron_timezone": s.cron_timezone.as_ref().map(|t| json!(t)).unwrap_or(Value::Null),
         "queue_name": s.queue_name.as_ref().map(|q| json!(q)).unwrap_or(Value::Null),
+    })
+}
+
+async fn handle_list_queues(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+) -> Result<()> {
+    let output: Vec<Value> = engine
+        .list_registered_queues()
+        .iter()
+        .map(format_queue)
+        .collect();
+    let mut resp = base_response("list_queues", rid, None);
+    resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct GetQueueRequest {
+    #[serde(default)]
+    name: String,
+}
+
+async fn handle_get_queue(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: GetQueueRequest = serde_json::from_str(text)?;
+    let output = engine
+        .list_registered_queues()
+        .iter()
+        .find(|q| q.name == req.name)
+        .map(format_queue);
+    let mut resp = base_response("get_queue", rid, None);
+    resp.insert("output".into(), output.unwrap_or(Value::Null));
+    send(ws, resp).await
+}
+
+async fn handle_list_versions(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+) -> Result<()> {
+    let (output, err) = match engine.list_application_versions().await {
+        Ok(vs) => (vs.iter().map(format_version).collect::<Vec<_>>(), None),
+        Err(e) => (
+            vec![],
+            Some(format!("failed to list application versions: {e}")),
+        ),
+    };
+    let mut resp = base_response("list_application_versions", rid, err);
+    resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct SetLatestVersionRequest {
+    #[serde(default)]
+    version_name: String,
+}
+
+async fn handle_set_latest_version(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: SetLatestVersionRequest = serde_json::from_str(text)?;
+    let err = engine
+        .set_latest_application_version(&req.version_name)
+        .await
+        .err()
+        .map(|e| {
+            format!(
+                "failed to set latest application version '{}': {e}",
+                req.version_name
+            )
+        });
+    let mut resp = base_response("set_latest_application_version", rid, err.clone());
+    resp.insert("success".into(), json!(err.is_none()));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct WorkflowAggregatesRequest {
+    #[serde(default)]
+    body: WorkflowAggregatesBody,
+}
+
+#[derive(Default, Deserialize)]
+struct WorkflowAggregatesBody {
+    #[serde(default)]
+    group_by_status: bool,
+    #[serde(default)]
+    group_by_name: bool,
+    #[serde(default)]
+    group_by_queue_name: bool,
+    #[serde(default)]
+    group_by_executor_id: bool,
+    #[serde(default)]
+    group_by_application_version: bool,
+    time_bucket_size_ms: Option<i64>,
+    #[serde(default)]
+    status: StringOrList,
+    #[serde(default)]
+    name: StringOrList,
+    #[serde(default)]
+    app_version: StringOrList,
+    #[serde(default)]
+    executor_id: StringOrList,
+    #[serde(default)]
+    queue_name: StringOrList,
+    #[serde(default)]
+    workflow_id_prefix: StringOrList,
+    start_time: Option<DateTime<Utc>>,
+    end_time: Option<DateTime<Utc>>,
+}
+
+async fn handle_workflow_aggregates(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: WorkflowAggregatesRequest = serde_json::from_str(text)?;
+    let b = req.body;
+    let query = WorkflowAggregateQuery {
+        by_status: b.group_by_status,
+        by_name: b.group_by_name,
+        by_queue_name: b.group_by_queue_name,
+        by_executor_id: b.group_by_executor_id,
+        by_app_version: b.group_by_application_version,
+        time_bucket_ms: b.time_bucket_size_ms,
+        status: b.status.vec(),
+        name: b.name.vec(),
+        app_version: b.app_version.vec(),
+        executor_ids: b.executor_id.vec(),
+        queue_names: b.queue_name.vec(),
+        workflow_id_prefix: b.workflow_id_prefix.first(),
+        start_time_ms: b.start_time.map(|t| t.timestamp_millis()),
+        end_time_ms: b.end_time.map(|t| t.timestamp_millis()),
+        limit: None,
+    };
+    let (output, err) = match engine.get_workflow_aggregates(&query).await {
+        Ok(rows) => (
+            rows.iter()
+                .map(format_workflow_aggregate)
+                .collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (
+            vec![],
+            Some(format!("failed to get workflow aggregates: {e}")),
+        ),
+    };
+    let mut resp = base_response("get_workflow_aggregates", rid, err);
+    resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+#[derive(Deserialize)]
+struct StepAggregatesRequest {
+    #[serde(default)]
+    body: StepAggregatesBody,
+}
+
+#[derive(Default, Deserialize)]
+struct StepAggregatesBody {
+    #[serde(default)]
+    group_by_function_name: bool,
+    #[serde(default)]
+    group_by_status: bool,
+    #[serde(default)]
+    select_count: bool,
+    #[serde(default)]
+    select_max_duration_ms: bool,
+    time_bucket_size_ms: Option<i64>,
+    #[serde(default)]
+    status: StringOrList,
+    #[serde(default)]
+    function_name: StringOrList,
+    #[serde(default)]
+    workflow_id_prefix: StringOrList,
+    completed_after: Option<DateTime<Utc>>,
+    completed_before: Option<DateTime<Utc>>,
+}
+
+async fn handle_step_aggregates(
+    engine: &Arc<DurableEngine>,
+    ws: &mut WsStream,
+    rid: &str,
+    text: &str,
+) -> Result<()> {
+    let req: StepAggregatesRequest = serde_json::from_str(text)?;
+    let b = req.body;
+    let query = StepAggregateQuery {
+        by_function_name: b.group_by_function_name,
+        by_status: b.group_by_status,
+        select_count: b.select_count,
+        select_max_duration_ms: b.select_max_duration_ms,
+        time_bucket_ms: b.time_bucket_size_ms,
+        status: b.status.vec(),
+        function_name: b.function_name.vec(),
+        workflow_id_prefix: b.workflow_id_prefix.first(),
+        completed_after_ms: b.completed_after.map(|t| t.timestamp_millis()),
+        completed_before_ms: b.completed_before.map(|t| t.timestamp_millis()),
+        limit: None,
+    };
+    let (output, err) = match engine.get_step_aggregates(&query).await {
+        Ok(rows) => (
+            rows.iter().map(format_step_aggregate).collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (vec![], Some(format!("failed to get step aggregates: {e}"))),
+    };
+    let mut resp = base_response("get_step_aggregates", rid, err);
+    resp.insert("output".into(), json!(output));
+    send(ws, resp).await
+}
+
+/// Render a [`WorkflowQueue`] in the conductor's queue shape (snake_case;
+/// nullable fields emitted as `null`).
+fn format_queue(q: &WorkflowQueue) -> Value {
+    json!({
+        "name": q.name,
+        "concurrency": q.global_concurrency,
+        "worker_concurrency": q.worker_concurrency,
+        "rate_limit_max": q.rate_limit.as_ref().map(|r| r.limit),
+        "rate_limit_period_sec": q.rate_limit.as_ref().map(|r| r.period.as_secs_f64()),
+        "priority_enabled": q.priority_enabled,
+        "partition_queue": q.partitioned,
+        "polling_interval_sec": q.base_polling_interval.as_secs_f64(),
+    })
+}
+
+/// Render a [`VersionInfo`] in the conductor's application-version shape
+/// (epoch-ms integers).
+fn format_version(v: &VersionInfo) -> Value {
+    json!({
+        "version_id": v.version_id,
+        "version_name": v.version_name,
+        "version_timestamp": v.version_timestamp.timestamp_millis(),
+        "created_at": v.created_at.timestamp_millis(),
+    })
+}
+
+/// Render a [`WorkflowAggregate`]. The latency/created metrics this SDK does not
+/// yet compute are emitted as `null` (only `count` is populated).
+fn format_workflow_aggregate(a: &WorkflowAggregate) -> Value {
+    json!({
+        "group": a.group,
+        "count": a.count,
+        "min_created_at": Value::Null,
+        "max_queue_wait_ms": Value::Null,
+        "max_total_latency_ms": Value::Null,
+    })
+}
+
+/// Render a [`StepAggregate`] (matches the wire shape one-to-one).
+fn format_step_aggregate(a: &StepAggregate) -> Value {
+    json!({
+        "group": a.group,
+        "count": a.count,
+        "max_duration_ms": a.max_duration_ms,
     })
 }
 

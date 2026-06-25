@@ -4,7 +4,7 @@
 
 use durust::{
     Conductor, ConductorConfig, DurableContext, DurableEngine, Error, InMemoryProvider, Result,
-    ScheduleOptions, WorkflowOptions,
+    ScheduleOptions, WorkflowOptions, WorkflowQueue,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -332,6 +332,110 @@ async fn conductor_handles_schedule_management() -> Result<()> {
 
     // get_schedule for an unknown name -> output null.
     assert!(missing["output"].is_null());
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn conductor_handles_registry_and_aggregates() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+
+        let queues = exchange(&mut ws, json!({"type":"list_queues","request_id":"q"})).await;
+        let queue = exchange(
+            &mut ws,
+            json!({"type":"get_queue","request_id":"gq","name":"myq"}),
+        )
+        .await;
+        let versions = exchange(
+            &mut ws,
+            json!({"type":"list_application_versions","request_id":"v"}),
+        )
+        .await;
+        let set_latest = exchange(
+            &mut ws,
+            json!({"type":"set_latest_application_version","request_id":"sv","version_name":"2.0.0"}),
+        )
+        .await;
+        let wagg = exchange(
+            &mut ws,
+            json!({"type":"get_workflow_aggregates","request_id":"wa",
+                   "body":{"group_by_status":true,"select_count":true}}),
+        )
+        .await;
+        let sagg = exchange(
+            &mut ws,
+            json!({"type":"get_step_aggregates","request_id":"sa",
+                   "body":{"group_by_function_name":true,"select_count":true}}),
+        )
+        .await;
+        (queues, queue, versions, set_latest, wagg, sagg)
+    });
+
+    let mut engine =
+        DurableEngine::new_with_version(Arc::new(InMemoryProvider::new()), "2.0.0").await?;
+    engine.register("work", |ctx: DurableContext, msg: String| async move {
+        let r = ctx
+            .step("s1", || async { Ok::<_, Error>(format!("{msg}!")) })
+            .await?;
+        Ok::<_, Error>(r)
+    });
+    engine.register_queue(WorkflowQueue::new("myq").worker_concurrency(3));
+    let engine = Arc::new(engine);
+    engine.launch().await?; // registers application version 2.0.0
+    let mut h = engine
+        .run_workflow::<_, String>("work", "hi".to_string(), WorkflowOptions::with_id("wf-1"))
+        .await?;
+    h.get_result().await?;
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+        },
+    )?;
+
+    let (queues, queue, versions, set_latest, wagg, sagg) = server.await.unwrap();
+
+    // list_queues -> our registered queue (the internal queue is hidden).
+    let qs = queues["output"].as_array().unwrap();
+    let myq = qs.iter().find(|q| q["name"] == "myq").expect("myq listed");
+    assert_eq!(myq["worker_concurrency"], 3);
+    assert!(myq["concurrency"].is_null()); // null, not omitted
+    assert!(myq["polling_interval_sec"].is_number());
+
+    // get_queue -> the same queue.
+    assert_eq!(queue["output"]["name"], "myq");
+
+    // list_application_versions -> our launched version present.
+    let vs = versions["output"].as_array().unwrap();
+    assert!(vs.iter().any(|v| v["version_name"] == "2.0.0"));
+    assert!(vs[0]["version_timestamp"].is_number());
+
+    // set_latest -> success.
+    assert_eq!(set_latest["success"], true);
+
+    // workflow aggregates grouped by status -> a SUCCESS group of count 1.
+    let wrows = wagg["output"].as_array().unwrap();
+    let success = wrows
+        .iter()
+        .find(|r| r["group"]["status"] == "SUCCESS")
+        .expect("a SUCCESS group");
+    assert_eq!(success["count"], 1);
+    assert!(success["max_total_latency_ms"].is_null()); // not yet computed
+
+    // step aggregates grouped by function name -> our step 's1'.
+    let srows = sagg["output"].as_array().unwrap();
+    assert!(srows.iter().any(|r| r["group"]["function_name"] == "s1"));
 
     conductor.shutdown(Duration::from_secs(2)).await?;
     engine.shutdown(Duration::from_secs(1)).await?;
