@@ -65,10 +65,10 @@ pub use handle::WorkflowHandle;
 pub use memory::InMemoryProvider;
 pub use postgres::PostgresProvider;
 pub use provider::{
-    is_terminal, DequeueRequest, ExportedWorkflow, ListFilter, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    is_terminal, ChangeWait, DequeueRequest, ExportedWorkflow, ListFilter, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use schedule::{

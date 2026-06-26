@@ -1,7 +1,7 @@
 use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::handle::WorkflowHandle;
-use crate::provider::{StateProvider, WorkflowStatus, STATUS_CANCELLED};
+use crate::provider::{ChangeWait, StateProvider, WorkflowStatus, STATUS_CANCELLED};
 use crate::tx::{TransactionOptions, Tx, TxBody};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
@@ -667,7 +667,15 @@ impl DurableContext {
                 return Ok(None);
             }
             let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-            tokio::time::sleep(remaining.min(NOTIFICATION_POLL_INTERVAL)).await;
+            self.provider
+                .await_change(
+                    ChangeWait::Notification {
+                        workflow_id: &self.workflow_id,
+                        topic,
+                    },
+                    remaining.min(self.wait_interval()),
+                )
+                .await;
         }
     }
 
@@ -731,7 +739,15 @@ impl DurableContext {
                 return Ok(None);
             }
             let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-            tokio::time::sleep(remaining.min(NOTIFICATION_POLL_INTERVAL)).await;
+            self.provider
+                .await_change(
+                    ChangeWait::Event {
+                        workflow_id: target_workflow_id,
+                        key,
+                    },
+                    remaining.min(self.wait_interval()),
+                )
+                .await;
         }
     }
 
@@ -797,12 +813,29 @@ impl DurableContext {
     pub fn err(&self, msg: impl Into<String>) -> Error {
         Error::app(msg)
     }
+
+    /// How long a blocked `recv`/`get_event` waits before re-checking the
+    /// database. On a backend with push wake-ups (Postgres `LISTEN`/`NOTIFY`)
+    /// this is just a long backstop — [`StateProvider::await_change`] returns as
+    /// soon as the awaited row is written — so we poll rarely; otherwise it is
+    /// the short polling interval.
+    fn wait_interval(&self) -> Duration {
+        if self.provider.supports_listen_notify() {
+            LISTEN_NOTIFY_BACKSTOP
+        } else {
+            NOTIFICATION_POLL_INTERVAL
+        }
+    }
 }
 
-/// How often blocked `recv`/`get_event` calls re-check the database. (Polling
-/// keeps this portable across backends; a Postgres LISTEN/NOTIFY fast path is a
-/// future optimization.)
+/// How often blocked `recv`/`get_event` calls re-check the database on a backend
+/// that only polls (in-memory, SQLite). Short, for responsiveness.
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Backstop re-check interval on a backend with push wake-ups (Postgres
+/// `LISTEN`/`NOTIFY`): the await returns promptly when the row is written, so we
+/// only fall back to a database re-check this often (covering a missed signal).
+const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 
 /// Prefix on the `function_name` of a patch marker recorded in `operation_outputs`.
 /// A shared identifier, so a patch decision a worker in any language recorded is
