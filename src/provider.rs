@@ -72,6 +72,48 @@ pub const STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED: &str = "MAX_RECOVERY_ATTEMPTS_E
 /// names. User values are serializer-encoded, so they never collide with it.
 pub(crate) const STREAM_CLOSED_SENTINEL: &str = "__DBOS_STREAM_CLOSED__";
 
+/// `LISTEN`/`NOTIFY` channel a new `notifications` row is announced on (the
+/// `dbos_notifications_trigger` payload is `destination_uuid::topic`). Shared
+/// verbatim with the other SDKs and the schema trigger.
+pub(crate) const NOTIFICATIONS_CHANNEL: &str = "dbos_notifications_channel";
+/// `LISTEN`/`NOTIFY` channel a new `workflow_events` row is announced on (the
+/// `dbos_workflow_events_trigger` payload is `workflow_uuid::key`).
+pub(crate) const WORKFLOW_EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
+
+/// A condition a blocked `recv`/`get_event` wants to be nudged about, so it can
+/// re-check the database promptly instead of waiting out its poll interval. A
+/// backend with push signalling (Postgres `LISTEN`/`NOTIFY`) maps each variant to
+/// its channel + payload; others ignore it and simply sleep.
+#[derive(Clone, Copy, Debug)]
+pub enum ChangeWait<'a> {
+    /// A notification delivered to `workflow_id`'s mailbox on `topic`.
+    Notification {
+        workflow_id: &'a str,
+        topic: &'a str,
+    },
+    /// Event `key` set on `workflow_id`.
+    Event { workflow_id: &'a str, key: &'a str },
+}
+
+impl ChangeWait<'_> {
+    /// The `LISTEN`/`NOTIFY` channel this condition is announced on.
+    pub(crate) fn channel(&self) -> &'static str {
+        match self {
+            ChangeWait::Notification { .. } => NOTIFICATIONS_CHANNEL,
+            ChangeWait::Event { .. } => WORKFLOW_EVENTS_CHANNEL,
+        }
+    }
+
+    /// The `NOTIFY` payload the schema trigger emits for this condition
+    /// (`workflow_uuid::topic` / `workflow_uuid::key`).
+    pub(crate) fn payload(&self) -> String {
+        match self {
+            ChangeWait::Notification { workflow_id, topic } => format!("{workflow_id}::{topic}"),
+            ChangeWait::Event { workflow_id, key } => format!("{workflow_id}::{key}"),
+        }
+    }
+}
+
 /// Group ordered `(key, value, serialization)` stream rows — sorted by key then
 /// offset — into one `(key, decoded values)` entry per key, decoding each value
 /// and dropping the close sentinel (a key present only via its sentinel still
@@ -600,6 +642,25 @@ pub struct DequeueRequest {
 pub trait StateProvider: Send + Sync {
     /// Create tables / indexes if they do not yet exist.
     async fn init(&self) -> Result<()>;
+
+    /// Whether this backend pushes change signals (Postgres `LISTEN`/`NOTIFY`),
+    /// so a blocked `recv`/`get_event` is woken as soon as the row it waits for
+    /// is written rather than only by polling. Callers that get `true` can wait
+    /// on a long backstop interval and rely on [`await_change`](Self::await_change)
+    /// for promptness; `false` means they must poll at a short interval.
+    fn supports_listen_notify(&self) -> bool {
+        false
+    }
+
+    /// Wait up to `within` for a hint that `wait`'s condition may have changed,
+    /// returning early when a matching change is signalled. The wake is only a
+    /// hint: the caller must re-check the database (a signal can be missed in the
+    /// gap between the caller's last check and subscribing — the bounded `within`
+    /// is the backstop). Backends without push signalling just sleep.
+    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
+        let _ = wait;
+        tokio::time::sleep(within).await;
+    }
 
     /// Idempotently insert a workflow row. If `status.id` already exists, the
     /// existing row is returned unchanged (so a re-submitted id is a no-op, not a

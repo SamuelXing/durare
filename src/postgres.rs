@@ -1,11 +1,12 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows, is_terminal,
-    nonexistent_or, DequeueRequest, ExportedWorkflow, ListFilter, NotificationInfo, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    nonexistent_or, ChangeWait, DequeueRequest, ExportedWorkflow, ListFilter, NotificationInfo,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -13,9 +14,14 @@ use crate::tx::{IsolationLevel, TransactionOptions, Tx, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
-use sqlx::postgres::{PgPool, PgPoolOptions, Postgres};
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions, Postgres};
 use sqlx::{QueryBuilder, Row};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 /// Columns selected when materializing a [`WorkflowStatus`] from `workflow_status`.
 /// `serialization` drives how `inputs`/`output` are decoded (see [`crate::Serializer`]).
@@ -26,6 +32,74 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      authenticated_user, assumed_role, authenticated_roles, \
      serialization, created_at, updated_at";
 
+/// Routes inbound `LISTEN`/`NOTIFY` notifications to the `recv`/`get_event`
+/// waiters parked on the matching payload. Waiters subscribe by payload; the
+/// listener task wakes them when a `NOTIFY` for that payload arrives.
+#[derive(Default)]
+struct NotifyHub {
+    waiters: Mutex<HashMap<String, WaitEntry>>,
+}
+
+/// The shared wake handle for everyone waiting on one payload, plus a refcount so
+/// the entry is dropped when the last waiter leaves.
+struct WaitEntry {
+    notify: Arc<Notify>,
+    count: usize,
+}
+
+/// An active subscription on one payload; deregisters on drop.
+struct Subscription {
+    hub: Arc<NotifyHub>,
+    payload: String,
+    notify: Arc<Notify>,
+}
+
+impl NotifyHub {
+    /// Register interest in `payload`, returning a [`Subscription`] whose
+    /// `notify` fires when the listener sees a matching `NOTIFY` (or a reconnect).
+    fn subscribe(self: &Arc<Self>, payload: String) -> Subscription {
+        let mut waiters = self.waiters.lock().unwrap();
+        let entry = waiters.entry(payload.clone()).or_insert_with(|| WaitEntry {
+            notify: Arc::new(Notify::new()),
+            count: 0,
+        });
+        entry.count += 1;
+        let notify = entry.notify.clone();
+        Subscription {
+            hub: Arc::clone(self),
+            payload,
+            notify,
+        }
+    }
+
+    /// Wake everyone waiting on exactly `payload`.
+    fn signal(&self, payload: &str) {
+        if let Some(entry) = self.waiters.lock().unwrap().get(payload) {
+            entry.notify.notify_waiters();
+        }
+    }
+
+    /// Wake every waiter — used after a listener reconnect, when a notification
+    /// may have been missed and all waiters should re-check the database.
+    fn signal_all(&self) {
+        for entry in self.waiters.lock().unwrap().values() {
+            entry.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        let mut waiters = self.hub.waiters.lock().unwrap();
+        if let Some(entry) = waiters.get_mut(&self.payload) {
+            entry.count -= 1;
+            if entry.count == 0 {
+                waiters.remove(&self.payload);
+            }
+        }
+    }
+}
+
 /// Postgres-backed [`StateProvider`], built on sqlx and the canonical DBOS
 /// schema (`workflow_status` / `operation_outputs`).
 pub struct PostgresProvider {
@@ -33,12 +107,22 @@ pub struct PostgresProvider {
     /// Format used when *encoding* stored values. Decoding always follows each
     /// row's recorded format, so this only sets what new rows are written as.
     serializer: Serializer,
+    /// Wakes parked `recv`/`get_event` calls from the `LISTEN`/`NOTIFY` listener.
+    /// Note: the listener (started in `init`) holds one pool connection for its
+    /// lifetime, so the app effectively has `max_connections - 1` available.
+    notify_hub: Arc<NotifyHub>,
+    /// Cancels the background listener task when the provider is dropped.
+    listener_token: CancellationToken,
+    /// Ensures the listener task is spawned at most once (on the first `init`).
+    listener_started: AtomicBool,
 }
 
 impl PostgresProvider {
     /// Connect to Postgres using a standard connection URL, e.g.
     /// `postgres://user:pass@localhost:5432/durust`.
     pub async fn connect(database_url: &str) -> Result<Self> {
+        // One of these is held by the LISTEN/NOTIFY listener for its lifetime
+        // (see `notify_hub`), leaving the rest for workflow/app queries.
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .connect(database_url)
@@ -51,6 +135,9 @@ impl PostgresProvider {
         Self {
             pool,
             serializer: Serializer::default(),
+            notify_hub: Arc::new(NotifyHub::default()),
+            listener_token: CancellationToken::new(),
+            listener_started: AtomicBool::new(false),
         }
     }
 
@@ -59,6 +146,101 @@ impl PostgresProvider {
     pub fn with_serializer(mut self, serializer: Serializer) -> Self {
         self.serializer = serializer;
         self
+    }
+}
+
+impl Drop for PostgresProvider {
+    fn drop(&mut self) {
+        // Stop the background listener task (it holds a pooled connection).
+        self.listener_token.cancel();
+    }
+}
+
+/// Initial (and post-recovery) delay between failed listener (re)connect/recv
+/// attempts; doubles up to [`LISTENER_BACKOFF_MAX`].
+const LISTENER_BACKOFF_MIN: Duration = Duration::from_millis(100);
+/// Ceiling on the listener reconnect backoff.
+const LISTENER_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Background task: hold a dedicated connection `LISTEN`ing on the notification
+/// and event channels, and wake the matching waiters as notifications arrive.
+/// Reconnects on failure (waking all waiters to re-poll, in case one was missed),
+/// and exits when `token` is cancelled (provider dropped).
+async fn run_listener(pool: PgPool, hub: Arc<NotifyHub>, token: CancellationToken) {
+    let mut backoff = LISTENER_BACKOFF_MIN;
+    loop {
+        if token.is_cancelled() {
+            return;
+        }
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!(error = %e, "notification listener: connect failed");
+                if !sleep_or_cancel(backoff, &token).await {
+                    return;
+                }
+                backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
+                continue;
+            }
+        };
+        if let Err(e) = listener
+            .listen_all([NOTIFICATIONS_CHANNEL, WORKFLOW_EVENTS_CHANNEL])
+            .await
+        {
+            tracing::debug!(error = %e, "notification listener: LISTEN failed");
+            if !sleep_or_cancel(backoff, &token).await {
+                return;
+            }
+            backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
+            continue;
+        }
+        // Freshly (re)connected: a notification may have been missed while
+        // disconnected, so nudge every waiter to re-check the database.
+        hub.signal_all();
+
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => return,
+                res = listener.try_recv() => match res {
+                    // A notification: wake exactly the channel+payload's waiters.
+                    // Receiving anything proves the link works, so relax the backoff.
+                    Ok(Some(n)) => {
+                        backoff = LISTENER_BACKOFF_MIN;
+                        hub.signal(&hub_key(n.channel(), n.payload()));
+                    }
+                    // try_recv returns None when it had to reconnect; re-poll all.
+                    Ok(None) => {
+                        backoff = LISTENER_BACKOFF_MIN;
+                        hub.signal_all();
+                    }
+                    // Hard error: back off before rebuilding so a recv that keeps
+                    // failing while connect succeeds can't spin (matches Go's loop,
+                    // which sleeps on a notification error rather than retrying hot).
+                    Err(e) => {
+                        tracing::debug!(error = %e, "notification listener: recv failed");
+                        if !sleep_or_cancel(backoff, &token).await {
+                            return;
+                        }
+                        backoff = (backoff * 2).min(LISTENER_BACKOFF_MAX);
+                        break; // rebuild the listener
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Hub key for one waiter: the channel and payload joined by a NUL (so a
+/// notification payload never collides with an identical-looking event payload).
+fn hub_key(channel: &str, payload: &str) -> String {
+    format!("{channel}\u{0}{payload}")
+}
+
+/// Sleep for `dur`, returning `false` if cancelled first.
+async fn sleep_or_cancel(dur: Duration, token: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = token.cancelled() => false,
+        _ = tokio::time::sleep(dur) => true,
     }
 }
 
@@ -121,7 +303,33 @@ impl StateProvider for PostgresProvider {
         sqlx::migrate!("./migrations/postgres")
             .run(&self.pool)
             .await?;
+        // Start the LISTEN/NOTIFY listener once (it powers await_change). Spawned
+        // here so it only runs for a provider that has been brought up; cancelled
+        // when the provider is dropped. `Relaxed` suffices: this is purely a
+        // spawn-once guard — the task's inputs are moved in via `spawn` (which
+        // carries its own happens-before), so the flag publishes no other memory.
+        if !self.listener_started.swap(true, Ordering::Relaxed) {
+            tokio::spawn(run_listener(
+                self.pool.clone(),
+                self.notify_hub.clone(),
+                self.listener_token.clone(),
+            ));
+        }
         Ok(())
+    }
+
+    fn supports_listen_notify(&self) -> bool {
+        true
+    }
+
+    async fn await_change(&self, wait: ChangeWait<'_>, within: Duration) {
+        // Subscribe before awaiting so a NOTIFY arriving during the wait wakes us;
+        // a NOTIFY in the gap before subscribing is covered by `within` (the
+        // caller re-checks the database on return).
+        let sub = self
+            .notify_hub
+            .subscribe(hub_key(wait.channel(), &wait.payload()));
+        let _ = tokio::time::timeout(within, sub.notify.notified()).await;
     }
 
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<WorkflowStatus> {

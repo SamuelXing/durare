@@ -1751,3 +1751,94 @@ async fn pg_export_import_round_trip() -> Result<()> {
         .await?;
     Ok(())
 }
+
+/// A blocked recv wakes via LISTEN/NOTIFY: an external send returns the message
+/// well within the long backstop interval (proving the push path, not polling).
+#[tokio::test]
+async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_recv_wakes_via_listen_notify: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let id = format!("wf-recv-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    assert!(provider.supports_listen_notify());
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("waiter", |ctx: DurableContext, _: ()| async move {
+        let msg: Option<String> = ctx.recv("topic", Duration::from_secs(10)).await?;
+        Ok::<_, Error>(msg.unwrap_or_default())
+    });
+
+    let mut handle = engine
+        .run_workflow::<_, String>("waiter", (), WorkflowOptions::with_id(&id))
+        .await?;
+    // Let the workflow reach recv and subscribe to the channel.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    engine.send(&id, "hello".to_string(), "topic").await?;
+    assert_eq!(handle.get_result().await?, "hello");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "recv should wake via NOTIFY, not the backstop (took {elapsed:?})"
+    );
+
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
+    Ok(())
+}
+
+/// A blocked get_event wakes via LISTEN/NOTIFY when another workflow sets the
+/// event, returning well within the backstop interval.
+#[tokio::test]
+async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_get_event_wakes_via_listen_notify: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let reader_id = format!("reader-{tag}");
+    let setter_id = format!("setter-{tag}");
+
+    let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    engine.register("reader", |ctx: DurableContext, target: String| async move {
+        let v: Option<String> = ctx.get_event(&target, "k", Duration::from_secs(10)).await?;
+        Ok::<_, Error>(v.unwrap_or_default())
+    });
+    engine.register("setter", |ctx: DurableContext, _: ()| async move {
+        ctx.set_event("k", "v").await?;
+        Ok::<_, Error>(String::new())
+    });
+
+    let mut reader = engine
+        .run_workflow::<_, String>(
+            "reader",
+            setter_id.clone(),
+            WorkflowOptions::with_id(&reader_id),
+        )
+        .await?;
+    // Let the reader reach get_event and subscribe.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    engine
+        .run_workflow::<_, String>("setter", (), WorkflowOptions::with_id(&setter_id))
+        .await?
+        .get_result()
+        .await?;
+    assert_eq!(reader.get_result().await?, "v");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "get_event should wake via NOTIFY, not the backstop (took {elapsed:?})"
+    );
+
+    engine
+        .delete_workflows(&[reader_id, setter_id], false)
+        .await?;
+    Ok(())
+}
