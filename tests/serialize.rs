@@ -201,3 +201,84 @@ async fn portable_written_default_read() -> Result<()> {
 async fn default_written_portable_read() -> Result<()> {
     cross_format(Serializer::Json, Serializer::Portable, "d2p").await
 }
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
+struct Row {
+    id: i64,
+    tags: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug, Clone)]
+struct Report {
+    title: String,
+    rows: Vec<Row>,
+    meta: std::collections::HashMap<String, i64>,
+    note: Option<String>,
+}
+
+fn sample_report() -> Report {
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("total".to_string(), 3);
+    meta.insert("ok".to_string(), 2);
+    Report {
+        title: "quarterly".to_string(),
+        rows: vec![
+            Row {
+                id: 1,
+                tags: vec!["a".to_string(), "b".to_string()],
+            },
+            Row {
+                id: 2,
+                tags: vec![],
+            },
+        ],
+        meta,
+        note: None,
+    }
+}
+
+/// A deeply-nested value (struct with vectors, a map, an option, and nested
+/// structs) survives real TEXT (de)serialization on SQLite intact — not just an
+/// in-memory clone: the step serializes it into its checkpoint and the workflow
+/// output, and it reconstructs to the exact structure on read.
+///
+/// Re-submitting the same id returns the stored output without running the body
+/// again (OAOO completion), so the builder step stays at a single execution. That
+/// is start-time dedup, not mid-flight step-checkpoint replay — the body is not
+/// re-executed here.
+#[tokio::test]
+async fn nested_value_round_trips_through_step_checkpoint() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+    let (url, path) = temp_db_url("nested");
+    let provider = SqliteProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    engine.register("report", |ctx: DurableContext, _: ()| async move {
+        let r = ctx
+            .step("build", || async {
+                BUILDS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(sample_report())
+            })
+            .await?;
+        Ok::<_, Error>(r)
+    });
+
+    // First execution builds and checkpoints the nested value.
+    let a: Report = engine.start_typed("report", "wf-nested", ()).await?;
+    assert_eq!(a, sample_report());
+
+    // Re-submitting the same id returns the stored output, deserialized back to
+    // the identical structure, without re-running the body.
+    let b: Report = engine.start_typed("report", "wf-nested", ()).await?;
+    assert_eq!(b, sample_report());
+    assert_eq!(
+        BUILDS.load(Ordering::SeqCst),
+        1,
+        "the step ran once; the resubmit returns the stored output, not a re-run"
+    );
+
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
