@@ -632,6 +632,53 @@ async fn sqlite_workflow_steps_introspection() -> Result<()> {
     Ok(())
 }
 
+/// Transactions and plain steps draw from the **same** per-workflow step counter:
+/// interleaving them assigns sequential ids (step 0, transaction 1, step 2), so a
+/// transaction is addressed by replay exactly like any other step.
+#[tokio::test]
+async fn sqlite_interleaved_step_and_transaction_share_seq() -> Result<()> {
+    use durust::params;
+    let (url, path) = temp_db_url("interleave");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("mix", |ctx: DurableContext, _: ()| async move {
+        // seq 0: a plain step.
+        ctx.step("before", || async { Ok::<_, Error>(1_i64) })
+            .await?;
+        // seq 1: a transaction step in between.
+        ctx.transaction::<(), _>("tx", |tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "CREATE TABLE IF NOT EXISTS m (id INTEGER PRIMARY KEY)",
+                    &params![],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await?;
+        // seq 2: another plain step.
+        ctx.step("after", || async { Ok::<_, Error>(2_i64) })
+            .await?;
+        Ok::<_, Error>(ctx.current_step_id() as i64)
+    });
+
+    let next_seq: i64 = engine.start_typed("mix", "w-mix", ()).await?;
+    assert_eq!(next_seq, 3, "step, transaction, step consumed seqs 0,1,2");
+
+    let steps = engine.get_workflow_steps("w-mix").await?;
+    assert_eq!(steps.len(), 3);
+    assert_eq!((steps[0].step_id, steps[0].name.as_str()), (0, "before"));
+    assert_eq!(
+        (steps[1].step_id, steps[1].name.as_str()),
+        (1, "tx"),
+        "the transaction landed at seq 1, sharing the step counter"
+    );
+    assert_eq!((steps[2].step_id, steps[2].name.as_str()), (2, "after"));
+
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// Management on the SQL backend: list filters (QueryBuilder), cancel/resume,
 /// and fork copying step checkpoints.
 #[tokio::test]

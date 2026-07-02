@@ -142,3 +142,39 @@ async fn list_schedules_filters() -> Result<()> {
 
     Ok(())
 }
+
+/// Resume re-activates a paused schedule (status returns to Active); pausing or
+/// resuming an unknown name is a no-op that returns `false` rather than erroring.
+#[tokio::test]
+async fn resume_reactivates_and_unknown_name_is_a_noop() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("wf", |_ctx: DurableContext, _at: String| async move {
+        Ok::<_, durust::Error>(())
+    });
+    engine
+        .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())
+        .await?;
+    assert_eq!(
+        engine.get_schedule("s").await?.unwrap().status,
+        ScheduleStatus::Active
+    );
+
+    assert!(engine.pause_schedule("s").await?);
+    assert_eq!(
+        engine.get_schedule("s").await?.unwrap().status,
+        ScheduleStatus::Paused
+    );
+
+    // Resume flips it back to Active.
+    assert!(engine.resume_schedule("s").await?, "resume returns true");
+    assert_eq!(
+        engine.get_schedule("s").await?.unwrap().status,
+        ScheduleStatus::Active,
+        "resume re-activates the schedule"
+    );
+
+    // An unknown name is a no-op returning false (not an error).
+    assert!(!engine.pause_schedule("nope").await?);
+    assert!(!engine.resume_schedule("nope").await?);
+    Ok(())
+}

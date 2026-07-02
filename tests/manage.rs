@@ -726,6 +726,32 @@ async fn step_aggregates_count_and_duration() -> Result<()> {
     Ok(())
 }
 
+/// Management ops on a non-existent workflow behave sanely: cancel is an
+/// idempotent no-op, while resume and fork fail (there is nothing to re-run).
+#[tokio::test]
+async fn management_ops_on_missing_workflow() -> Result<()> {
+    let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+
+    // Cancel of an unknown id is a no-op (idempotent), not an error.
+    assert!(
+        engine.cancel_workflow("ghost").await.is_ok(),
+        "cancel of a missing workflow is a no-op"
+    );
+    // Resume and fork of an unknown id fail — nothing exists to re-run.
+    assert!(
+        engine.resume_workflow::<()>("ghost").await.is_err(),
+        "resume of a missing workflow errors"
+    );
+    assert!(
+        engine
+            .fork_workflow::<()>("ghost", 0, WorkflowOptions::default())
+            .await
+            .is_err(),
+        "fork of a missing workflow errors"
+    );
+    Ok(())
+}
+
 async fn status_of(provider: &Arc<InMemoryProvider>, id: &str) -> String {
     provider
         .get_workflow_status(id)
