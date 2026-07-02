@@ -1827,11 +1827,12 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
         qb.push(")");
     }
     if let Some(wf) = filter.was_forked_from {
+        // The column is NOT NULL DEFAULT FALSE, so plain equality suffices.
         clause(qb);
         qb.push(if wf {
             "was_forked_from = TRUE"
         } else {
-            "(was_forked_from = FALSE OR was_forked_from IS NULL)"
+            "was_forked_from = FALSE"
         });
     }
     if let Some(t) = filter.start_time_ms {
