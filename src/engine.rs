@@ -1362,10 +1362,15 @@ impl Runtime {
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
         if !queued {
-            // Direct runs start now, so the deadline is fixed here; for queued
-            // runs it is computed when a dispatcher claims the workflow.
-            row.started_at_ms = Some(now_ms);
-            row.deadline_ms = row.timeout_ms.map(|t| now_ms + t);
+            // Direct runs start the instant they are created, so the deadline is
+            // fixed here (queued runs get theirs when a dispatcher claims them).
+            // Derive both from the row's own `created_at` rather than the separate,
+            // earlier `now_ms` read: otherwise `started_at` can land a millisecond
+            // before `created_at`, making queue-wait (`started_at - created_at`)
+            // spuriously negative — a row that "started before it was created".
+            let created_ms = row.created_at.timestamp_millis();
+            row.started_at_ms = Some(created_ms);
+            row.deadline_ms = row.timeout_ms.map(|t| created_ms + t);
         }
 
         let canonical = self.provider.insert_workflow_status(row).await?;

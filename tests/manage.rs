@@ -55,6 +55,30 @@ async fn retrieve_and_list() -> Result<()> {
     Ok(())
 }
 
+/// A direct run's `started_at` is never before its `created_at` — they are the
+/// same instant (queue-wait 0). Regression for a bug where `started_at` was
+/// back-filled from a clock read taken *before* the one that set `created_at`,
+/// so `started_at - created_at` could be -1ms and queue-wait aggregates went
+/// negative (a row that "started before it was created").
+#[tokio::test]
+async fn direct_run_started_at_equals_created_at() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    engine.start_typed::<_, ()>("noop", "d1", ()).await?;
+
+    let s = provider.get_workflow_status("d1").await?.unwrap();
+    let started = s.started_at_ms.expect("a direct run records started_at");
+    assert_eq!(
+        started,
+        s.created_at.timestamp_millis(),
+        "a direct run starts exactly when it is created, so queue-wait is 0"
+    );
+    Ok(())
+}
+
 /// A cancelled workflow refuses further steps; resume re-runs it from its
 /// checkpoints (the already-recorded step is not re-executed).
 #[tokio::test]
