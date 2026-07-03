@@ -13,10 +13,12 @@
 //! rewritten to `$1, $2, …` for Postgres); bind values go through [`Param`],
 //! most easily via the [`params!`](crate::params) macro.
 
+use crate::context::RetryPredicate;
 use crate::error::{Error, Result};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// A bound parameter for transactional-step SQL. Build these with
 /// [`params!`](crate::params) rather than by hand in the common case.
@@ -258,22 +260,51 @@ impl IsolationLevel {
     }
 }
 
-/// Options for a transactional step: its checkpoint `name`, isolation level, and
-/// whether the transaction is read-only.
-#[derive(Clone, Debug)]
+/// Options for a transactional step: its checkpoint `name`, isolation level,
+/// whether the transaction is read-only, and the user-facing retry policy for
+/// application errors raised by the body.
+///
+/// Two retry layers apply, matching the reference SDK. A transaction-level
+/// **conflict** (serialization / deadlock / `SQLITE_BUSY`) is always retried on
+/// a fresh transaction and never counts against the budget below. An
+/// **application error** returned by the body is retried only if `max_retries`
+/// allows it (and any [`retry_if`](Self::retry_if) predicate accepts it), with
+/// exponential backoff; the whole body re-runs on a new transaction. Only after
+/// the budget is exhausted is the failure checkpointed durably. With the default
+/// `max_retries` of 0 an application error fails immediately, as before.
+#[derive(Clone)]
 pub struct TransactionOptions {
     pub name: String,
     pub isolation: IsolationLevel,
     pub read_only: bool,
+    /// Additional attempts after the first failure (0 = run once, no retry).
+    pub max_retries: u32,
+    /// Exponential backoff multiplier between attempts.
+    pub backoff_factor: f64,
+    /// Delay before the first retry.
+    pub base_interval: Duration,
+    /// Upper bound on any single backoff delay.
+    pub max_interval: Duration,
+    /// Optional predicate deciding whether a body error is retryable. Returning
+    /// `false` stops retries immediately even with attempts remaining, so a
+    /// permanent error fails fast. `None` (the default) retries every error up to
+    /// `max_retries`. A transaction conflict is retried regardless of this.
+    pub retry_if: Option<RetryPredicate>,
 }
 
 impl TransactionOptions {
-    /// Default options (`ReadCommitted`, read-write) for a step named `name`.
+    /// Default options (`ReadCommitted`, read-write, no user-retry) for a step
+    /// named `name`.
     pub fn new(name: impl Into<String>) -> Self {
         TransactionOptions {
             name: name.into(),
             isolation: IsolationLevel::default(),
             read_only: false,
+            max_retries: 0,
+            backoff_factor: 2.0,
+            base_interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(5),
+            retry_if: None,
         }
     }
 
@@ -287,6 +318,67 @@ impl TransactionOptions {
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
         self
+    }
+
+    /// Set the number of retries (attempts after the first) for body errors.
+    pub fn max_retries(mut self, n: u32) -> Self {
+        self.max_retries = n;
+        self
+    }
+
+    /// Set the backoff multiplier between retries.
+    pub fn backoff_factor(mut self, f: f64) -> Self {
+        self.backoff_factor = f;
+        self
+    }
+
+    /// Set the initial retry delay.
+    pub fn base_interval(mut self, d: Duration) -> Self {
+        self.base_interval = d;
+        self
+    }
+
+    /// Set the maximum retry delay.
+    pub fn max_interval(mut self, d: Duration) -> Self {
+        self.max_interval = d;
+        self
+    }
+
+    /// Set a predicate deciding whether a body error is retryable. It is
+    /// consulted on every failure before backoff; returning `false` stops retries
+    /// at once (the error propagates), so a permanent failure doesn't burn
+    /// attempts:
+    ///
+    /// ```ignore
+    /// let opts = TransactionOptions::new("transfer")
+    ///     .max_retries(5)
+    ///     .retry_if(|e: &Error| e.is_retryable());
+    /// ```
+    pub fn retry_if<P>(mut self, predicate: P) -> Self
+    where
+        P: Fn(&Error) -> bool + Send + Sync + 'static,
+    {
+        self.retry_if = Some(std::sync::Arc::new(predicate));
+        self
+    }
+
+    /// Exponential backoff delay before the `attempt`-th user-retry (0-based),
+    /// matching [`StepOptions`](crate::StepOptions): `base * factor^attempt`,
+    /// capped at `max_interval`.
+    pub(crate) fn user_retry_backoff(&self, attempt: u32) -> Duration {
+        let secs = self.base_interval.as_secs_f64() * self.backoff_factor.powi(attempt as i32);
+        Duration::from_secs_f64(secs).min(self.max_interval)
+    }
+
+    /// Decide whether a body error should be retried on attempt `attempt`
+    /// (0-based, the number of retries already performed). A transaction conflict
+    /// is never retried here — it belongs to the inner transaction loop and does
+    /// not count against this budget, so an exhausted conflict fails immediately
+    /// rather than re-running the whole body.
+    pub(crate) fn should_user_retry(&self, err: &Error, attempt: u32) -> bool {
+        !err.is_tx_conflict()
+            && attempt < self.max_retries
+            && self.retry_if.as_ref().is_none_or(|p| p(err))
     }
 }
 

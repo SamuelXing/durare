@@ -5,8 +5,8 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
-    PostgresProvider, Result, ScheduledInput, Serializer, StateProvider, WorkflowOptions,
-    WorkflowQueue, WorkflowStatus, STATUS_PENDING,
+    PostgresProvider, Result, ScheduledInput, Serializer, StateProvider, TransactionOptions,
+    WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -1989,6 +1989,92 @@ async fn pg_checkpoints_a_caught_transaction_failure() -> Result<()> {
         TX_RUNS.load(Ordering::SeqCst),
         1,
         "a checkpointed failed transaction step is not re-run on replay"
+    );
+    Ok(())
+}
+
+/// `TransactionOptions::max_retries` re-runs the whole body on an application
+/// error until it succeeds; a `retry_if` predicate that rejects the error fails
+/// fast without burning the budget. Both run against a real Postgres transaction.
+#[tokio::test]
+async fn pg_transaction_body_user_retry() -> Result<()> {
+    use durust::params;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RETRY_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static FAST_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_transaction_body_user_retry: DATABASE_URL unset");
+        return Ok(());
+    };
+    RETRY_RUNS.store(0, Ordering::SeqCst);
+    FAST_RUNS.store(0, Ordering::SeqCst);
+    let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+
+    // Body fails twice then succeeds; max_retries(3) re-runs it to success.
+    engine.register("retry", |ctx: DurableContext, _: ()| async move {
+        let opts = TransactionOptions::new("flaky")
+            .max_retries(3)
+            .base_interval(Duration::from_millis(1));
+        let n: i64 = ctx
+            .transaction_with(opts, |tx| {
+                Box::pin(async move {
+                    tx.execute("SELECT 1", &params![]).await?;
+                    let run = RETRY_RUNS.fetch_add(1, Ordering::SeqCst);
+                    if run < 2 {
+                        Err(Error::app("transient"))
+                    } else {
+                        Ok(42_i64)
+                    }
+                })
+            })
+            .await?;
+        Ok::<_, Error>(n)
+    });
+
+    // A rejected error stops immediately despite max_retries(5).
+    engine.register("nofast", |ctx: DurableContext, _: ()| async move {
+        let opts = TransactionOptions::new("permanent")
+            .max_retries(5)
+            .base_interval(Duration::from_millis(1))
+            .retry_if(|e: &Error| e.is_retryable());
+        let r: Result<i64> = ctx
+            .transaction_with(opts, |tx| {
+                Box::pin(async move {
+                    tx.execute("SELECT 1", &params![]).await?;
+                    FAST_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Err(Error::app("permanent failure"))
+                })
+            })
+            .await;
+        Ok::<_, Error>(r.is_err())
+    });
+
+    let out: i64 = engine
+        .start_typed(
+            "retry",
+            &format!("wf-txn-retry-{}", uuid::Uuid::new_v4()),
+            (),
+        )
+        .await?;
+    assert_eq!(out, 42, "the body eventually succeeds");
+    assert_eq!(
+        RETRY_RUNS.load(Ordering::SeqCst),
+        3,
+        "the body re-runs twice then succeeds (1 + 2 retries)"
+    );
+
+    let failed: bool = engine
+        .start_typed(
+            "nofast",
+            &format!("wf-txn-nofast-{}", uuid::Uuid::new_v4()),
+            (),
+        )
+        .await?;
+    assert!(failed, "the error is surfaced to the caller");
+    assert_eq!(
+        FAST_RUNS.load(Ordering::SeqCst),
+        1,
+        "a rejected error is not retried despite max_retries(5)"
     );
     Ok(())
 }
