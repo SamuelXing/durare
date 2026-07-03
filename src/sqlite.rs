@@ -348,7 +348,7 @@ impl StateProvider for SqliteProvider {
         let mut user_attempt: u32 = 0;
         loop {
             let mut conflict_attempt: u32 = 0;
-            let attempt = 'conflict: loop {
+            let body_err = 'conflict: loop {
                 let outcome = async {
                     let mut tx = self.pool.begin().await?;
                     // Replay: if this step already committed, return its recorded
@@ -430,12 +430,12 @@ impl StateProvider for SqliteProvider {
             // A body error reached the user-retry policy: retry the whole body if
             // the budget allows and the predicate accepts, otherwise record the
             // failure durably and surface the original error.
-            if opts.should_user_retry(&attempt, user_attempt) {
+            if opts.should_user_retry(&body_err, user_attempt) {
                 let delay = opts.user_retry_backoff(user_attempt);
                 tracing::warn!(
                     step = %name,
                     attempt = user_attempt + 1,
-                    error = %attempt,
+                    error = %body_err,
                     "transaction failed; retrying after backoff"
                 );
                 tokio::time::sleep(delay).await;
@@ -452,13 +452,13 @@ impl StateProvider for SqliteProvider {
             .bind(workflow_id)
             .bind(seq)
             .bind(name)
-            .bind(serialize::encode_error(&self.serializer, &attempt))
+            .bind(serialize::encode_error(&self.serializer, &body_err))
             .bind(self.serializer.name())
             .bind(started_at_ms)
             .bind(Utc::now().timestamp_millis())
             .execute(&self.pool)
             .await?;
-            return Err(attempt);
+            return Err(body_err);
         }
     }
 

@@ -558,7 +558,7 @@ impl StateProvider for PostgresProvider {
             // INNER loop: one committed success, or an application error surfaced
             // to the outer loop. A serialization/deadlock conflict aborts the tx
             // and retries on a fresh one without recording anything.
-            let attempt = 'conflict: loop {
+            let body_err = 'conflict: loop {
                 let outcome = async {
                     let mut tx = self.pool.begin().await?;
                     // `SET TRANSACTION` must come before any query in the tx.
@@ -654,12 +654,12 @@ impl StateProvider for PostgresProvider {
             // the budget allows and the predicate accepts; otherwise record the
             // failure durably (outside any transaction) so a replay returns it
             // without re-running, and surface the original error.
-            if opts.should_user_retry(&attempt, user_attempt) {
+            if opts.should_user_retry(&body_err, user_attempt) {
                 let delay = opts.user_retry_backoff(user_attempt);
                 tracing::warn!(
                     step = %name,
                     attempt = user_attempt + 1,
-                    error = %attempt,
+                    error = %body_err,
                     "transaction failed; retrying after backoff"
                 );
                 tokio::time::sleep(delay).await;
@@ -676,13 +676,13 @@ impl StateProvider for PostgresProvider {
             .bind(workflow_id)
             .bind(seq)
             .bind(name)
-            .bind(serialize::encode_error(&self.serializer, &attempt))
+            .bind(serialize::encode_error(&self.serializer, &body_err))
             .bind(self.serializer.name())
             .bind(started_at_ms)
             .bind(Utc::now().timestamp_millis())
             .execute(&self.pool)
             .await?;
-            return Err(attempt);
+            return Err(body_err);
         }
     }
 

@@ -371,10 +371,14 @@ impl TransactionOptions {
     }
 
     /// Decide whether a body error should be retried on attempt `attempt`
-    /// (0-based, the number of retries already performed). A conflict is not
-    /// handled here — it is retried by the inner transaction loop.
+    /// (0-based, the number of retries already performed). A transaction conflict
+    /// is never retried here — it belongs to the inner transaction loop and does
+    /// not count against this budget, so an exhausted conflict fails immediately
+    /// rather than re-running the whole body.
     pub(crate) fn should_user_retry(&self, err: &Error, attempt: u32) -> bool {
-        attempt < self.max_retries && self.retry_if.as_ref().is_none_or(|p| p(err))
+        !err.is_tx_conflict()
+            && attempt < self.max_retries
+            && self.retry_if.as_ref().is_none_or(|p| p(err))
     }
 }
 
