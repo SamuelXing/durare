@@ -547,114 +547,142 @@ impl StateProvider for PostgresProvider {
         body: TxBody<'_>,
     ) -> Result<Value> {
         let name = opts.name.as_str();
-        const MAX_ATTEMPTS: u32 = 10;
-        let mut attempt: u32 = 0;
+        const MAX_CONFLICT_ATTEMPTS: u32 = 10;
+        // OUTER loop: the user-facing retry policy for application errors. A body
+        // error is retried up to `opts.max_retries` (gated by `retry_if`), the
+        // whole body re-running on a fresh transaction. Conflicts are handled by
+        // the inner loop and don't count against this budget.
+        let mut user_attempt: u32 = 0;
         loop {
-            // One attempt: a fresh transaction. A serialization/deadlock conflict
-            // anywhere here aborts it and we retry on a new one.
-            let outcome = async {
-                let mut tx = self.pool.begin().await?;
-                // `SET TRANSACTION` must come before any query in the tx.
-                if opts.isolation != IsolationLevel::ReadCommitted || opts.read_only {
-                    let mut stmt = format!(
-                        "SET TRANSACTION ISOLATION LEVEL {}",
-                        opts.isolation.pg_sql()
-                    );
-                    if opts.read_only {
-                        stmt.push_str(" READ ONLY");
+            let mut conflict_attempt: u32 = 0;
+            // INNER loop: one committed success, or an application error surfaced
+            // to the outer loop. A serialization/deadlock conflict aborts the tx
+            // and retries on a fresh one without recording anything.
+            let attempt = 'conflict: loop {
+                let outcome = async {
+                    let mut tx = self.pool.begin().await?;
+                    // `SET TRANSACTION` must come before any query in the tx.
+                    if opts.isolation != IsolationLevel::ReadCommitted || opts.read_only {
+                        let mut stmt = format!(
+                            "SET TRANSACTION ISOLATION LEVEL {}",
+                            opts.isolation.pg_sql()
+                        );
+                        if opts.read_only {
+                            stmt.push_str(" READ ONLY");
+                        }
+                        sqlx::query(&stmt).execute(&mut *tx).await?;
                     }
-                    sqlx::query(&stmt).execute(&mut *tx).await?;
-                }
-                // Replay: if this step already committed, return its recorded
-                // outcome (output as Ok, a recorded failure as Err) without
-                // running the body.
-                if let Some(r) = sqlx::query(
-                    "SELECT output, error, serialization FROM operation_outputs
-                     WHERE workflow_uuid = $1 AND function_id = $2",
-                )
-                .bind(workflow_id)
-                .bind(seq)
-                .fetch_optional(&mut *tx)
-                .await?
-                {
-                    let fmt: Option<String> = r.get("serialization");
-                    if let Some(so) = step_outcome_from(
-                        &self.serializer,
-                        fmt.as_deref(),
-                        r.get::<Option<String>, _>("output").as_deref(),
-                        r.get::<Option<String>, _>("error").as_deref(),
-                    )? {
-                        return so.into_value_result();
+                    // Replay: if this step already committed, return its recorded
+                    // outcome (output as Ok, a recorded failure as Err) without
+                    // running the body.
+                    if let Some(r) = sqlx::query(
+                        "SELECT output, error, serialization FROM operation_outputs
+                         WHERE workflow_uuid = $1 AND function_id = $2",
+                    )
+                    .bind(workflow_id)
+                    .bind(seq)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    {
+                        let fmt: Option<String> = r.get("serialization");
+                        if let Some(so) = step_outcome_from(
+                            &self.serializer,
+                            fmt.as_deref(),
+                            r.get::<Option<String>, _>("output").as_deref(),
+                            r.get::<Option<String>, _>("error").as_deref(),
+                        )? {
+                            return so.into_value_result();
+                        }
                     }
-                }
-                // Run the user's body against this transaction.
-                let body_result = {
-                    let mut h = Tx::postgres(&mut tx);
-                    body(&mut h).await
-                };
-                match body_result {
-                    // Success: checkpoint the output in the same transaction, so
-                    // the body's writes and the checkpoint commit atomically.
-                    Ok(value) => {
-                        sqlx::query(
-                            "INSERT INTO operation_outputs
-                                 (workflow_uuid, function_id, function_name, output, serialization,
-                                  started_at_epoch_ms, completed_at_epoch_ms)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7)
-                             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-                        )
-                        .bind(workflow_id)
-                        .bind(seq)
-                        .bind(name)
-                        .bind(self.serializer.encode(&value)?)
-                        .bind(self.serializer.name())
-                        .bind(started_at_ms)
-                        .bind(Utc::now().timestamp_millis())
-                        .execute(&mut *tx)
-                        .await?;
-                        tx.commit().await?;
-                        Ok(value)
-                    }
-                    // A transaction conflict is retried on a fresh transaction;
-                    // dropping `tx` rolls back the body's writes. Not recorded.
-                    Err(e) if e.is_tx_conflict() => Err(e),
-                    // A genuine body error: roll back the body's writes (the step
-                    // stays atomic), then record the error *outside* the aborted
-                    // transaction so the failed step is durable and not re-run on
-                    // replay. The original error is surfaced to the caller.
-                    Err(e) => {
-                        tx.rollback().await?;
-                        sqlx::query(
-                            "INSERT INTO operation_outputs
-                                 (workflow_uuid, function_id, function_name, error, serialization,
-                                  started_at_epoch_ms, completed_at_epoch_ms)
-                             VALUES ($1, $2, $3, $4, $5, $6, $7)
-                             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-                        )
-                        .bind(workflow_id)
-                        .bind(seq)
-                        .bind(name)
-                        .bind(serialize::encode_error(&self.serializer, &e))
-                        .bind(self.serializer.name())
-                        .bind(started_at_ms)
-                        .bind(Utc::now().timestamp_millis())
-                        .execute(&self.pool)
-                        .await?;
-                        Err(e)
+                    // Run the user's body against this transaction.
+                    let body_result = {
+                        let mut h = Tx::postgres(&mut tx);
+                        body(&mut h).await
+                    };
+                    match body_result {
+                        // Success: checkpoint the output in the same transaction, so
+                        // the body's writes and the checkpoint commit atomically.
+                        Ok(value) => {
+                            sqlx::query(
+                                "INSERT INTO operation_outputs
+                                     (workflow_uuid, function_id, function_name, output, serialization,
+                                      started_at_epoch_ms, completed_at_epoch_ms)
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                                 ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+                            )
+                            .bind(workflow_id)
+                            .bind(seq)
+                            .bind(name)
+                            .bind(self.serializer.encode(&value)?)
+                            .bind(self.serializer.name())
+                            .bind(started_at_ms)
+                            .bind(Utc::now().timestamp_millis())
+                            .execute(&mut *tx)
+                            .await?;
+                            tx.commit().await?;
+                            Ok(value)
+                        }
+                        // Any error rolls back the body's writes (dropping `tx` on a
+                        // conflict, an explicit rollback otherwise) so the step stays
+                        // atomic. Nothing is recorded here: a conflict retries on a
+                        // fresh tx, and an application error is left for the outer
+                        // user-retry loop, which records it only once the budget is
+                        // exhausted.
+                        Err(e) if e.is_tx_conflict() => Err(e),
+                        Err(e) => {
+                            tx.rollback().await?;
+                            Err(e)
+                        }
                     }
                 }
-            }
-            .await;
+                .await;
 
-            match outcome {
-                Ok(v) => return Ok(v),
-                Err(e) if e.is_tx_conflict() && attempt + 1 < MAX_ATTEMPTS => {
-                    attempt += 1;
-                    let ms = (1u64 << attempt.min(6)).min(200);
-                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                match outcome {
+                    Ok(v) => return Ok(v),
+                    Err(e)
+                        if e.is_tx_conflict() && conflict_attempt + 1 < MAX_CONFLICT_ATTEMPTS =>
+                    {
+                        conflict_attempt += 1;
+                        let ms = (1u64 << conflict_attempt.min(6)).min(200);
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    }
+                    Err(e) => break 'conflict e,
                 }
-                Err(e) => return Err(e),
+            };
+
+            // A body error reached the user-retry policy. Retry the whole body if
+            // the budget allows and the predicate accepts; otherwise record the
+            // failure durably (outside any transaction) so a replay returns it
+            // without re-running, and surface the original error.
+            if opts.should_user_retry(&attempt, user_attempt) {
+                let delay = opts.user_retry_backoff(user_attempt);
+                tracing::warn!(
+                    step = %name,
+                    attempt = user_attempt + 1,
+                    error = %attempt,
+                    "transaction failed; retrying after backoff"
+                );
+                tokio::time::sleep(delay).await;
+                user_attempt += 1;
+                continue;
             }
+            sqlx::query(
+                "INSERT INTO operation_outputs
+                     (workflow_uuid, function_id, function_name, error, serialization,
+                      started_at_epoch_ms, completed_at_epoch_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+            )
+            .bind(workflow_id)
+            .bind(seq)
+            .bind(name)
+            .bind(serialize::encode_error(&self.serializer, &attempt))
+            .bind(self.serializer.name())
+            .bind(started_at_ms)
+            .bind(Utc::now().timestamp_millis())
+            .execute(&self.pool)
+            .await?;
+            return Err(attempt);
         }
     }
 

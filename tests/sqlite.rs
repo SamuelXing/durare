@@ -3,7 +3,7 @@
 
 use durust::{
     DurableContext, DurableEngine, Error, ListFilter, Result, ScheduledInput, SqliteProvider,
-    WorkflowOptions, WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
+    TransactionOptions, WorkflowOptions, WorkflowQueue, STATUS_CANCELLED, STATUS_SUCCESS,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -2019,6 +2019,90 @@ async fn sqlite_checkpoints_a_caught_transaction_failure() -> Result<()> {
         "a checkpointed failed transaction step is not re-run on replay"
     );
 
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// `TransactionOptions::max_retries` re-runs the whole body on an application
+/// error, on a fresh transaction, until it succeeds. The successful attempt is
+/// the one that's checkpointed, so nothing is recorded as failed.
+#[tokio::test]
+async fn sqlite_transaction_retries_body_error() -> Result<()> {
+    use durust::params;
+    static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("txn-retry");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("retry", |ctx: DurableContext, _: ()| async move {
+        let opts = TransactionOptions::new("flaky")
+            .max_retries(3)
+            .base_interval(Duration::from_millis(1));
+        let n: i64 = ctx
+            .transaction_with(opts, |tx| {
+                Box::pin(async move {
+                    // Touch the tx so each attempt really opens one.
+                    tx.execute("SELECT 1", &params![]).await?;
+                    let run = TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                    if run < 2 {
+                        Err(Error::app("transient"))
+                    } else {
+                        Ok(42_i64)
+                    }
+                })
+            })
+            .await?;
+        Ok::<_, Error>(n)
+    });
+    let out: i64 = engine.start_typed("retry", "wf-txn-retry", ()).await?;
+    assert_eq!(
+        out, 42,
+        "the body eventually succeeds and returns its value"
+    );
+    assert_eq!(
+        TX_RUNS.load(Ordering::SeqCst),
+        3,
+        "the body re-runs twice then succeeds (1 + 2 retries)"
+    );
+    // The checkpointed step is the success, not a failure.
+    let steps = engine.get_workflow_steps("wf-txn-retry").await?;
+    let step = steps.iter().find(|s| s.name == "flaky").expect("recorded");
+    assert!(step.error.is_none(), "the recorded outcome is the success");
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+/// A `retry_if` predicate that rejects the error stops retries immediately, even
+/// with `max_retries` remaining: the body runs exactly once and the error is
+/// surfaced (and checkpointed) without burning the budget.
+#[tokio::test]
+async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
+    use durust::params;
+    static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
+    let (url, path) = temp_db_url("txn-nofast");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("nofast", |ctx: DurableContext, _: ()| async move {
+        let opts = TransactionOptions::new("permanent")
+            .max_retries(5)
+            .base_interval(Duration::from_millis(1))
+            .retry_if(|e: &Error| e.is_retryable());
+        let r: Result<i64> = ctx
+            .transaction_with(opts, |tx| {
+                Box::pin(async move {
+                    tx.execute("SELECT 1", &params![]).await?;
+                    TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                    // A plain app error is not retryable, so the predicate rejects it.
+                    Err(Error::app("permanent failure"))
+                })
+            })
+            .await;
+        Ok::<_, Error>(r.is_err())
+    });
+    let failed: bool = engine.start_typed("nofast", "wf-txn-nofast", ()).await?;
+    assert!(failed, "the error is surfaced to the caller");
+    assert_eq!(
+        TX_RUNS.load(Ordering::SeqCst),
+        1,
+        "a rejected error is not retried despite max_retries(5)"
+    );
     let _ = std::fs::remove_file(path);
     Ok(())
 }
