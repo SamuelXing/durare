@@ -465,11 +465,16 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
         .find(|r| r["group"]["status"] == "SUCCESS")
         .expect("a SUCCESS group");
     assert_eq!(success["count"], 1);
-    // Selected latency aggregates are now computed (a direct run starts
-    // immediately, so queue-wait is ~0 rather than null).
+    // Selected latency aggregates are now computed. A direct run starts the
+    // instant it is created, so queue-wait is exactly 0 (not null, and never
+    // negative — started_at is derived from created_at, so it can't precede it).
     assert!(success["min_created_at"].is_number());
     assert!(success["max_total_latency_ms"].as_i64().unwrap() >= 0);
-    assert!(success["max_queue_wait_ms"].as_i64().unwrap() >= 0);
+    assert_eq!(
+        success["max_queue_wait_ms"].as_i64().unwrap(),
+        0,
+        "a direct run has zero queue wait"
+    );
 
     // step aggregates grouped by function name -> our step 's1'.
     let srows = sagg["output"].as_array().unwrap();
