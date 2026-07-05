@@ -392,6 +392,11 @@ impl<'c> DebouncerClient<'c> {
     /// Schedule (or push back) the target's run for `key`, with the latest
     /// `input`. Returns a handle to the single eventual run; every call for the
     /// same active `key` returns a handle to the *same* run.
+    ///
+    /// Requires a live engine running the collector: with none (or an app-version
+    /// mismatch), a call that coalesces into an existing debouncer blocks —
+    /// retrying until an engine appears — rather than erroring. Matches Go's
+    /// client debouncer.
     pub async fn debounce<I, O>(
         &self,
         key: &str,
