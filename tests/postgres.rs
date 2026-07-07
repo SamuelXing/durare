@@ -1134,7 +1134,14 @@ async fn pg_application_versions() -> Result<()> {
     // Restore this binary's real version as latest: unversioned-row dequeue
     // gating is latest-only, so leaving a uuid version promoted would starve
     // every other test's client-enqueued ('') claims on the shared database.
-    let real = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    // Register the version first (idempotent): registration happens at
+    // `launch()`, which this engine never does, and on a fresh database (CI)
+    // no other test may have registered it yet.
+    let restore_provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let real = DurableEngine::new(restore_provider.clone()).await?;
+    restore_provider
+        .create_application_version(real.app_version())
+        .await?;
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(
         real.set_latest_application_version(real.app_version())
@@ -1237,8 +1244,14 @@ async fn pg_client_debounces() -> Result<()> {
     // The pinned engine registered `ver` at launch, making it the latest
     // application version. Unversioned-row dequeue gating is latest-only, so
     // restore this binary's real version as latest or other tests' ('')
-    // client-enqueued claims on the shared database would starve.
+    // client-enqueued claims on the shared database would starve. Register it
+    // first (idempotent): registration happens at `launch()`, which this
+    // engine never does, and on a fresh database (CI) no other test may have
+    // registered it yet.
     let real = DurableEngine::new(provider.clone()).await?;
+    provider
+        .create_application_version(real.app_version())
+        .await?;
     tokio::time::sleep(Duration::from_millis(5)).await;
     assert!(
         real.set_latest_application_version(real.app_version())
