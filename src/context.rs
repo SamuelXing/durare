@@ -275,8 +275,9 @@ impl DurableContext {
     /// checkpointed. On replay the same child is re-attached instead of being
     /// started again, so the child runs at most once per logical call.
     ///
-    /// The child inherits this workflow's identity ([`AuthContext`]) unless
-    /// `opts` sets an explicit one, and records its `parent_workflow_id`. Pass
+    /// The child inherits this workflow's identity ([`AuthContext`]) field by
+    /// field — each auth field set on `opts` overrides just that field — and
+    /// records its `parent_workflow_id`. Pass
     /// `opts.queue` to route the child through a queue instead of running it inline.
     pub async fn start_workflow<I, O>(
         &self,
@@ -319,17 +320,24 @@ impl DurableContext {
         opts.workflow_id = Some(child_id.clone());
         let input_json = serde_json::to_value(input)?;
 
-        // An explicit identity on `opts` overrides the inherited parent identity;
-        // with no auth set (the common case) the child inherits this workflow's.
-        let opts_auth = AuthContext {
-            authenticated_user: opts.authenticated_user.clone(),
-            assumed_role: opts.assumed_role.clone(),
-            authenticated_roles: opts.authenticated_roles.clone(),
-        };
-        let child_auth = if opts_auth.is_empty() {
-            self.auth.clone()
-        } else {
-            opts_auth
+        // The child inherits this workflow's identity **per field**: each auth
+        // field set on `opts` overrides just that field, and every unset field
+        // falls back to the parent's — so overriding only the assumed role still
+        // carries the parent's user and roles (matching the reference SDKs).
+        let child_auth = AuthContext {
+            authenticated_user: opts
+                .authenticated_user
+                .clone()
+                .or_else(|| self.auth.authenticated_user.clone()),
+            assumed_role: opts
+                .assumed_role
+                .clone()
+                .or_else(|| self.auth.assumed_role.clone()),
+            authenticated_roles: if opts.authenticated_roles.is_empty() {
+                self.auth.authenticated_roles.clone()
+            } else {
+                opts.authenticated_roles.clone()
+            },
         };
 
         self.runtime

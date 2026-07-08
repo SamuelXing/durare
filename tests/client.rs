@@ -446,8 +446,11 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
         "s1 ran once; s0 replayed from its checkpoint"
     );
 
-    // Resuming a completed workflow errors.
-    assert!(client.resume_workflow::<i64>("w").await.is_err());
+    // Resuming a completed workflow is a no-op: nothing re-runs, the handle
+    // reads the recorded outcome.
+    let mut done: WorkflowHandle<i64> = client.resume_workflow("w").await?;
+    assert_eq!(done.get_result().await?, 2);
+    assert_eq!(S1.load(Ordering::SeqCst), 1, "no step re-ran on the no-op");
 
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
@@ -804,5 +807,31 @@ async fn client_completion_cannot_overwrite_cancelled() -> Result<()> {
 
     let row = provider.get_workflow_status(h.id()).await?.unwrap();
     assert_eq!(row.status, STATUS_CANCELLED);
+    Ok(())
+}
+
+/// Client resume of a missing id is a typed `NonExistentWorkflow`; resume of a
+/// completed workflow is a no-op whose handle reads the recorded outcome.
+#[tokio::test]
+async fn client_resume_missing_and_completed() -> Result<()> {
+    use durust::ErrorCode;
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("one", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(1_i64)
+    });
+    engine.launch().await?;
+    let out: i64 = engine.start_typed("one", "wf-one", ()).await?;
+    assert_eq!(out, 1);
+
+    let client = Client::new(provider.clone());
+    let Err(err) = client.resume_workflow::<i64>("ghost").await else {
+        panic!("resume of a missing workflow must error");
+    };
+    assert_eq!(err.code(), ErrorCode::NonExistentWorkflow);
+
+    let mut done = client.resume_workflow::<i64>("wf-one").await?;
+    assert_eq!(done.get_result().await?, 1, "completed resume is a no-op");
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
