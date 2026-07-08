@@ -787,8 +787,10 @@ async fn sqlite_management() -> Result<()> {
         .get_result()
         .await?;
     engine.cancel_workflow("wf-2").await?;
-    // Already terminal (SUCCESS) → cancel is a no-op; resume errors.
-    assert!(engine.resume_workflow::<i64>("wf-2").await.is_err());
+    // Already terminal (SUCCESS) → cancel is a no-op, and resume is a found
+    // no-op whose handle reads the recorded outcome.
+    let mut done = engine.resume_workflow::<i64>("wf-2").await?;
+    assert_eq!(done.get_result().await?, 15);
 
     // A genuinely cancellable workflow.
     use durust::{StateProvider, WorkflowStatus, STATUS_PENDING};

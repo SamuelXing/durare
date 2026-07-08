@@ -2914,3 +2914,47 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+/// Resume onto a named queue over live Postgres: the resumed run is claimed by
+/// that queue's dispatcher and the row records the queue.
+#[tokio::test]
+async fn pg_resume_routes_to_named_queue() -> Result<()> {
+    use durust::{StateProvider, WorkflowQueue, WorkflowStatus, STATUS_PENDING};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_resume_routes_to_named_queue: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4();
+    let wf = format!("bounce-{tag}");
+    let queue = format!("resume-q-{tag}");
+    let id = format!("wf-bounce-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register(&wf, |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n + 1)
+    });
+    engine.register_queue(
+        WorkflowQueue::new(&queue).base_polling_interval(Duration::from_millis(50)),
+    );
+    engine.launch().await?;
+
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            &id,
+            &wf,
+            serde_json::json!(41),
+            STATUS_PENDING,
+            "",
+            engine.app_version(),
+        ))
+        .await?;
+    engine.cancel_workflow(&id).await?;
+
+    let mut h = engine.resume_workflow_on::<i64>(&id, &queue).await?;
+    assert_eq!(h.get_result().await?, 42);
+    let row = provider.get_workflow_status(&id).await?.unwrap();
+    assert_eq!(row.queue_name.as_deref(), Some(queue.as_str()));
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

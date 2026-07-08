@@ -1270,29 +1270,29 @@ impl DurableEngine {
     }
 
     /// Resume a cancelled (or otherwise non-terminal) workflow. It is re-queued
-    /// onto the internal queue and a dispatcher — on any live engine — re-runs it
-    /// from its checkpoints; the returned handle tracks it by polling. Errors if
-    /// the workflow does not exist or is already `SUCCESS`/`ERROR`. Requires a
-    /// launched engine to make progress.
+    /// onto the internal queue — which every engine dispatches, so it always
+    /// makes progress — and re-run from its checkpoints; the returned handle
+    /// tracks it by polling. Resuming an already-completed workflow is a no-op:
+    /// the handle simply reads its recorded outcome. A missing id is a typed
+    /// [`Error::NonExistentWorkflow`]. Requires a launched engine to make
+    /// progress.
     pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
-        if !self.provider.resume_workflow(id).await? {
-            return Err(Error::app(format!(
-                "workflow `{id}` cannot be resumed (missing or already completed)"
-            )));
+        self.resume_workflow_on(id, INTERNAL_QUEUE).await
+    }
+
+    /// Like [`resume_workflow`](Self::resume_workflow) but re-queues onto
+    /// `queue` instead of the internal queue, so the resumed run competes under
+    /// that queue's concurrency and rate limits.
+    pub async fn resume_workflow_on<O>(&self, id: &str, queue: &str) -> Result<WorkflowHandle<O>> {
+        if self.provider.resume_workflow(id).await? {
+            self.provider.enqueue_existing(id, queue).await?;
+        } else if self.provider.get_workflow_status(id).await?.is_none() {
+            return Err(Error::nonexistent_workflow(id));
         }
-        self.requeue_for_rerun(id).await?;
         Ok(WorkflowHandle::polling(
             id.to_string(),
             self.provider.clone(),
         ))
-    }
-
-    /// Put an existing row onto the internal queue so a dispatcher re-runs it.
-    /// Re-execution always uses the internal queue (not the workflow's original
-    /// user queue): it is always dispatched, so a resumed workflow makes
-    /// progress regardless of which user queues a process listens to.
-    async fn requeue_for_rerun(&self, id: &str) -> Result<()> {
-        self.provider.enqueue_existing(id, INTERNAL_QUEUE).await
     }
 
     /// Cancel many workflows in one round-trip. Each that exists and is not
@@ -1304,17 +1304,40 @@ impl DurableEngine {
     }
 
     /// Resume many workflows in one round-trip. Each that exists and is not
-    /// `SUCCESS`/`ERROR` is re-queued (its own queue, or the internal queue) for a
-    /// dispatcher to re-run; the returned polling handles track exactly those
-    /// (skipped ids yield no handle, so the result may be shorter than `ids`).
+    /// `SUCCESS`/`ERROR` is re-queued onto the internal queue for a dispatcher
+    /// to re-run. A polling handle is returned for **every id that exists**, in
+    /// input order — an already-terminal workflow is a no-op whose handle reads
+    /// its recorded outcome; missing ids yield no handle (and no error).
     pub async fn resume_workflows<O>(&self, ids: &[String]) -> Result<Vec<WorkflowHandle<O>>> {
+        self.resume_workflows_on(ids, INTERNAL_QUEUE).await
+    }
+
+    /// Like [`resume_workflows`](Self::resume_workflows) but re-queues onto
+    /// `queue` instead of the internal queue.
+    pub async fn resume_workflows_on<O>(
+        &self,
+        ids: &[String],
+        queue: &str,
+    ) -> Result<Vec<WorkflowHandle<O>>> {
         let resumed = self.provider.resume_workflows(ids).await?;
-        let mut handles = Vec::with_capacity(resumed.len());
-        for id in resumed {
-            self.requeue_for_rerun(&id).await?;
-            handles.push(WorkflowHandle::polling(id, self.provider.clone()));
+        for id in &resumed {
+            self.provider.enqueue_existing(id, queue).await?;
         }
-        Ok(handles)
+        let existing: std::collections::HashSet<String> = self
+            .provider
+            .list_workflows(&ListFilter {
+                workflow_ids: ids.to_vec(),
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        Ok(ids
+            .iter()
+            .filter(|id| existing.contains(*id))
+            .map(|id| WorkflowHandle::polling(id.clone(), self.provider.clone()))
+            .collect())
     }
 
     /// Delete many workflows and (via `ON DELETE CASCADE`) their step / event /

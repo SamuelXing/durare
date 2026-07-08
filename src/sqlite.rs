@@ -1099,9 +1099,7 @@ impl StateProvider for SqliteProvider {
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
-            return Err(crate::error::Error::app(format!(
-                "cannot fork nonexistent workflow `{original_id}`"
-            )));
+            return Err(crate::error::Error::nonexistent_workflow(original_id));
         }
 
         sqlx::query("UPDATE workflow_status SET was_forked_from = TRUE WHERE workflow_uuid = ?")

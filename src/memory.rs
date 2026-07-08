@@ -861,9 +861,11 @@ impl StateProvider for InMemoryProvider {
         let new_id = params.new_id.as_str();
         let start_step = params.start_step;
         let mut g = self.inner.lock().await;
-        let original = g.workflows.get(original_id).cloned().ok_or_else(|| {
-            Error::app(format!("cannot fork nonexistent workflow `{original_id}`"))
-        })?;
+        let original = g
+            .workflows
+            .get(original_id)
+            .cloned()
+            .ok_or_else(|| Error::nonexistent_workflow(original_id))?;
 
         let mut forked = WorkflowStatus::new(
             new_id,
