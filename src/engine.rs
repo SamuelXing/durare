@@ -101,6 +101,46 @@ pub struct WorkflowRegistration {
 
 inventory::collect!(WorkflowRegistration);
 
+/// A compile-time, typed reference to a registered workflow.
+///
+/// `#[durust::workflow]` emits one of these for every annotated function: a
+/// zero-sized marker named by the function in `UpperCamelCase` (so
+/// `process_order` yields a `ProcessOrder` marker). Passing the marker to
+/// [`DurableEngine::start_with`] fixes the input and output types from the
+/// function's own signature, so the call is checked without a turbofish and a
+/// wrong input type is a compile error:
+///
+/// ```ignore
+/// #[durust::workflow]
+/// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { /* … */ }
+///
+/// let handle = engine.start_with(ProcessOrder, order, opts).await?; // input: Order, checked
+/// let receipt: Receipt = handle.await?;                             // output: Receipt, inferred
+/// ```
+pub trait WorkflowDef {
+    /// The workflow's input type — its second parameter.
+    type Input;
+    /// The workflow's output type — the `Ok` type of its returned `Result`.
+    type Output;
+    /// The name the workflow is registered and persisted under.
+    const NAME: &'static str;
+}
+
+/// Projects the `Ok` type out of a `Result` at the type level. Lets the
+/// `#[durust::workflow]` macro name a workflow's output as
+/// `<ReturnType as WorkflowResult>::Ok` instead of parsing the return type's
+/// tokens — the compiler does the extraction, through any `Result` alias.
+/// Macro plumbing, not public API.
+#[doc(hidden)]
+pub trait WorkflowResult {
+    /// The `Ok` type of the `Result`.
+    type Ok;
+}
+
+impl<T, E> WorkflowResult for std::result::Result<T, E> {
+    type Ok = T;
+}
+
 /// A workflow registered on a [`DurableEngine`], as reported by
 /// [`DurableEngine::list_registered_workflows`]. The `name` is the identifier
 /// the workflow is registered and persisted under.
@@ -1215,6 +1255,35 @@ impl DurableEngine {
             auth,
         );
         Ok(WorkflowHandle::local(id, self.provider.clone(), join))
+    }
+
+    /// Start a workflow from its typed [`WorkflowDef`] reference — the marker
+    /// `#[durust::workflow]` emits — returning a [`WorkflowHandle`] immediately.
+    ///
+    /// The reference fixes the input and output types from the workflow's own
+    /// signature, so neither needs a turbofish and a wrong input type is a
+    /// compile error:
+    ///
+    /// ```ignore
+    /// let handle = engine.start_with(ProcessOrder, order, WorkflowOptions::default()).await?;
+    /// let receipt: Receipt = handle.await?;
+    /// ```
+    ///
+    /// This is sugar for [`run_workflow`](Self::run_workflow) with the name
+    /// taken from `W::NAME`; set `opts.queue` to enqueue onto a queue instead of
+    /// running in-process.
+    pub async fn start_with<W>(
+        &self,
+        _wf: W,
+        input: W::Input,
+        opts: WorkflowOptions,
+    ) -> Result<WorkflowHandle<W::Output>>
+    where
+        W: WorkflowDef,
+        W::Input: Serialize,
+    {
+        self.run_workflow::<W::Input, W::Output>(W::NAME, input, opts)
+            .await
     }
 
     /// Enqueue a workflow on a registered queue.
