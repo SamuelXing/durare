@@ -111,10 +111,8 @@ pub enum Error {
 
     /// An error raised by user code inside a step or workflow, with an optional
     /// underlying `source` so `{:?}` and error-reporting tools can walk the
-    /// cause chain. The `source` is a live, in-process detail — only the
-    /// `message` survives a checkpoint/replay (see [`encode_error`]).
-    ///
-    /// [`encode_error`]: crate::serialize
+    /// cause chain. The `source` is a live, in-process detail — a checkpointed
+    /// error stores only its `message`, so the chain does not survive a replay.
     #[error("{message}")]
     App {
         message: String,
