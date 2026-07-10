@@ -7,6 +7,7 @@
 //! `UpperCamelCase` zero-sized struct implementing `durust::WorkflowDef` — so
 //! the workflow can be started by a type-checked reference rather than a string.
 
+use heck::ToUpperCamelCase;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
@@ -54,24 +55,6 @@ impl Parse for WorkflowArgs {
         }
         Ok(WorkflowArgs { name, schedule })
     }
-}
-
-/// Convert a snake_case identifier to `UpperCamelCase` for the workflow marker
-/// (e.g. `process_order` → `ProcessOrder`).
-fn to_upper_camel(s: &str) -> String {
-    let mut out = String::new();
-    let mut upper = true;
-    for c in s.chars() {
-        if c == '_' {
-            upper = true;
-        } else if upper {
-            out.extend(c.to_uppercase());
-            upper = false;
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 /// The `Ok` type of a `Result<Ok, ..>` return: the first type argument of the
@@ -154,7 +137,7 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
     // Marker type name: `UpperCamelCase` of the function identifier.
-    let marker = Ident::new(&to_upper_camel(&ident.to_string()), ident.span());
+    let marker = Ident::new(&ident.to_string().to_upper_camel_case(), ident.span());
 
     let expanded = quote! {
         #func
