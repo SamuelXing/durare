@@ -378,7 +378,8 @@ pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
         .inputs
         .iter()
         .enumerate()
-        .filter_map(|(i, a)| (i != 1).then(|| a.clone()))
+        .filter(|&(i, _)| i != 1)
+        .map(|(_, a)| a.clone())
         .collect();
 
     let attrs = &func.attrs;
