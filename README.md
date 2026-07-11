@@ -8,11 +8,12 @@ Write ordinary async functions; durare checkpoints each step to your database
 and, after a crash, restart, or redeploy, resumes every unfinished workflow
 exactly where it stopped. Completed steps are never re-run.
 
-There is no server to operate and no sidecar. The engine is a library inside
-your process that talks directly to Postgres or SQLite, and it keeps its state
-in the standard [DBOS](https://docs.dbos.dev) system schema, so a durare
-application shares a database — and tooling — with the other DBOS SDKs. See
-[DBOS compatibility](#dbos-compatibility).
+durare is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
+aligned by design with the DBOS Transact SDKs for Python, Go, and TypeScript:
+the same programming model, the same semantics, and the same system schema on
+the same database. There is no server to operate and no sidecar — the engine
+is a library inside your process that talks directly to Postgres or SQLite.
+See [DBOS compatibility](#dbos-compatibility).
 
 ```rust
 use std::time::Duration;
@@ -170,7 +171,7 @@ SELECT workflow_uuid, name, status FROM dbos.workflow_status;
 SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_outputs;
 ```
 
-durare is an independent implementation and is not affiliated with DBOS, Inc.
+durare is community-maintained.
 
 ## Backends
 
