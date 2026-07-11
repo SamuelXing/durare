@@ -19,13 +19,16 @@ pub struct RateLimiter {
 /// honors, in order: worker concurrency (this process), global concurrency
 /// (across all executors, via a DB count), and the rate limiter.
 ///
-/// Built with chained setters:
+/// Built with chained setters, then registered before `launch`:
 ///
-/// ```ignore
+/// ```
+/// use durare::{RateLimiter, WorkflowQueue};
+/// use std::time::Duration;
+///
 /// let q = WorkflowQueue::new("emails")
 ///     .worker_concurrency(4)
 ///     .rate_limiter(RateLimiter { limit: 50, period: Duration::from_secs(60) });
-/// engine.register_queue(q);
+/// // engine.register_queue(q) before engine.launch()
 /// ```
 #[derive(Clone, Debug)]
 pub struct WorkflowQueue {

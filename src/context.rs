@@ -79,7 +79,9 @@ impl StepOptions {
     /// consulted on every failure before backoff; returning `false` stops retries
     /// at once (the error propagates), so permanent errors don't burn attempts:
     ///
-    /// ```ignore
+    /// ```
+    /// use durare::{Error, StepOptions};
+    ///
     /// let opts = StepOptions::new("fetch")
     ///     .max_retries(5)
     ///     .retry_if(|e: &Error| e.is_retryable());
@@ -207,12 +209,16 @@ impl DurableContext {
     /// This lets you change a workflow's body while long-lived workflows are
     /// still running. Wrap the changed region in a patch:
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
     /// if ctx.patch("use-v2-pricing").await? {
     ///     // new code
     /// } else {
     ///     // old code
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// A workflow that reaches this point for the first time (new, or one that
@@ -526,13 +532,20 @@ impl DurableContext {
     /// operation and, on replay, the branches are not polled at all, so any
     /// durable calls nested inside would desynchronize the step sequence.
     ///
-    /// ```ignore
+    /// ```no_run
+    /// # use durare::{DurableContext, Result};
+    /// # async fn fetch_primary() -> String { String::new() }
+    /// # async fn fetch_fallback() -> String { String::new() }
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
     /// let (winner, value) = ctx
     ///     .select(vec![
     ///         Box::pin(async { fetch_primary().await }),
     ///         Box::pin(async { fetch_fallback().await }),
     ///     ])
     ///     .await?;
+    /// # let _ = (winner, value);
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn select<T>(
         &self,
@@ -1035,12 +1048,16 @@ impl DurableContext {
     /// the final `Err` item. Also a live read (not checkpointed). Consume it with
     /// [`StreamExt::next`](futures_util::StreamExt::next):
     ///
-    /// ```ignore
+    /// ```no_run
     /// use durare::StreamExt;
+    /// # use durare::{DurableContext, Result};
+    /// # async fn demo(ctx: DurableContext, id: &str) -> Result<()> {
     /// let mut values = ctx.read_stream_values::<String>(id, "events");
     /// while let Some(v) = values.next().await {
     ///     println!("{}", v?);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn read_stream_values<T: DeserializeOwned + 'static>(
         &self,

@@ -15,12 +15,15 @@ use serde_json::Value;
 /// the other DBOS SDKs deliver too, so a scheduled run's persisted input is
 /// portable across them. A scheduled workflow declares this as its input type:
 ///
-/// ```ignore
+/// ```
+/// use durare::{DurableContext, Result, ScheduledInput};
+///
 /// #[durare::workflow(schedule = "0 0 * * * *")]
 /// async fn hourly(_ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
 ///     println!("fired for {}", tick.scheduled_time);
 ///     Ok(())
 /// }
+/// # fn main() {}
 /// ```
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduledInput {

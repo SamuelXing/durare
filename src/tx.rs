@@ -361,7 +361,9 @@ impl TransactionOptions {
     /// at once (the error propagates), so a permanent failure doesn't burn
     /// attempts:
     ///
-    /// ```ignore
+    /// ```
+    /// use durare::{Error, TransactionOptions};
+    ///
     /// let opts = TransactionOptions::new("transfer")
     ///     .max_retries(5)
     ///     .retry_if(|e: &Error| e.is_retryable());

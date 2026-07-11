@@ -110,12 +110,24 @@ inventory::collect!(WorkflowRegistration);
 /// function's own signature, so the call is checked without a turbofish and a
 /// wrong input type is a compile error:
 ///
-/// ```ignore
-/// #[durare::workflow]
-/// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { /* … */ }
+/// ```
+/// use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+/// use std::sync::Arc;
 ///
-/// let handle = engine.start_with(ProcessOrder, order, opts).await?; // input: Order, checked
-/// let receipt: Receipt = handle.await?;                             // output: Receipt, inferred
+/// #[durare::workflow]
+/// async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+///     Ok(format!("receipt for {order_id}"))
+/// }
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<()> {
+/// # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+/// // input checked as String, output inferred as String:
+/// let handle = engine.start_with(ProcessOrder, "1001".into(), WorkflowOptions::default()).await?;
+/// let receipt: String = handle.await?;
+/// # assert_eq!(receipt, "receipt for 1001");
+/// # Ok(())
+/// # }
 /// ```
 pub trait WorkflowDef {
     /// The workflow's input type — its second parameter.
@@ -1277,9 +1289,22 @@ impl DurableEngine {
     /// signature, so neither needs a turbofish and a wrong input type is a
     /// compile error:
     ///
-    /// ```ignore
+    /// ```
+    /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+    /// # use std::sync::Arc;
+    /// # #[durare::workflow]
+    /// # async fn process_order(ctx: DurableContext, order: String) -> Result<String> {
+    /// #     Ok(format!("receipt for {order}"))
+    /// # }
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<()> {
+    /// # let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    /// # let order = String::from("1001");
     /// let handle = engine.start_with(ProcessOrder, order, WorkflowOptions::default()).await?;
-    /// let receipt: Receipt = handle.await?;
+    /// let receipt: String = handle.await?;
+    /// # assert_eq!(receipt, "receipt for 1001");
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// This is sugar for [`start`](Self::start) with the name

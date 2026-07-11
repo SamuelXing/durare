@@ -10,6 +10,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Documented every public API item and enabled `#![warn(missing_docs)]`, now
   enforced in CI so the public surface stays fully documented.
+- Rewrote the crate-level docs (the docs.rs landing page) around a tested
+  example of the `#[durare::workflow]` + `start_with` path, with a capability
+  map linking every major API.
+- Converted all `ignore`d doc examples to compiled (most of them runnable)
+  doctests, so every example in the docs is checked by `cargo test`.
+- Added crates.io and docs.rs badges, an MSRV policy section, and a
+  `CONTRIBUTING.md`.
 
 ## [0.1.0] - 2026-07-10
 
