@@ -35,6 +35,7 @@
 //! # Ok(())
 //! # }
 //! ```
+#![warn(missing_docs)]
 
 mod admin;
 mod client;

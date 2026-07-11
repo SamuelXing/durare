@@ -80,6 +80,7 @@ pub struct WorkflowSchedule {
     pub workflow_name: String,
     /// 6-field cron spec (second precision).
     pub schedule: String,
+    /// Whether the schedule is currently active or paused.
     pub status: ScheduleStatus,
     /// Optional user value attached to the schedule (surfaced via get/list).
     pub context: Option<Value>,
@@ -115,6 +116,7 @@ pub struct ScheduleOptions {
 }
 
 impl ScheduleOptions {
+    /// Default schedule options (no queue, no timezone, no attached context).
     pub fn new() -> Self {
         Self::default()
     }

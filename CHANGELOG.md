@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- Documented every public API item and enabled `#![warn(missing_docs)]`, now
+  enforced in CI so the public surface stays fully documented.
+
 ## [0.1.0] - 2026-07-10
 
 First release. A DBOS-compatible durable-execution SDK for Rust: write ordinary
@@ -37,4 +44,5 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/SamuelXing/durare/releases/tag/v0.1.0

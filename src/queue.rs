@@ -4,7 +4,9 @@ use std::time::Duration;
 /// At most `limit` workflows may start within any trailing `period` window.
 #[derive(Clone, Debug)]
 pub struct RateLimiter {
+    /// Maximum number of starts permitted within each `period` window.
     pub limit: i64,
+    /// Length of the trailing window the `limit` is measured over.
     pub period: Duration,
 }
 
@@ -27,6 +29,7 @@ pub struct RateLimiter {
 /// ```
 #[derive(Clone, Debug)]
 pub struct WorkflowQueue {
+    /// Unique queue name workflows are enqueued on.
     pub name: String,
     /// Max workflows this executor runs concurrently from the queue.
     pub worker_concurrency: Option<usize>,
@@ -34,6 +37,7 @@ pub struct WorkflowQueue {
     pub global_concurrency: Option<i64>,
     /// When `true`, lower `priority` values are dispatched first.
     pub priority_enabled: bool,
+    /// Rate limit on workflow starts from this queue, if any.
     pub rate_limit: Option<RateLimiter>,
     /// Max workflows claimed per polling iteration (default 100).
     pub max_tasks_per_iteration: usize,
@@ -48,6 +52,8 @@ pub struct WorkflowQueue {
 }
 
 impl WorkflowQueue {
+    /// A new queue with the given name and default settings (unbounded
+    /// concurrency, no rate limit, 100 tasks/iteration, 1s–120s polling).
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -62,26 +68,31 @@ impl WorkflowQueue {
         }
     }
 
+    /// Cap the workflows this executor runs concurrently from the queue.
     pub fn worker_concurrency(mut self, n: usize) -> Self {
         self.worker_concurrency = Some(n);
         self
     }
 
+    /// Cap the workflows running concurrently across all executors.
     pub fn global_concurrency(mut self, n: i64) -> Self {
         self.global_concurrency = Some(n);
         self
     }
 
+    /// Dispatch in priority order (lower `priority` value first).
     pub fn priority_enabled(mut self) -> Self {
         self.priority_enabled = true;
         self
     }
 
+    /// Rate-limit workflow starts from this queue.
     pub fn rate_limiter(mut self, r: RateLimiter) -> Self {
         self.rate_limit = Some(r);
         self
     }
 
+    /// Set the maximum workflows claimed per polling iteration (default 100).
     pub fn max_tasks_per_iteration(mut self, n: usize) -> Self {
         self.max_tasks_per_iteration = n;
         self
@@ -97,11 +108,13 @@ impl WorkflowQueue {
         self
     }
 
+    /// Set the starting (and minimum) polling interval (default 1s).
     pub fn base_polling_interval(mut self, d: Duration) -> Self {
         self.base_polling_interval = d;
         self
     }
 
+    /// Set the ceiling the polling interval backs off to on errors (default 120s).
     pub fn max_polling_interval(mut self, d: Duration) -> Self {
         self.max_polling_interval = d;
         self

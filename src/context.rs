@@ -165,6 +165,7 @@ impl DurableContext {
         }
     }
 
+    /// The id of the workflow this context belongs to.
     pub fn workflow_id(&self) -> &str {
         &self.workflow_id
     }

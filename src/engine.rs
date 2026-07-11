@@ -255,6 +255,11 @@ pub enum DeduplicationPolicy {
     ReturnExisting,
 }
 
+/// Per-invocation options for starting or enqueuing a workflow — its
+/// idempotency key, queue and priority, deduplication, timeout, app version, and
+/// authenticated identity. Build with the chained setters (e.g.
+/// [`WorkflowOptions::with_id`] then [`queue`](WorkflowOptions::queue)); all
+/// fields default to unset.
 #[derive(Clone, Default)]
 pub struct WorkflowOptions {
     /// Explicit idempotency key. If `None`, a uuid is generated.
