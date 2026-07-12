@@ -106,7 +106,7 @@
 //!   [`patch`](DurableContext::patch).
 //! - **Management and operations** — list / cancel / resume / fork, timeouts,
 //!   [`Debouncer`], the registry-less [`Client`] for other processes,
-//!   [`AdminServer`], [`Conductor`].
+//!   [`AdminServer`], [`Conductor`] (feature `conductor`).
 //! - **Backends** — [`PostgresProvider`], [`SqliteProvider`], and
 //!   [`InMemoryProvider`], all behind the [`StateProvider`] seam.
 //!
@@ -117,6 +117,20 @@
 //! the determinism contract — read this first), then [`queues`],
 //! [`messaging`], and [`transactions`]. Ten runnable, end-to-end examples live
 //! in [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
+//!
+//! # Cargo features
+//!
+//! The examples above need no features — the in-memory, Postgres, and SQLite
+//! backends are all built in. One optional component is behind a feature flag:
+//!
+//! - **`conductor`** *(off by default)* — the DBOS Conductor client
+//!   ([`Conductor`], [`ConductorConfig`], [`AlertHandler`]): a websocket client
+//!   for the DBOS control plane. Opt-in because it pulls in a TLS websocket
+//!   stack and gzip framing. Enable with
+//!   `durare = { version = "0.2", features = ["conductor"] }`.
+// Render `#[doc(cfg(...))]` "available on feature X" banners on docs.rs (which
+// builds with `--cfg docsrs`, see Cargo.toml). Inert on stable and CI builds.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
 // Concept guides — std-style module pages (think `std::pin`) that each explain
@@ -131,6 +145,7 @@ pub mod transactions;
 
 mod admin;
 mod client;
+#[cfg(feature = "conductor")]
 mod conductor;
 mod context;
 mod debounce;
@@ -148,6 +163,8 @@ mod tx;
 
 pub use admin::AdminServer;
 pub use client::Client;
+#[cfg(feature = "conductor")]
+#[cfg_attr(docsrs, doc(cfg(feature = "conductor")))]
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, RetryPredicate, StepOptions};
 pub use debounce::{Debouncer, DebouncerClient};
