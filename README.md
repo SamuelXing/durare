@@ -89,7 +89,7 @@ never charged twice.
 
 ```toml
 [dependencies]
-durare = "0.2"
+durare = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -135,7 +135,7 @@ For a Postgres-only build (no SQLite C compile) that also enables the Conductor
 client:
 
 ```toml
-durare = { version = "0.2", default-features = false, features = ["postgres", "conductor"] }
+durare = { version = "0.3", default-features = false, features = ["postgres", "conductor"] }
 ```
 
 ## How it works

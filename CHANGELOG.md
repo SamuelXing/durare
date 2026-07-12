@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-12
+
+The feature-gating release: optional components you don't use no longer weigh
+down your build. The Postgres and SQLite backends are cargo features (both on by
+default; at least one required), and the Conductor client and admin HTTP server
+are opt-in. `durare-macros` is unchanged and stays at `0.1.0`.
+
 ### Changed
 
 - **(breaking)** The DBOS Conductor client — `Conductor`, `ConductorConfig`,
@@ -27,9 +34,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Documentation
 
 - Added a "Cargo features" section to the crate docs and the README documenting
-  the `postgres`, `sqlite`, and opt-in `conductor`/`admin` features, and
-  corrected the README quick-start dependency to `durare = "0.2"` (a `"0.1"`
-  requirement does not resolve to 0.2.x).
+  the `postgres`, `sqlite`, and opt-in `conductor`/`admin` features, and fixed
+  the stale README quick-start version requirement (it had pinned `0.1`, which
+  does not resolve to newer releases).
 
 ## [0.2.0] - 2026-07-11
 
@@ -130,7 +137,8 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/SamuelXing/durare/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/SamuelXing/durare/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/SamuelXing/durare/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/SamuelXing/durare/releases/tag/v0.1.0
