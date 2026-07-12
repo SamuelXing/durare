@@ -562,6 +562,59 @@ async fn launch_persists_the_queue_registry() -> Result<()> {
     Ok(())
 }
 
+/// The launch-time conflict-policy gate resolved from the application version:
+/// a process self-elects as latest when it first registers its version, so its
+/// queue config lands on the first launch — but a straggler running an
+/// already-registered older version (with a newer version present) must not
+/// clobber the newer config. Pins the deliberate divergence from Go's ordering
+/// (see PARITY.md); Go resolves the gate before self-registration.
+#[tokio::test]
+async fn launch_gate_self_elects_then_stragglers_do_not_clobber() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let noop = |_ctx: DurableContext, _: ()| async move { Ok::<_, Error>(()) };
+
+    // v-old launches first: registers itself (latest so far) and writes q=1.
+    {
+        let mut e = DurableEngine::new_with_version(provider.clone(), "v-old").await?;
+        e.register("noop", noop);
+        e.register_queue(test_queue("q").worker_concurrency(1));
+        e.launch().await?;
+        e.shutdown(Duration::from_secs(1)).await?;
+    }
+    assert_eq!(provider.list_queues().await?[0].worker_concurrency, Some(1));
+
+    // v-new launches: a newer version self-elects as latest and overwrites q=2.
+    {
+        let mut e = DurableEngine::new_with_version(provider.clone(), "v-new").await?;
+        e.register("noop", noop);
+        e.register_queue(test_queue("q").worker_concurrency(2));
+        e.launch().await?;
+        e.shutdown(Duration::from_secs(1)).await?;
+    }
+    assert_eq!(
+        provider.list_queues().await?[0].worker_concurrency,
+        Some(2),
+        "the newer version self-elected and updated the config"
+    );
+
+    // v-old relaunches as a straggler: already registered (older timestamp) and
+    // v-new is latest, so the gate is false — it must not revert the config.
+    {
+        let mut e = DurableEngine::new_with_version(provider.clone(), "v-old").await?;
+        e.register("noop", noop);
+        e.register_queue(test_queue("q").worker_concurrency(1));
+        e.launch().await?;
+        e.shutdown(Duration::from_secs(1)).await?;
+    }
+    assert_eq!(
+        provider.list_queues().await?[0].worker_concurrency,
+        Some(2),
+        "an older-version straggler did not clobber the newer config"
+    );
+
+    Ok(())
+}
+
 /// upsert_queue's conflict policy: a first write inserts; a name collision does
 /// nothing unless the caller may overwrite (the engine resolves that from the
 /// application version).

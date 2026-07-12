@@ -17,9 +17,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   database-backed, fleet-wide registry the DBOS conductor and control plane read —
   and `DurableEngine::list_queues()` reads it back. A queue registered by any
   executor against a shared database is visible to every conductor pointed at it,
-  matching the Go and Python SDKs. The conflict policy matches Go's default: an
-  older executor mid-rolling-deploy will not overwrite a newer queue's stored
-  configuration.
+  matching the Go and Python SDKs. The write is version-gated and resolved on
+  launch: a process self-elects as latest when it first registers its version (so
+  its queue config lands on the first launch), and an already-registered
+  older-version straggler will not overwrite a newer queue's configuration.
 
 ### Changed
 
