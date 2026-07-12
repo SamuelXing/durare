@@ -105,7 +105,7 @@ jobs:
         run: cargo doc --no-deps --all-features
 
   features:
-    name: feature matrix (single backend)
+    name: feature matrix
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -121,3 +121,14 @@ jobs:
         run: cargo clippy --no-default-features --features postgres --lib --examples -- -D warnings
       - name: clippy (sqlite only)
         run: cargo clippy --no-default-features --features sqlite --lib --examples -- -D warnings
+      # A zero-backend build must be rejected by the crate's own compile_error!,
+      # not compile or fail some other way. Passes only if that specific error
+      # fires, so the guard can't silently rot.
+      - name: reject zero-backend build
+        run: |
+          if cargo check --no-default-features 2>&1 | grep -q "at least one SQL backend"; then
+            echo "ok: zero-backend build rejected by compile_error!"
+          else
+            echo "expected the 'at least one SQL backend' compile_error!; got a different result" >&2
+            exit 1
+          fi
