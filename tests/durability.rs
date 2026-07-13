@@ -326,6 +326,147 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
     Ok(())
 }
 
+/// `recover_on_launch(true)` (opt-in): `launch()` recovers this executor's
+/// pending workflows in the background, so a crash-and-restart resumes
+/// unfinished work with no separate `recover()` call. Opt-in because it is only
+/// sound when each live process has a unique executor id.
+#[tokio::test]
+async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    let provider = Arc::new(InMemoryProvider::new());
+    let register = |engine: &mut DurableEngine| {
+        engine.register("crash-once", |_ctx: DurableContext, _: ()| async move {
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("boom on the first attempt");
+            }
+            Ok::<_, Error>(())
+        });
+    };
+
+    // First "process": start a workflow that panics on its first attempt, so the
+    // row is left recoverable (PENDING). It never launches or recovers.
+    {
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        register(&mut engine);
+        let _ = engine
+            .start::<(), ()>(
+                "crash-once",
+                (),
+                WorkflowOptions::with_id("wf-launch-recover"),
+            )
+            .await?
+            .result()
+            .await; // observes the panic as an error; the row stays PENDING
+    }
+    assert_eq!(
+        provider
+            .get_workflow_status("wf-launch-recover")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_PENDING,
+        "the panicked workflow is left recoverable"
+    );
+
+    // Second "process": a fresh engine over the same database. `launch()` alone —
+    // no explicit `recover()` — must resume it, because it opts into
+    // recover_on_launch.
+    let mut builder = DurableEngine::builder(provider.clone());
+    builder.recover_on_launch(true);
+    builder.register("crash-once", |_ctx: DurableContext, _: ()| async move {
+        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom on the first attempt");
+        }
+        Ok::<_, Error>(())
+    });
+    let engine = builder.build().await?;
+    engine.launch().await?;
+
+    // Recovery runs on a background task, so poll for completion.
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = provider
+            .get_workflow_status("wf-launch-recover")
+            .await?
+            .unwrap()
+            .status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        status, STATUS_SUCCESS,
+        "launch() alone recovered the workflow"
+    );
+    assert_eq!(
+        ATTEMPTS.load(Ordering::SeqCst),
+        2,
+        "crashed once, then recovered on launch"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// By default (recover_on_launch off): `launch()` does not recover, so a pending
+/// workflow stays pending until an explicit `recover()`.
+#[tokio::test]
+async fn launch_does_not_recover_by_default() -> Result<()> {
+    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+
+    let provider = Arc::new(InMemoryProvider::new());
+    {
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        engine.register("crash-once-opt", |_ctx: DurableContext, _: ()| async move {
+            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("boom on the first attempt");
+            }
+            Ok::<_, Error>(())
+        });
+        let _ = engine
+            .start::<(), ()>("crash-once-opt", (), WorkflowOptions::with_id("wf-opt-out"))
+            .await?
+            .result()
+            .await;
+    }
+
+    // launch() with the default (recovery off) leaves the pending row untouched.
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("crash-once-opt", |_ctx: DurableContext, _: ()| async move {
+        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom on the first attempt");
+        }
+        Ok::<_, Error>(())
+    });
+    engine.launch().await?;
+    // Give any (unexpected) background recovery a chance to run.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        provider
+            .get_workflow_status("wf-opt-out")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_PENDING,
+        "recovery is off, so the workflow stays pending"
+    );
+
+    // An explicit recover() still works.
+    assert!(engine.recover().await? >= 1, "manual recovery picks it up");
+    assert_eq!(
+        provider
+            .get_workflow_status("wf-opt-out")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_SUCCESS,
+        "the manually recovered run completes"
+    );
+    Ok(())
+}
+
 /// F1 refinement — a panic in a step body is caught and turned into a step
 /// error, so it is subject to the step's retry policy: a step that panics once
 /// succeeds on retry (rather than failing the whole workflow immediately).

@@ -186,6 +186,15 @@ pub struct EngineConfig {
     pub app_version: Option<String>,
     /// This process's executor id, recorded as the owner of claimed runs.
     pub executor_id: Option<String>,
+    /// Whether [`launch`](DurableEngine::launch) recovers this executor's
+    /// pending workflows in the background on startup. `None` resolves to the
+    /// default, **off** — recovery is opt-in because it is only sound when each
+    /// live process has a *unique* executor id (recovering "this executor's"
+    /// pending work assumes the previous owner is gone, not running concurrently).
+    /// Enable it for a single-process app, or when you set a distinct
+    /// `DBOS__VMID` per process; otherwise drive recovery yourself with
+    /// [`recover`](DurableEngine::recover).
+    pub recover_on_launch: Option<bool>,
 }
 
 impl EngineConfig {
@@ -198,6 +207,15 @@ impl EngineConfig {
     /// Set the executor id (still overridden by `DBOS__VMID`).
     pub fn executor_id(mut self, id: impl Into<String>) -> Self {
         self.executor_id = Some(id.into());
+        self
+    }
+
+    /// Enable [`launch`](DurableEngine::launch) recovering this executor's
+    /// pending workflows on startup (off by default — see the field docs for why
+    /// it is opt-in). Leave it off to drive recovery yourself via
+    /// [`recover`](DurableEngine::recover).
+    pub fn recover_on_launch(mut self, yes: bool) -> Self {
+        self.recover_on_launch = Some(yes);
         self
     }
 
@@ -223,6 +241,10 @@ impl EngineConfig {
             return v.clone();
         }
         "local".to_string()
+    }
+
+    pub(crate) fn resolve_recover_on_launch(&self) -> bool {
+        self.recover_on_launch.unwrap_or(false)
     }
 }
 
@@ -418,6 +440,10 @@ pub struct DurableEngine {
     /// Recovery re-dispatches beyond this count park the workflow in
     /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
     max_recovery_attempts: i32,
+    /// Whether [`launch`](Self::launch) recovers this executor's pending
+    /// workflows in the background on startup (off by default; opt-in). See
+    /// [`EngineConfig::recover_on_launch`].
+    recover_on_launch: bool,
     /// Flipped by [`shutdown`](Self::shutdown); background loops observe it.
     shutting_down: Arc<AtomicBool>,
     /// Set by [`deactivate`](Self::deactivate): this process stops claiming new
@@ -515,6 +541,14 @@ impl DurableEngineBuilder {
         self
     }
 
+    /// Enable [`launch`](DurableEngine::launch) recovering this executor's
+    /// pending workflows on startup (off by default; opt-in). See
+    /// [`EngineConfig::recover_on_launch`].
+    pub fn recover_on_launch(&mut self, yes: bool) -> &mut Self {
+        self.config.recover_on_launch = Some(yes);
+        self
+    }
+
     /// Set the recovery-attempt cap before a workflow is parked in
     /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (default 100).
     pub fn max_recovery_attempts(&mut self, max: i32) -> &mut Self {
@@ -581,6 +615,7 @@ impl DurableEngineBuilder {
             executor_id,
             app_version,
             max_recovery_attempts: self.max_recovery_attempts,
+            recover_on_launch: self.config.resolve_recover_on_launch(),
             shutting_down: Arc::new(AtomicBool::new(false)),
             deactivated: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
@@ -654,6 +689,7 @@ impl DurableEngine {
             executor_id,
             app_version,
             max_recovery_attempts: 100,
+            recover_on_launch: config.resolve_recover_on_launch(),
             shutting_down: Arc::new(AtomicBool::new(false)),
             deactivated: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(AtomicUsize::new(0)),
@@ -1075,6 +1111,14 @@ impl DurableEngine {
     /// one scheduler task per `#[workflow(schedule = …)]` workflow. Workflow
     /// timeouts are enforced inline per run, so they need no separate sweep. Call
     /// once per launch; safe to call again after `shutdown`.
+    ///
+    /// When [`recover_on_launch`](EngineConfig::recover_on_launch) is enabled
+    /// (off by default), this also recovers this executor's workflows left
+    /// pending by a previous run, re-dispatching them on a background task — so a
+    /// crash and restart resumes unfinished work without a separate call. It is
+    /// opt-in because it is only sound when each live process has a *unique*
+    /// executor id; otherwise drive recovery yourself with
+    /// [`recover`](Self::recover).
     pub async fn launch(&self) -> Result<()> {
         // A deactivated process must not start claiming work again.
         if self.is_deactivated() {
@@ -1125,6 +1169,18 @@ impl DurableEngine {
             }
         }
 
+        // When recovery-on-launch is opted into, snapshot this executor's pending
+        // workflows *before* starting dispatchers and returning, so recovery picks
+        // up only a previous run's leftovers — not a workflow this process creates
+        // afterward. Opt-in (off by default) because it is only sound when each
+        // live process has a unique executor id; the dispatch runs on a background
+        // task below.
+        let to_recover = if self.recover_on_launch {
+            list_pending_workflows(&rt, std::slice::from_ref(&self.executor_id)).await?
+        } else {
+            Vec::new()
+        };
+
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
         for queue in self.queues.values() {
             // Skip queues this process is configured not to listen to. The
@@ -1145,6 +1201,24 @@ impl DurableEngine {
             self.shutting_down.clone(),
             self.macro_schedules(),
         )));
+
+        // Dispatch the recovery snapshot taken above on a background task, so
+        // launch stays prompt — a recovered workflow runs to completion, which
+        // would otherwise block startup for its full duration. The recovered runs
+        // are tracked by `inflight`, so `shutdown` drains them. (`tokio::spawn` is
+        // not an await, so the dispatcher lock above is fine to hold across it.)
+        if !to_recover.is_empty() {
+            let rt = rt.clone();
+            let max = self.max_recovery_attempts;
+            tokio::spawn(async move {
+                match dispatch_pending_workflows(&rt, max, to_recover).await {
+                    Ok(ids) => {
+                        tracing::info!(count = ids.len(), "recovered pending workflows on launch")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "recover-on-launch failed"),
+                }
+            });
+        }
         Ok(())
     }
 
@@ -1791,7 +1865,12 @@ impl DurableEngine {
     /// left alone (version-gated recovery), and a workflow recovered more than
     /// `max_recovery_attempts` times is parked in
     /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Queued workflows are returned to their
-    /// queue for re-dispatch; the rest are re-run inline. Call once on startup.
+    /// queue for re-dispatch; the rest are re-run inline.
+    ///
+    /// This is the primary recovery entry point: call it on startup (or on
+    /// demand) to resume unfinished work. [`launch`](Self::launch) can do this
+    /// for you when you enable
+    /// [`recover_on_launch`](EngineConfig::recover_on_launch).
     ///
     /// Returns the number of workflows that were recovered.
     pub async fn recover(&self) -> Result<usize> {
@@ -1803,66 +1882,103 @@ impl DurableEngine {
     /// workflow that was recovered. Backs the admin server's
     /// `POST /dbos-workflow-recovery`, which recovers a named set of executors.
     pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
-        let filter = ListFilter {
-            status: vec![STATUS_PENDING.to_string()],
-            app_version: vec![self.app_version.clone()],
-            executor_ids: executor_ids.to_vec(),
-            ..Default::default()
-        };
-        let pending = self.provider.list_workflows(&filter).await?;
-        let rt = self.runtime();
-        let mut recovered = Vec::new();
-        for record in pending {
-            let attempts = self
-                .provider
-                .bump_recovery_attempts(&record.id, self.max_recovery_attempts)
-                .await?;
-            if attempts > self.max_recovery_attempts {
-                tracing::warn!(
-                    id = %record.id,
-                    attempts,
-                    "workflow parked: exceeded max recovery attempts"
-                );
-                continue;
-            }
-
-            // A workflow claimed off a queue before the crash goes back to the
-            // queue so the dispatcher (and its concurrency limits) re-runs it.
-            if record.queue_name.is_some() {
-                self.provider
-                    .set_workflow_status(&record.id, STATUS_ENQUEUED, None, None)
-                    .await?;
-                recovered.push(record.id);
-                continue;
-            }
-
-            if let Some(handler) = rt
-                .workflows
-                .get(&registry_key(&record.name, record.config_name.as_deref()))
-                .cloned()
-            {
-                // Best-effort: a workflow that fails again is marked ERROR by
-                // `run_to_completion`; we keep going with the rest.
-                let _ = run_to_completion(
-                    rt.clone(),
-                    handler,
-                    record.id.clone(),
-                    record.input.clone(),
-                    record.deadline_ms,
-                    AuthContext::from_status(&record),
-                )
-                .await;
-                recovered.push(record.id);
-            } else {
-                tracing::warn!(
-                    workflow = %record.name,
-                    id = %record.id,
-                    "skipping recovery: no handler registered for this workflow name"
-                );
-            }
-        }
-        Ok(recovered)
+        recover_pending_workflows(&self.runtime(), self.max_recovery_attempts, executor_ids).await
     }
+}
+
+/// Recover this app version's `PENDING` workflows owned by the given executors
+/// (empty = any), returning the id of each one recovered. Backs
+/// [`DurableEngine::recover_pending_for`] and the background recovery that
+/// [`DurableEngine::launch`] spawns. Runs each recovered workflow to completion;
+/// a workflow that was claimed off a queue goes back on its queue instead.
+///
+/// Split out as a free function so `launch` can spawn it onto a background task
+/// (the engine itself is not `Clone`, but the [`Runtime`] behind it is `Arc`).
+pub(crate) async fn recover_pending_workflows(
+    rt: &Arc<Runtime>,
+    max_recovery_attempts: i32,
+    executor_ids: &[String],
+) -> Result<Vec<String>> {
+    let pending = list_pending_workflows(rt, executor_ids).await?;
+    dispatch_pending_workflows(rt, max_recovery_attempts, pending).await
+}
+
+/// The `PENDING` workflows of this app version owned by the given executors
+/// (empty = any). Split from dispatch so [`DurableEngine::launch`] can snapshot
+/// the set *synchronously* at launch time — recovering only what a previous run
+/// left behind, never a workflow this process creates after launch returns.
+pub(crate) async fn list_pending_workflows(
+    rt: &Arc<Runtime>,
+    executor_ids: &[String],
+) -> Result<Vec<WorkflowStatus>> {
+    let filter = ListFilter {
+        status: vec![STATUS_PENDING.to_string()],
+        app_version: vec![rt.app_version.clone()],
+        executor_ids: executor_ids.to_vec(),
+        ..Default::default()
+    };
+    rt.provider.list_workflows(&filter).await
+}
+
+/// Re-dispatch a snapshot of pending workflows: each is bumped past the recovery
+/// cap (parking it if exceeded), re-queued if it was claimed off a queue, or
+/// otherwise re-run to completion.
+pub(crate) async fn dispatch_pending_workflows(
+    rt: &Arc<Runtime>,
+    max_recovery_attempts: i32,
+    pending: Vec<WorkflowStatus>,
+) -> Result<Vec<String>> {
+    let mut recovered = Vec::new();
+    for record in pending {
+        let attempts = rt
+            .provider
+            .bump_recovery_attempts(&record.id, max_recovery_attempts)
+            .await?;
+        if attempts > max_recovery_attempts {
+            tracing::warn!(
+                id = %record.id,
+                attempts,
+                "workflow parked: exceeded max recovery attempts"
+            );
+            continue;
+        }
+
+        // A workflow claimed off a queue before the crash goes back to the
+        // queue so the dispatcher (and its concurrency limits) re-runs it.
+        if record.queue_name.is_some() {
+            rt.provider
+                .set_workflow_status(&record.id, STATUS_ENQUEUED, None, None)
+                .await?;
+            recovered.push(record.id);
+            continue;
+        }
+
+        if let Some(handler) = rt
+            .workflows
+            .get(&registry_key(&record.name, record.config_name.as_deref()))
+            .cloned()
+        {
+            // Best-effort: a workflow that fails again is marked ERROR by
+            // `run_to_completion`; we keep going with the rest.
+            let _ = run_to_completion(
+                rt.clone(),
+                handler,
+                record.id.clone(),
+                record.input.clone(),
+                record.deadline_ms,
+                AuthContext::from_status(&record),
+            )
+            .await;
+            recovered.push(record.id);
+        } else {
+            tracing::warn!(
+                workflow = %record.name,
+                id = %record.id,
+                "skipping recovery: no handler registered for this workflow name"
+            );
+        }
+    }
+    Ok(recovered)
 }
 
 /// The shared execution core: everything needed to create and run a workflow.

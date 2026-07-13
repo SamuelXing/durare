@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in recovery on launch: `EngineConfig::recover_on_launch(true)` (or the
+  builder's `recover_on_launch(true)`) makes `DurableEngine::launch` recover this
+  executor's workflows left pending by a previous run, re-dispatching them on a
+  background task — so a crash and restart resumes unfinished work without a
+  separate `recover()` call. **Off by default** (no behavior change): it is
+  opt-in because it is only sound when each live process has a *unique* executor
+  id — recovering "this executor's" pending work assumes the previous owner is
+  gone, not running concurrently. Enable it for a single-process app, or when you
+  set a distinct `DBOS__VMID` per process; otherwise keep driving recovery
+  yourself with `recover()`. (A future release may default it on once recovery
+  is liveness-aware.)
+
 ## [0.3.1] - 2026-07-12
 
 ### Added
