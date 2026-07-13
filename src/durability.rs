@@ -80,13 +80,18 @@
 //! # Crash recovery
 //!
 //! On startup, call [`DurableEngine::recover`]: it finds every workflow this
-//! application version left unfinished and re-dispatches it — each one replays
-//! to its frontier and continues. Queued workflows need nothing special: an
-//! `ENQUEUED` row survives the crash and is simply claimed again by the next
-//! dispatcher. A workflow that keeps crashing is not retried forever — after a
-//! bounded number of recovery attempts it is parked as
-//! `MAX_RECOVERY_ATTEMPTS_EXCEEDED` for an operator to inspect and
-//! resume.
+//! application version left unfinished on this executor and re-dispatches it —
+//! each one replays to its frontier and continues. [`DurableEngine::launch`] can
+//! do this for you if you opt in with
+//! [`recover_on_launch(true)`](crate::EngineConfig::recover_on_launch); it is
+//! off by default because it is only sound when each live process has a *unique*
+//! executor id (recovering "this executor's" pending work assumes the previous
+//! owner is gone, not running concurrently) — enable it for a single-process app
+//! or when you set a distinct `DBOS__VMID` per process. Queued workflows need
+//! nothing special: an `ENQUEUED` row survives the crash and is simply claimed
+//! again by the next dispatcher. A workflow that keeps crashing is not retried
+//! forever — after a bounded number of recovery attempts it is parked as
+//! `MAX_RECOVERY_ATTEMPTS_EXCEEDED` for an operator to inspect and resume.
 //!
 //! For a live demonstration — a process killed mid-workflow, restarted, and
 //! finishing without repeating completed work — run
