@@ -17,6 +17,8 @@
 //! createdb durare_test && DATABASE_URL=postgres://localhost/durare_test cargo test --test adversity
 //! ```
 
+mod common;
+
 use durare::{
     DurableContext, DurableEngine, EngineConfig, Error, ErrorCode, PostgresProvider, Result,
     StateProvider, WorkflowOptions, WorkflowQueue, STATUS_PENDING, STATUS_SUCCESS,
@@ -319,13 +321,7 @@ async fn pg_version_gate_routes_under_contention() -> Result<()> {
         return Ok(());
     };
     let tag = uuid::Uuid::new_v4().simple().to_string();
-    let dbname = format!("durare_vgate_{tag}");
-    let admin = sqlx::postgres::PgPool::connect(&base_url).await.unwrap();
-    sqlx::raw_sql(&format!("CREATE DATABASE {dbname}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let url = with_database(&base_url, &dbname);
+    let (admin, url, dbname) = common::hermetic_pg_db(&base_url, "durare_vgate").await;
 
     let queue = format!("vgate-q-{tag}");
     let wf = format!("vgate-task-{tag}");
@@ -418,28 +414,8 @@ async fn pg_version_gate_routes_under_contention() -> Result<()> {
     drop(engines);
     drop(probe);
     drop(producer);
-    if let Err(e) = sqlx::raw_sql(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-    {
-        eprintln!("vgate test: leaving {dbname} behind: {e}");
-    }
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
-}
-
-/// Swap the database name in a Postgres URL (`…/olddb?params` → `…/newdb?params`).
-fn with_database(url: &str, dbname: &str) -> String {
-    let (head, query) = match url.split_once('?') {
-        Some((h, q)) => (h, Some(q)),
-        None => (url, None),
-    };
-    let (prefix, _) = head
-        .rsplit_once('/')
-        .expect("postgres URL should end in /dbname");
-    match query {
-        Some(q) => format!("{prefix}/{dbname}?{q}"),
-        None => format!("{prefix}/{dbname}"),
-    }
 }
 
 /// The documented sharp edge, pinned: two **live** engines sharing one
