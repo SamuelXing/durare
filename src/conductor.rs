@@ -149,7 +149,13 @@ impl Conductor {
 /// appended.
 fn websocket_url(config: &ConductorConfig) -> String {
     let base = if config.url.is_empty() {
-        let domain = std::env::var("DBOS_DOMAIN").unwrap_or_else(|_| "cloud.dbos.dev".to_string());
+        // A set-but-empty DBOS_DOMAIN counts as unset (Go's rule; Python
+        // would build a hostless URL here) — an empty domain is always a
+        // misconfiguration, never a target.
+        let domain = std::env::var("DBOS_DOMAIN")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "cloud.dbos.dev".to_string());
         format!("wss://{domain}/conductor/v1alpha1")
     } else {
         config.url.trim_end_matches('/').to_string()
@@ -1510,7 +1516,10 @@ fn format_step_aggregate(a: &StepAggregate) -> Value {
 /// Deserialize an explicit JSON `null` as the type's default. The conductor
 /// service marshals absent lists as `null` (a Go nil slice), which
 /// `#[serde(default)]` alone does not cover — it only handles a *missing*
-/// field, and a bare `Vec<String>` rejects `null` outright.
+/// field, and a bare `Vec<String>` rejects `null` outright. serde has no
+/// built-in for this; this helper is the canonical pattern its maintainers
+/// recommend (serde-rs/serde#1098) — the packaged equivalent
+/// (`serde_with::DefaultOnNull`) is not worth a new dependency here.
 fn null_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1834,6 +1843,13 @@ mod tests {
         assert_eq!(
             websocket_url(&config("")),
             "wss://example.test/conductor/v1alpha1/websocket/app/k"
+        );
+
+        // Set-but-empty counts as unset (Go's rule), not a hostless URL.
+        std::env::set_var("DBOS_DOMAIN", "");
+        assert_eq!(
+            websocket_url(&config("")),
+            "wss://cloud.dbos.dev/conductor/v1alpha1/websocket/app/k"
         );
         std::env::remove_var("DBOS_DOMAIN");
 

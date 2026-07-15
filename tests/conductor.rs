@@ -125,7 +125,9 @@ async fn conductor_requires_api_key_and_defaults_url() -> Result<()> {
     // An empty URL is accepted: it defaults to the hosted DBOS conductor.
     // Point the domain at a closed local port so the background dial fails
     // fast instead of contacting the real endpoint. Safe to mutate here: no
-    // other test in this binary reads DBOS_DOMAIN (they pass explicit URLs).
+    // other test in this binary reads DBOS_DOMAIN (they pass explicit URLs),
+    // and the URL is resolved inside `start`, so the variable can be reset
+    // immediately — before any fallible await could skip the cleanup.
     std::env::set_var("DBOS_DOMAIN", "127.0.0.1:1");
     let defaulted = Conductor::start(
         engine.clone(),
@@ -136,10 +138,10 @@ async fn conductor_requires_api_key_and_defaults_url() -> Result<()> {
             executor_metadata: None,
             alert_handler: None,
         },
-    )
-    .expect("empty URL defaults instead of erroring");
-    defaulted.shutdown(Duration::from_secs(2)).await?;
+    );
     std::env::remove_var("DBOS_DOMAIN");
+    let defaulted = defaulted.expect("empty URL defaults instead of erroring");
+    defaulted.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
 
