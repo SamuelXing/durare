@@ -31,14 +31,32 @@ it, but say so in the body and don't imply it's overdue.
      in durare is usually skip — unless it's a *bugfix* to behavior durare also
      has, in which case file it as `kind:bugfix`.
 
-3. **Dedup before filing.** For each item you would file, run:
+3. **Verify every capability claim with quoted evidence — in BOTH directions.**
+   Past runs fabricated claims twice: asserted durare lacked bulk ops it has
+   (`cancel_workflows` et al. were in `src/engine.rs` all along), and asserted
+   Go had a `SetWorkflowAttributes` API it does not (only the schema migration
+   exists). To prevent this, before an item goes in an issue body:
+   - **"durare lacks X"** — run the search against a fresh checkout of
+     `SamuelXing/durare` `main` (`gh repo clone` or the workspace copy after
+     `git fetch`; never a stale branch) and paste the actual command + its
+     output (or explicit `no matches`) into the issue body under an
+     `### Evidence` heading.
+   - **"SDK Y has X"** — same: quote the defining symbol with a file path and
+     line from that SDK's current `main` (e.g. the `gh search code` or
+     `git grep` hit). A migration/schema artifact alone is NOT an API — say
+     "schema only" when the column exists but no public API references it.
+   - A claim you cannot back with a paste does not get filed. No exceptions —
+     an unverified issue is worse than a missed one, because it burns
+     maintainer trust and pollutes the tracker.
+
+4. **Dedup before filing.** For each item you would file, run:
    ```
    gh issue list --repo SamuelXing/durare --state all \
      --search "in:body upstream:<repo>#<number>"
    ```
    If a result exists, skip it (already tracked). The marker makes re-runs safe.
 
-4. **Ensure labels exist** (ignore "already exists" errors):
+5. **Ensure labels exist** (ignore "already exists" errors):
    ```
    gh label create parity        -c "#0E8A16" --repo SamuelXing/durare 2>/dev/null || true
    gh label create kind:feature  -c "#1D76DB" --repo SamuelXing/durare 2>/dev/null || true
@@ -47,7 +65,7 @@ it, but say so in the body and don't imply it's overdue.
    ```
    …and `from:ts|py|go|java` and `phase:0`…`phase:12` and `unmapped` as needed.
 
-5. **File a tracking issue** for each new parity-relevant item:
+6. **File a tracking issue** for each new parity-relevant item:
    ```
    gh issue create --repo SamuelXing/durare \
      --title "[parity][<repo-slug>] <concise feature name>" \
