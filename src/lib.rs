@@ -206,8 +206,8 @@ pub use debounce::{Debouncer, DebouncerClient};
 pub use engine::WorkflowResult;
 pub use engine::{
     erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, EngineMetrics,
-    HealthReport, RegisteredWorkflow, RetentionPolicy, WorkflowDef, WorkflowFn, WorkflowOptions,
-    WorkflowRegistration,
+    HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef, WorkflowFn,
+    WorkflowOptions, WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by
@@ -220,9 +220,10 @@ pub use memory::InMemoryProvider;
 pub use postgres::PostgresProvider;
 pub use provider::{
     is_terminal, ChangeWait, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    NotificationInsert, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use schedule::{

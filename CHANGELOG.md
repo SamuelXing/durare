@@ -19,6 +19,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (10k rows per statement) on all backends, so enabling a policy over a
   large backlog is many short transactions instead of one long
   vacuum-pinning delete.
+- Searchable workflow attributes: attach arbitrary key-value metadata at
+  creation (`WorkflowOptions::attributes`), replace or clear it later
+  (`set_workflow_attributes` on `DurableEngine`, `Client`, and — as one
+  durable step — `DurableContext`), and filter `list_workflows` by
+  containment (`ListFilter::attributes`): a workflow matches when its
+  attributes contain all given pairs, served on Postgres by migration 40's
+  GIN index. Cross-SDK semantics throughout: replace-not-merge, no child
+  inheritance, and filtering requires Postgres (SQLite stores and reads
+  attributes but errors on an attribute filter, matching the reference
+  SDKs; the in-memory backend emulates containment for tests). The
+  conductor's list requests accept the attributes filter and its responses
+  carry each row's attributes, so the DBOS console's attribute views work
+  against a Rust process.
+- Bulk send: `send_bulk(&[SendMessage])` on `DurableEngine`, `Client`, and
+  `DurableContext` fans one call out to many destinations — each message
+  with its own destination, topic, and optional at-most-once idempotency
+  key (a repeated key within one call is rejected). The SQL backends
+  deliver the batch atomically in a single multi-row insert (one missing
+  destination rejects the whole batch); from workflow code the batch is
+  one recorded step (`DBOS.send_bulk`), so a replay re-delivers nothing.
+  Backed by a new `StateProvider::insert_notifications` (sequential
+  default for custom providers).
 - Garbage collection: `DurableEngine::garbage_collect(cutoff_epoch_ms,
   rows_threshold)` deletes workflow history — every non-in-flight workflow
   created strictly before the cutoff, with its step/event/stream rows — and

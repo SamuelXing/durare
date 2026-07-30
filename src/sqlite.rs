@@ -2,10 +2,10 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest,
-    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert, RecordedStep,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS,
+    EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL,
 };
@@ -27,7 +27,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at";
+     serialization, created_at, updated_at, attributes";
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -128,6 +128,11 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
+        attributes: row
+            .try_get::<Option<String>, _>("attributes")
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str(&t).ok()),
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get::<i64, _>("priority") as i32,
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
@@ -199,8 +204,8 @@ impl StateProvider for SqliteProvider {
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  serialization, created_at, updated_at, attributes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -225,6 +230,7 @@ impl StateProvider for SqliteProvider {
         .bind(self.serializer.name())
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
+        .bind(encode_attributes(&s.attributes)?)
         .execute(&self.pool)
         .await
         .map_err(|e| dedup_or(e, &s))?
@@ -736,6 +742,44 @@ impl StateProvider for SqliteProvider {
         Ok(())
     }
 
+    async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Serialize up front (fallible), then build one multi-row INSERT — the
+        // whole batch commits or fails together, and each keyed row keeps the
+        // singular path's `{key}::{destination}` at-most-once id.
+        let mut prepared = Vec::with_capacity(rows.len());
+        for r in rows {
+            let message_uuid = match &r.idempotency_key {
+                Some(k) => format!("{k}::{}", r.destination_id),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            prepared.push((message_uuid, self.serializer.encode(&r.message)?));
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT INTO notifications
+                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms) ",
+        );
+        qb.push_values(rows.iter().zip(prepared), |mut b, (r, (uuid, encoded))| {
+            b.push_bind(uuid)
+                .push_bind(&r.destination_id)
+                .push_bind(&r.topic)
+                .push_bind(encoded)
+                .push_bind(self.serializer.name())
+                .push_bind(now);
+        });
+        qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
+        qb.build().execute(&self.pool).await.map_err(|e| {
+            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
+            dests.sort_unstable();
+            dests.dedup();
+            nonexistent_or(e, &dests.join(", "))
+        })?;
+        Ok(())
+    }
+
     async fn consume_notification(
         &self,
         workflow_id: &str,
@@ -825,6 +869,12 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
+        if filter.attributes.is_some() {
+            return Err(Error::app(
+                "filtering workflows by attributes is not supported on SQLite; \
+                 use a Postgres system database to filter by attributes",
+            ));
+        }
         let cols = list_select_cols(filter);
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {cols} FROM workflow_status"));
@@ -1136,6 +1186,32 @@ impl StateProvider for SqliteProvider {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        // Replace-not-merge; an empty map clears to NULL (the reference shape).
+        // Stored as TEXT — filtering requires Postgres, storage does not.
+        let value = attributes
+            .filter(|m| !m.is_empty())
+            .map(|m| serde_json::to_string(&Value::Object(m.clone())))
+            .transpose()?;
+        let res = sqlx::query(
+            "UPDATE workflow_status SET attributes = ?, updated_at = ?
+             WHERE workflow_uuid = ?",
+        )
+        .bind(value)
+        .bind(Utc::now().timestamp_millis())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(Error::nonexistent_workflow(id));
+        }
+        Ok(())
     }
 
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
@@ -2037,6 +2113,15 @@ fn row_to_schedule(row: &sqlx::sqlite::SqliteRow) -> Result<WorkflowSchedule> {
         cron_timezone: row.try_get("cron_timezone").ok().flatten(),
         queue_name: row.try_get("queue_name").ok().flatten(),
     })
+}
+
+/// Encode the attributes object for the TEXT `attributes` column: JSON text,
+/// or NULL when unset.
+fn encode_attributes(attributes: &Option<Value>) -> Result<Option<String>> {
+    attributes
+        .as_ref()
+        .map(|v| serde_json::to_string(v).map_err(Error::from))
+        .transpose()
 }
 
 /// Map an `operation_outputs` row to a [`StepInfo`], decoding `output` per the

@@ -164,6 +164,35 @@ const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// one long delete.
 pub(crate) const GC_BATCH: i64 = 10_000;
 
+/// Whether a workflow's stored `attributes` contain every key-value pair of
+/// `filter` — the in-memory equivalent of Postgres JSONB `@>` containment at
+/// the top level: each filter key must exist with an equal value (equality is
+/// deep for nested values, matching how `@>` treats a filter whose values are
+/// scalars or exact sub-objects).
+pub(crate) fn attributes_contain(stored: Option<&Value>, filter: &Map<String, Value>) -> bool {
+    let Some(Value::Object(stored)) = stored else {
+        return filter.is_empty();
+    };
+    filter
+        .iter()
+        .all(|(k, v)| stored.get(k).is_some_and(|s| contains_value(s, v)))
+}
+
+/// JSONB `@>` containment between two values: objects contain a subset of
+/// keys (recursively), arrays contain every element of the filter array, and
+/// scalars compare by equality.
+fn contains_value(stored: &Value, filter: &Value) -> bool {
+    match (stored, filter) {
+        (Value::Object(s), Value::Object(f)) => f
+            .iter()
+            .all(|(k, v)| s.get(k).is_some_and(|sv| contains_value(sv, v))),
+        (Value::Array(s), Value::Array(f)) => {
+            f.iter().all(|fv| s.iter().any(|sv| contains_value(sv, fv)))
+        }
+        (s, f) => s == f,
+    }
+}
+
 /// Resolve the effective garbage-collection cutoff from the two bounds — the
 /// newer of the absolute `cutoff_epoch_ms` and the `created_at` of the
 /// `rows_threshold`-th-newest workflow. `None` means nothing to collect (no
@@ -510,6 +539,10 @@ pub struct WorkflowStatus {
     pub created_at: DateTime<Utc>,
     /// When the row was last modified.
     pub updated_at: DateTime<Utc>,
+    /// Custom user-defined attributes attached to this workflow (a JSON
+    /// object), searchable via [`ListFilter::attributes`] containment on
+    /// Postgres. `None` when no attributes are set.
+    pub attributes: Option<Value>,
 }
 
 impl WorkflowStatus {
@@ -555,6 +588,7 @@ impl WorkflowStatus {
             config_name: None,
             created_at: now,
             updated_at: now,
+            attributes: None,
         }
     }
 }
@@ -606,6 +640,11 @@ pub struct ListFilter {
     /// `Some(true)` keeps only workflows that have a parent; `Some(false)` only
     /// those that don't; `None` does not filter on parentage.
     pub has_parent: Option<bool>,
+    /// Keep only workflows whose attributes **contain** all of these key-value
+    /// pairs (JSONB `@>` containment, served by a GIN index). Requires a
+    /// Postgres backend: SQLite errors on an attribute filter, matching the
+    /// reference SDKs; the in-memory backend emulates containment.
+    pub attributes: Option<Map<String, Value>>,
     /// Maximum number of rows to return; `None` for no limit.
     pub limit: Option<i64>,
     /// Number of matching rows to skip before returning (for pagination).
@@ -644,6 +683,7 @@ impl Default for ListFilter {
             dequeued_after_ms: None,
             dequeued_before_ms: None,
             has_parent: None,
+            attributes: None,
             limit: None,
             offset: None,
             sort_desc: false,
@@ -895,6 +935,22 @@ pub struct NotificationInfo {
     pub created_at_ms: i64,
     /// Whether a `recv` has already consumed it.
     pub consumed: bool,
+}
+
+/// One prepared notification row for
+/// [`StateProvider::insert_notifications`] — the provider-level form of a
+/// bulk-send message, with the payload already serialized to JSON.
+#[derive(Clone, Debug)]
+pub struct NotificationInsert {
+    /// Destination workflow id.
+    pub destination_id: String,
+    /// Topic the destination's `recv` listens on.
+    pub topic: String,
+    /// The serialized message payload.
+    pub message: Value,
+    /// Optional at-most-once key, scoped per destination (see
+    /// [`StateProvider::insert_notification`]).
+    pub idempotency_key: Option<String>,
 }
 
 /// One recorded operation of a workflow.
@@ -1334,6 +1390,30 @@ pub trait StateProvider: Send + Sync {
         idempotency_key: Option<&str>,
     ) -> Result<()>;
 
+    /// Append many messages in one operation — the bulk counterpart of
+    /// [`insert_notification`](Self::insert_notification), with the same
+    /// per-row semantics (FK-checked destinations; a keyed row's id derives
+    /// from `{key}::{destination_id}`, so a repeat is a silent no-op).
+    ///
+    /// The SQL backends deliver the whole batch **atomically** in a single
+    /// multi-row statement: one nonexistent destination rejects the entire
+    /// batch and nothing is delivered. The default implementation inserts
+    /// sequentially — same per-row semantics but no all-or-nothing guarantee;
+    /// providers that can should override atomically. An empty slice is a
+    /// no-op.
+    async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
+        for r in rows {
+            self.insert_notification(
+                &r.destination_id,
+                &r.topic,
+                r.message.clone(),
+                r.idempotency_key.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Atomically claim the **oldest unconsumed** message for
     /// `(workflow_id, topic)` and record it as the step checkpoint
     /// `(workflow_id, seq)` in the same transaction — if claiming and
@@ -1476,6 +1556,16 @@ pub trait StateProvider: Send + Sync {
     /// dispatcher promotes it to `ENQUEUED` once due); anything else is a no-op.
     /// Returns whether a row was updated.
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool>;
+
+    /// **Replace** the custom attributes attached to workflow `id` (`None` or
+    /// an empty map clears them) and bump `updated_at`. Errors with
+    /// [`Error::NonExistentWorkflow`](crate::Error::NonExistentWorkflow) if
+    /// the workflow does not exist.
+    async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<&Map<String, Value>>,
+    ) -> Result<()>;
 
     /// Create `params.new_id` as a fork of `params.original_id`: a fresh
     /// `ENQUEUED` workflow on `params.queue_name` with the same

@@ -210,6 +210,11 @@ pub struct EngineConfig {
 /// (or how numerous) terminal workflow history may get before a background
 /// sweep deletes it via [`garbage_collect`](DurableEngine::garbage_collect).
 ///
+/// A **durare extension**: no reference DBOS SDK offers client-side retention
+/// (they enforce only a DBOS-Cloud-pushed policy). It is opt-in at runtime —
+/// with no policy configured (the default), behavior is identical to the
+/// reference SDKs.
+///
 /// At least one bound is required — [`launch`](DurableEngine::launch) rejects
 /// a boundless policy. In-flight and still-queued work
 /// (`PENDING`/`ENQUEUED`/`DELAYED`) is never collected regardless of the
@@ -424,6 +429,12 @@ pub struct WorkflowOptions {
     pub assumed_role: Option<String>,
     /// Roles available to the authenticated user.
     pub authenticated_roles: Vec<String>,
+    /// Custom attributes attached to the workflow at creation: arbitrary
+    /// user-defined key-value metadata, searchable later via
+    /// [`ListFilter::attributes`](crate::ListFilter::attributes) containment
+    /// (Postgres). Not inherited by child workflows. Replace them later with
+    /// [`DurableEngine::set_workflow_attributes`].
+    pub attributes: Option<serde_json::Map<String, serde_json::Value>>,
     /// Config / instance name: routes this run to the handler registered for that
     /// instance under the same workflow name (see
     /// [`DurableEngine::register_configured`]), and is recorded so recovery
@@ -460,6 +471,12 @@ impl WorkflowOptions {
     /// Set the role assumed for this run.
     pub fn assumed_role(mut self, role: impl Into<String>) -> Self {
         self.assumed_role = Some(role.into());
+        self
+    }
+
+    /// Attach custom attributes (see [`WorkflowOptions::attributes`]).
+    pub fn attributes(mut self, attributes: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.attributes = Some(attributes);
         self
     }
 
@@ -510,6 +527,80 @@ impl WorkflowOptions {
         self.authenticated_roles = roles.into_iter().map(Into::into).collect();
         self
     }
+}
+
+/// One message in a bulk send ([`DurableEngine::send_bulk`],
+/// [`DurableContext::send_bulk`](crate::DurableContext::send_bulk),
+/// [`Client::send_bulk`](crate::Client::send_bulk)): its own destination,
+/// topic, and optional at-most-once idempotency key. Mixed payload types in
+/// one batch: use `T = serde_json::Value`.
+#[derive(Clone, Debug)]
+pub struct SendMessage<T> {
+    /// Destination workflow id.
+    pub destination_id: String,
+    /// Topic the destination's `recv` listens on.
+    pub topic: String,
+    /// The message payload.
+    pub message: T,
+    /// Optional at-most-once key, scoped per destination like
+    /// [`send_with_idempotency_key`](DurableEngine::send_with_idempotency_key);
+    /// the same key must not repeat within one bulk call.
+    pub idempotency_key: Option<String>,
+}
+
+impl<T> SendMessage<T> {
+    /// A message for `destination_id` on `topic`, without an idempotency key.
+    pub fn new(destination_id: impl Into<String>, message: T, topic: impl Into<String>) -> Self {
+        Self {
+            destination_id: destination_id.into(),
+            topic: topic.into(),
+            message,
+            idempotency_key: None,
+        }
+    }
+
+    /// Attach an at-most-once idempotency key.
+    pub fn idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+}
+
+/// Validate a bulk-send batch and serialize it to provider rows: duplicate
+/// provided idempotency keys are rejected up front (each names a distinct
+/// at-most-once delivery — a repeat within one call is a caller bug, matching
+/// the reference behavior), payloads are serialized once.
+pub(crate) fn prepare_bulk<T: Serialize>(
+    messages: &[SendMessage<T>],
+) -> Result<Vec<crate::provider::NotificationInsert>> {
+    let mut keys: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.idempotency_key.as_deref())
+        .collect();
+    keys.sort_unstable();
+    let mut duplicates: Vec<&str> = keys
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0])
+        .collect();
+    duplicates.dedup();
+    if !duplicates.is_empty() {
+        return Err(Error::app(format!(
+            "send_bulk received duplicate idempotency keys: {}",
+            duplicates.join(", ")
+        )));
+    }
+    messages
+        .iter()
+        .map(|m| {
+            Ok(crate::provider::NotificationInsert {
+                destination_id: m.destination_id.clone(),
+                topic: m.topic.clone(),
+                message: serde_json::to_value(&m.message)?,
+                idempotency_key: m.idempotency_key.clone(),
+            })
+        })
+        .collect()
 }
 
 /// A point-in-time readiness report from [`DurableEngine::health`].
@@ -1869,6 +1960,25 @@ impl DurableEngine {
             .await
     }
 
+    /// Send many messages in one call — the fan-out counterpart of
+    /// [`send`](Self::send), delivered **atomically** on the SQL backends
+    /// (one multi-row insert: all messages land, or none do). Each message
+    /// carries its own destination, topic, and optional at-most-once
+    /// idempotency key ([`SendMessage`]); a repeated non-`None` key within
+    /// one call is rejected. From workflow code use
+    /// [`DurableContext::send_bulk`], which records the whole batch as one
+    /// durable step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if any destination does not exist (no
+    /// message is delivered in that case on the SQL backends).
+    pub async fn send_bulk<T: Serialize>(&self, messages: &[SendMessage<T>]) -> Result<()> {
+        self.provider
+            .insert_notifications(&prepare_bulk(messages)?)
+            .await
+    }
+
     /// Read event `key` of a workflow from **outside** any workflow, waiting up
     /// to `timeout` for it to be set. Returns `None` on timeout. From workflow
     /// code use [`DurableContext::get_event`], which is durable.
@@ -2140,6 +2250,26 @@ impl DurableEngine {
     /// skipped. An empty slice is a no-op.
     pub async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
         self.provider.delete_workflows(ids, delete_children).await
+    }
+
+    /// **Replace** the custom attributes attached to workflow `id` — arbitrary
+    /// user-defined key-value metadata, searchable via
+    /// [`ListFilter::attributes`](crate::ListFilter::attributes) containment
+    /// on Postgres. Pass `None` (or an empty map) to clear all attributes.
+    /// Replace, not merge: the given map becomes the workflow's entire
+    /// attribute set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the workflow does not exist.
+    pub async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<()> {
+        self.provider
+            .set_workflow_attributes(id, attributes.as_ref())
+            .await
     }
 
     /// Reschedule a `DELAYED` workflow to become eligible `delay` from now. Only
@@ -2485,6 +2615,11 @@ impl Runtime {
         row.authenticated_roles = auth.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
+        row.attributes = opts
+            .attributes
+            .clone()
+            .filter(|m| !m.is_empty())
+            .map(serde_json::Value::Object);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
         if !queued {
