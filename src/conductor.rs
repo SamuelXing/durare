@@ -1623,6 +1623,8 @@ struct ListBody {
     load_output: bool,
     #[serde(default)]
     queues_only: bool,
+    /// Attribute containment filter (Postgres-only), per the conductor wire.
+    attributes: Option<serde_json::Map<String, Value>>,
 }
 
 impl ListBody {
@@ -1652,6 +1654,7 @@ impl ListBody {
             load_input: self.load_input,
             load_output: self.load_output,
             queues_only: self.queues_only,
+            attributes: self.attributes.clone(),
         };
         if force_queued {
             f.queues_only = true;
@@ -1701,6 +1704,13 @@ fn format_list_workflow(ws: &WorkflowStatus) -> Value {
     if !ws.authenticated_roles.is_empty() {
         let roles = serde_json::to_string(&ws.authenticated_roles).unwrap_or_default();
         m.insert("AuthenticatedRoles".into(), json!(roles));
+    }
+    // Marshaled to a JSON string so the wire shape is parseable by the
+    // conductor (the reference SDKs' `Attributes *string` field).
+    if let Some(attrs) = &ws.attributes {
+        if let Ok(s) = serde_json::to_string(attrs) {
+            m.insert("Attributes".into(), json!(s));
+        }
     }
     if let Some(i) = payload(Some(&ws.input)) {
         m.insert("Input".into(), json!(i));

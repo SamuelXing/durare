@@ -8,6 +8,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Searchable workflow attributes: attach arbitrary key-value metadata at
+  creation (`WorkflowOptions::attributes`), replace or clear it later
+  (`set_workflow_attributes` on `DurableEngine`, `Client`, and — as one
+  durable step — `DurableContext`), and filter `list_workflows` by
+  containment (`ListFilter::attributes`): a workflow matches when its
+  attributes contain all given pairs, served on Postgres by migration 40's
+  GIN index. Cross-SDK semantics throughout: replace-not-merge, no child
+  inheritance, and filtering requires Postgres (SQLite stores and reads
+  attributes but errors on an attribute filter, matching the reference
+  SDKs; the in-memory backend emulates containment for tests). The
+  conductor's list requests accept the attributes filter and its responses
+  carry each row's attributes, so the DBOS console's attribute views work
+  against a Rust process.
 - Bulk send: `send_bulk(&[SendMessage])` on `DurableEngine`, `Client`, and
   `DurableContext` fans one call out to many destinations — each message
   with its own destination, topic, and optional at-most-once idempotency

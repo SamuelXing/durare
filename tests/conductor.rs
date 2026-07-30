@@ -1166,3 +1166,70 @@ async fn conductor_tolerates_explicit_null_list_fields() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+/// Attribute filtering over the conductor wire: the list body's `attributes`
+/// containment filter narrows the result, and each row carries its attributes
+/// as a JSON string (the console's parse shape).
+#[tokio::test]
+async fn conductor_filters_and_reports_attributes() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let filtered = exchange(
+            &mut ws,
+            json!({"type":"list_workflows","request_id":"la",
+                   "body":{"attributes":{"customer":"acme"}}}),
+        )
+        .await;
+        filtered
+    });
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
+        Ok::<_, Error>(())
+    });
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    for (id, attrs) in [
+        ("cw-acme", json!({"customer": "acme"})),
+        ("cw-globex", json!({"customer": "globex"})),
+    ] {
+        engine
+            .start::<(), ()>(
+                "noop",
+                (),
+                WorkflowOptions::with_id(id).attributes(attrs.as_object().unwrap().clone()),
+            )
+            .await?
+            .await?;
+    }
+
+    let conductor = Conductor::start(
+        engine.clone(),
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+
+    let filtered = server.await.unwrap();
+    let rows = filtered["output"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "containment narrowed the list: {rows:?}");
+    assert_eq!(rows[0]["WorkflowUUID"], "cw-acme");
+    let attrs_str = rows[0]["Attributes"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(attrs_str).unwrap(),
+        json!({"customer": "acme"}),
+        "attributes marshaled as a JSON string"
+    );
+
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

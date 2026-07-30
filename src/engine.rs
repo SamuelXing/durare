@@ -333,6 +333,12 @@ pub struct WorkflowOptions {
     pub assumed_role: Option<String>,
     /// Roles available to the authenticated user.
     pub authenticated_roles: Vec<String>,
+    /// Custom attributes attached to the workflow at creation: arbitrary
+    /// user-defined key-value metadata, searchable later via
+    /// [`ListFilter::attributes`](crate::ListFilter::attributes) containment
+    /// (Postgres). Not inherited by child workflows. Replace them later with
+    /// [`DurableEngine::set_workflow_attributes`].
+    pub attributes: Option<serde_json::Map<String, serde_json::Value>>,
     /// Config / instance name: routes this run to the handler registered for that
     /// instance under the same workflow name (see
     /// [`DurableEngine::register_configured`]), and is recorded so recovery
@@ -369,6 +375,12 @@ impl WorkflowOptions {
     /// Set the role assumed for this run.
     pub fn assumed_role(mut self, role: impl Into<String>) -> Self {
         self.assumed_role = Some(role.into());
+        self
+    }
+
+    /// Attach custom attributes (see [`WorkflowOptions::attributes`]).
+    pub fn attributes(mut self, attributes: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.attributes = Some(attributes);
         self
     }
 
@@ -2107,6 +2119,26 @@ impl DurableEngine {
         self.provider.delete_workflows(ids, delete_children).await
     }
 
+    /// **Replace** the custom attributes attached to workflow `id` — arbitrary
+    /// user-defined key-value metadata, searchable via
+    /// [`ListFilter::attributes`](crate::ListFilter::attributes) containment
+    /// on Postgres. Pass `None` (or an empty map) to clear all attributes.
+    /// Replace, not merge: the given map becomes the workflow's entire
+    /// attribute set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the workflow does not exist.
+    pub async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<()> {
+        self.provider
+            .set_workflow_attributes(id, attributes.as_ref())
+            .await
+    }
+
     /// Reschedule a `DELAYED` workflow to become eligible `delay` from now. Only
     /// affects a workflow currently `DELAYED` (e.g. enqueued with
     /// [`WorkflowOptions::delay`]); the queue dispatcher promotes it once due.
@@ -2449,6 +2481,11 @@ impl Runtime {
         row.authenticated_roles = auth.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
+        row.attributes = opts
+            .attributes
+            .clone()
+            .filter(|m| !m.is_empty())
+            .map(serde_json::Value::Object);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
         if !queued {
