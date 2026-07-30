@@ -370,6 +370,45 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
+    async fn insert_notifications(
+        &self,
+        rows: &[crate::provider::NotificationInsert],
+    ) -> Result<()> {
+        // One lock for the whole batch, destinations validated before any
+        // insert — the same all-or-nothing the SQL backends get from a single
+        // multi-row statement.
+        let mut g = self.inner.lock().await;
+        if let Some(missing) = rows
+            .iter()
+            .find(|r| !g.workflows.contains_key(&r.destination_id))
+        {
+            return Err(Error::nonexistent_workflow(&missing.destination_id));
+        }
+        let now = Utc::now().timestamp_millis();
+        for r in rows {
+            let message_uuid = match &r.idempotency_key {
+                Some(k) => format!("{k}::{}", r.destination_id),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            if r.idempotency_key.is_some()
+                && g.notifications
+                    .iter()
+                    .any(|n| n.message_uuid == message_uuid)
+            {
+                continue;
+            }
+            g.notifications.push(NotificationRow {
+                message_uuid,
+                destination_id: r.destination_id.clone(),
+                topic: r.topic.clone(),
+                message: r.message.clone(),
+                consumed: false,
+                created_at_ms: now,
+            });
+        }
+        Ok(())
+    }
+
     async fn consume_notification(
         &self,
         workflow_id: &str,

@@ -891,6 +891,22 @@ pub struct NotificationInfo {
     pub consumed: bool,
 }
 
+/// One prepared notification row for
+/// [`StateProvider::insert_notifications`] — the provider-level form of a
+/// bulk-send message, with the payload already serialized to JSON.
+#[derive(Clone, Debug)]
+pub struct NotificationInsert {
+    /// Destination workflow id.
+    pub destination_id: String,
+    /// Topic the destination's `recv` listens on.
+    pub topic: String,
+    /// The serialized message payload.
+    pub message: Value,
+    /// Optional at-most-once key, scoped per destination (see
+    /// [`StateProvider::insert_notification`]).
+    pub idempotency_key: Option<String>,
+}
+
 /// One recorded operation of a workflow.
 ///
 /// Materialized from an `operation_outputs` row by
@@ -1327,6 +1343,30 @@ pub trait StateProvider: Send + Sync {
         message: Value,
         idempotency_key: Option<&str>,
     ) -> Result<()>;
+
+    /// Append many messages in one operation — the bulk counterpart of
+    /// [`insert_notification`](Self::insert_notification), with the same
+    /// per-row semantics (FK-checked destinations; a keyed row's id derives
+    /// from `{key}::{destination_id}`, so a repeat is a silent no-op).
+    ///
+    /// The SQL backends deliver the whole batch **atomically** in a single
+    /// multi-row statement: one nonexistent destination rejects the entire
+    /// batch and nothing is delivered. The default implementation inserts
+    /// sequentially — same per-row semantics but no all-or-nothing guarantee;
+    /// providers that can should override atomically. An empty slice is a
+    /// no-op.
+    async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
+        for r in rows {
+            self.insert_notification(
+                &r.destination_id,
+                &r.topic,
+                r.message.clone(),
+                r.idempotency_key.as_deref(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
 
     /// Atomically claim the **oldest unconsumed** message for
     /// `(workflow_id, topic)` and record it as the step checkpoint

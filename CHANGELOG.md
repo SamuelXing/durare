@@ -8,6 +8,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Bulk send: `send_bulk(&[SendMessage])` on `DurableEngine`, `Client`, and
+  `DurableContext` fans one call out to many destinations — each message
+  with its own destination, topic, and optional at-most-once idempotency
+  key (a repeated key within one call is rejected). The SQL backends
+  deliver the batch atomically in a single multi-row insert (one missing
+  destination rejects the whole batch); from workflow code the batch is
+  one recorded step (`DBOS.send_bulk`), so a replay re-delivers nothing.
+  Backed by a new `StateProvider::insert_notifications` (sequential
+  default for custom providers).
 - Garbage collection: `DurableEngine::garbage_collect(cutoff_epoch_ms,
   rows_threshold)` deletes workflow history — every non-in-flight workflow
   created strictly before the cutoff, with its step/event/stream rows — and

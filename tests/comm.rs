@@ -286,3 +286,169 @@ async fn send_with_idempotency_key_delivers_at_most_once() -> Result<()> {
     assert_eq!(m3, None, "the duplicate keyed send was not delivered");
     Ok(())
 }
+
+/// send_bulk fans one call out to many workflows: each destination's recv
+/// gets its own payload on its own topic, from a single engine call.
+#[tokio::test]
+async fn send_bulk_fans_out_to_many_workflows() -> Result<()> {
+    use durare::SendMessage;
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("waiter", |ctx: DurableContext, topic: String| async move {
+        let msg: Option<String> = ctx.recv(&topic, Duration::from_secs(5)).await?;
+        Ok::<_, Error>(msg.unwrap_or_default())
+    });
+
+    let mut handles = Vec::new();
+    for n in 0..3 {
+        handles.push(
+            engine
+                .start::<_, String>(
+                    "waiter",
+                    format!("topic-{n}"),
+                    WorkflowOptions::with_id(format!("bulk-dest-{n}")),
+                )
+                .await?,
+        );
+    }
+
+    engine
+        .send_bulk(&[
+            SendMessage::new("bulk-dest-0", "zero".to_string(), "topic-0"),
+            SendMessage::new("bulk-dest-1", "one".to_string(), "topic-1"),
+            SendMessage::new("bulk-dest-2", "two".to_string(), "topic-2"),
+        ])
+        .await?;
+
+    let mut got = Vec::new();
+    for h in handles {
+        got.push(h.result().await?);
+    }
+    assert_eq!(got, vec!["zero", "one", "two"]);
+    Ok(())
+}
+
+/// A repeated idempotency key within one bulk call is a caller bug, rejected
+/// up front; distinct keys are at-most-once across repeated calls.
+#[tokio::test]
+async fn send_bulk_idempotency_keys() -> Result<()> {
+    use durare::SendMessage;
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("sink", |ctx: DurableContext, _: ()| async move {
+        // Park so the mailbox can be inspected while the workflow is live.
+        ctx.recv::<String>("done", Duration::from_secs(5)).await?;
+        Ok::<_, Error>(())
+    });
+    let h = engine
+        .start::<_, ()>("sink", (), WorkflowOptions::with_id("bulk-sink"))
+        .await?;
+
+    // Duplicate key inside one call: rejected, nothing delivered.
+    let err = engine
+        .send_bulk(&[
+            SendMessage::new("bulk-sink", "a".to_string(), "t").idempotency_key("k1"),
+            SendMessage::new("bulk-sink", "b".to_string(), "t").idempotency_key("k1"),
+        ])
+        .await
+        .expect_err("duplicate keys must be rejected");
+    assert!(
+        err.to_string().contains("duplicate idempotency keys"),
+        "{err}"
+    );
+
+    // The same keyed batch sent twice delivers once.
+    let batch = [SendMessage::new("bulk-sink", "once".to_string(), "t").idempotency_key("k2")];
+    engine.send_bulk(&batch).await?;
+    engine.send_bulk(&batch).await?;
+    let notifications = engine.list_workflow_notifications("bulk-sink").await?;
+    let on_topic = notifications
+        .iter()
+        .filter(|n| n.topic.as_deref() == Some("t"))
+        .count();
+    assert_eq!(on_topic, 1, "keyed batch delivered at most once");
+
+    engine.send("bulk-sink", "fin".to_string(), "done").await?;
+    h.result().await?;
+    Ok(())
+}
+
+/// One nonexistent destination rejects the whole batch — nothing is
+/// delivered to the valid destinations either (all-or-nothing).
+#[tokio::test]
+async fn send_bulk_is_all_or_nothing_on_a_missing_destination() -> Result<()> {
+    use durare::SendMessage;
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("sink", |ctx: DurableContext, _: ()| async move {
+        ctx.recv::<String>("done", Duration::from_secs(5)).await?;
+        Ok::<_, Error>(())
+    });
+    let h = engine
+        .start::<_, ()>("sink", (), WorkflowOptions::with_id("bulk-real"))
+        .await?;
+
+    let err = engine
+        .send_bulk(&[
+            SendMessage::new("bulk-real", "hi".to_string(), "t"),
+            SendMessage::new("no-such-workflow", "hi".to_string(), "t"),
+        ])
+        .await
+        .expect_err("missing destination must reject the batch");
+    assert!(matches!(err, Error::NonExistentWorkflow(_)), "{err}");
+    let delivered = engine.list_workflow_notifications("bulk-real").await?;
+    assert!(
+        delivered.iter().all(|n| n.topic.as_deref() != Some("t")),
+        "nothing delivered from the failed batch: {delivered:?}"
+    );
+
+    engine.send("bulk-real", "fin".to_string(), "done").await?;
+    h.result().await?;
+    Ok(())
+}
+
+/// ctx.send_bulk is one durable step: the batch lands, exactly one
+/// `DBOS.send_bulk` checkpoint is recorded, and a replay does not re-deliver.
+#[tokio::test]
+async fn ctx_send_bulk_records_one_step() -> Result<()> {
+    use durare::SendMessage;
+
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register("fan", |ctx: DurableContext, _: ()| async move {
+        ctx.send_bulk(&[
+            SendMessage::new("bulk-rx-0", "a".to_string(), "t"),
+            SendMessage::new("bulk-rx-1", "b".to_string(), "t"),
+        ])
+        .await?;
+        Ok::<_, Error>(())
+    });
+    engine.register("rx", |ctx: DurableContext, _: ()| async move {
+        let msg: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+        Ok::<_, Error>(msg.unwrap_or_default())
+    });
+
+    let mut receivers = Vec::new();
+    for n in 0..2 {
+        receivers.push(
+            engine
+                .start::<_, String>("rx", (), WorkflowOptions::with_id(format!("bulk-rx-{n}")))
+                .await?,
+        );
+    }
+    engine
+        .start::<_, ()>("fan", (), WorkflowOptions::with_id("bulk-fan"))
+        .await?
+        .result()
+        .await?;
+
+    assert_eq!(receivers.remove(0).result().await?, "a");
+    assert_eq!(receivers.remove(0).result().await?, "b");
+
+    let steps = engine.get_workflow_steps("bulk-fan").await?;
+    let bulk_steps: Vec<_> = steps
+        .iter()
+        .filter(|s| s.name == "DBOS.send_bulk")
+        .collect();
+    assert_eq!(bulk_steps.len(), 1, "one checkpoint for the whole batch");
+    Ok(())
+}

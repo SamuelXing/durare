@@ -2,10 +2,10 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest,
-    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert, RecordedStep,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS,
+    EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL,
 };
@@ -733,6 +733,44 @@ impl StateProvider for SqliteProvider {
         .execute(&self.pool)
         .await
         .map_err(|e| nonexistent_or(e, destination_id))?;
+        Ok(())
+    }
+
+    async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Serialize up front (fallible), then build one multi-row INSERT — the
+        // whole batch commits or fails together, and each keyed row keeps the
+        // singular path's `{key}::{destination}` at-most-once id.
+        let mut prepared = Vec::with_capacity(rows.len());
+        for r in rows {
+            let message_uuid = match &r.idempotency_key {
+                Some(k) => format!("{k}::{}", r.destination_id),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            prepared.push((message_uuid, self.serializer.encode(&r.message)?));
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT INTO notifications
+                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms) ",
+        );
+        qb.push_values(rows.iter().zip(prepared), |mut b, (r, (uuid, encoded))| {
+            b.push_bind(uuid)
+                .push_bind(&r.destination_id)
+                .push_bind(&r.topic)
+                .push_bind(encoded)
+                .push_bind(self.serializer.name())
+                .push_bind(now);
+        });
+        qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
+        qb.build().execute(&self.pool).await.map_err(|e| {
+            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
+            dests.sort_unstable();
+            dests.dedup();
+            nonexistent_or(e, &dests.join(", "))
+        })?;
         Ok(())
     }
 
