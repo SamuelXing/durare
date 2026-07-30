@@ -162,6 +162,11 @@ impl Client {
         row.authenticated_roles = opts.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
+        row.attributes = opts
+            .attributes
+            .clone()
+            .filter(|m| !m.is_empty())
+            .map(serde_json::Value::Object);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
 
@@ -395,6 +400,26 @@ impl Client {
             })
             .await?;
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
+    }
+
+    /// **Replace** the custom attributes attached to workflow `id` — arbitrary
+    /// user-defined key-value metadata, searchable via
+    /// [`ListFilter::attributes`](crate::ListFilter::attributes) containment
+    /// on Postgres. Pass `None` (or an empty map) to clear all attributes.
+    /// Replace, not merge: the given map becomes the workflow's entire
+    /// attribute set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the workflow does not exist.
+    pub async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<()> {
+        self.provider
+            .set_workflow_attributes(id, attributes.as_ref())
+            .await
     }
 
     /// Reschedule a `DELAYED` workflow to become eligible `delay` from now. A

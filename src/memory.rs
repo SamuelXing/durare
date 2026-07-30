@@ -483,6 +483,9 @@ impl StateProvider for InMemoryProvider {
                             .iter()
                             .any(|p| w.id.starts_with(p)))
                     && (filter.name.is_empty() || filter.name.contains(&w.name))
+                    && filter.attributes.as_ref().is_none_or(|f| {
+                        crate::provider::attributes_contain(w.attributes.as_ref(), f)
+                    })
                     && (filter.status.is_empty() || filter.status.contains(&w.status))
                     && (filter.queue_name.is_empty()
                         || w.queue_name
@@ -897,6 +900,23 @@ impl StateProvider for InMemoryProvider {
             }
         }
         Ok(false)
+    }
+
+    async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        let Some(row) = g.workflows.get_mut(id) else {
+            return Err(Error::nonexistent_workflow(id));
+        };
+        // Replace-not-merge; an empty map clears (the reference shape).
+        row.attributes = attributes
+            .filter(|m| !m.is_empty())
+            .map(|m| Value::Object(m.clone()));
+        row.updated_at = Utc::now();
+        Ok(())
     }
 
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
@@ -1486,6 +1506,8 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or(Value::Null),
         output: col_str(s, "output").and_then(|v| serde_json::from_str(&v).ok()),
+        // Not part of the cross-SDK portable export payload (matching Go).
+        attributes: None,
         error,
         error_info,
         executor_id: col_str(s, "executor_id").unwrap_or_default(),

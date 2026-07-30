@@ -27,7 +27,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at";
+     serialization, created_at, updated_at, attributes";
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -128,6 +128,11 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
+        attributes: row
+            .try_get::<Option<String>, _>("attributes")
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str(&t).ok()),
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get::<i64, _>("priority") as i32,
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
@@ -199,8 +204,8 @@ impl StateProvider for SqliteProvider {
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  serialization, created_at, updated_at, attributes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -225,6 +230,7 @@ impl StateProvider for SqliteProvider {
         .bind(self.serializer.name())
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
+        .bind(encode_attributes(&s.attributes)?)
         .execute(&self.pool)
         .await
         .map_err(|e| dedup_or(e, &s))?
@@ -863,6 +869,12 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
+        if filter.attributes.is_some() {
+            return Err(Error::app(
+                "filtering workflows by attributes is not supported on SQLite; \
+                 use a Postgres system database to filter by attributes",
+            ));
+        }
         let cols = list_select_cols(filter);
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {cols} FROM workflow_status"));
@@ -1162,6 +1174,32 @@ impl StateProvider for SqliteProvider {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        // Replace-not-merge; an empty map clears to NULL (the reference shape).
+        // Stored as TEXT — filtering requires Postgres, storage does not.
+        let value = attributes
+            .filter(|m| !m.is_empty())
+            .map(|m| serde_json::to_string(&Value::Object(m.clone())))
+            .transpose()?;
+        let res = sqlx::query(
+            "UPDATE workflow_status SET attributes = ?, updated_at = ?
+             WHERE workflow_uuid = ?",
+        )
+        .bind(value)
+        .bind(Utc::now().timestamp_millis())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(Error::nonexistent_workflow(id));
+        }
+        Ok(())
     }
 
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
@@ -2063,6 +2101,15 @@ fn row_to_schedule(row: &sqlx::sqlite::SqliteRow) -> Result<WorkflowSchedule> {
         cron_timezone: row.try_get("cron_timezone").ok().flatten(),
         queue_name: row.try_get("queue_name").ok().flatten(),
     })
+}
+
+/// Encode the attributes object for the TEXT `attributes` column: JSON text,
+/// or NULL when unset.
+fn encode_attributes(attributes: &Option<Value>) -> Result<Option<String>> {
+    attributes
+        .as_ref()
+        .map(|v| serde_json::to_string(v).map_err(Error::from))
+        .transpose()
 }
 
 /// Map an `operation_outputs` row to a [`StepInfo`], decoding `output` per the

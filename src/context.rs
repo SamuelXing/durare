@@ -1024,6 +1024,46 @@ impl DurableContext {
         Ok(())
     }
 
+    /// **Replace** the custom attributes attached to workflow `id` (commonly
+    /// this workflow's own — [`workflow_id`](Self::workflow_id)); `None` or an
+    /// empty map clears them. Recorded as one durable step
+    /// (`DBOS.updateWorkflowAttributes`, the cross-SDK name), so under
+    /// recovery the replacement happens exactly once and a replay does not
+    /// re-run it. Replace, not merge.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if the target workflow does not exist;
+    /// otherwise storage errors, [`Error::Cancelled`], or
+    /// [`Error::UnexpectedStep`] on a divergent replay.
+    pub async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        let seq = self.next_seq();
+        if let Some(_done) = self
+            .replay_or_guard::<Value>(seq, "DBOS.updateWorkflowAttributes")
+            .await?
+        {
+            return Ok(());
+        }
+        self.provider
+            .set_workflow_attributes(id, attributes.as_ref())
+            .await?;
+        self.provider
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                "DBOS.updateWorkflowAttributes",
+                Value::Null,
+                None,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Send many messages in one durable operation — the fan-out counterpart
     /// of [`send`](Self::send). The whole batch is one recorded step
     /// (`DBOS.send_bulk`): on replay nothing is re-delivered, and on the SQL

@@ -32,7 +32,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at";
+     serialization, created_at, updated_at, attributes";
 
 /// Routes inbound `LISTEN`/`NOTIFY` notifications to the `recv`/`get_event`
 /// waiters parked on the matching payload. Waiters subscribe by payload; the
@@ -357,6 +357,7 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
         executor_id: row.get("executor_id"),
         app_version: row.get("application_version"),
         queue_name: row.try_get("queue_name").ok().flatten(),
+        attributes: row.try_get("attributes").ok().flatten(),
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get("priority"),
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
@@ -484,9 +485,9 @@ impl StateProvider for PostgresProvider {
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at)
+                  serialization, created_at, updated_at, attributes)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22)
+                     $17, $18, $19, $20, $21, $22, $23)
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -511,6 +512,7 @@ impl StateProvider for PostgresProvider {
         .bind(self.serializer.name())
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
+        .bind(&s.attributes)
         .execute(&self.pool)
         .await
         .map_err(|e| dedup_or(e, &s))?
@@ -1481,6 +1483,30 @@ impl StateProvider for PostgresProvider {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn set_workflow_attributes(
+        &self,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        // Replace-not-merge; an empty map clears to NULL (the reference shape).
+        let value = attributes
+            .filter(|m| !m.is_empty())
+            .map(|m| Value::Object(m.clone()));
+        let res = sqlx::query(
+            "UPDATE workflow_status SET attributes = $2, updated_at = $3
+             WHERE workflow_uuid = $1",
+        )
+        .bind(id)
+        .bind(value)
+        .bind(Utc::now().timestamp_millis())
+        .execute(&self.pool)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(Error::nonexistent_workflow(id));
+        }
+        Ok(())
     }
 
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
@@ -2498,6 +2524,12 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, filter: &'a ListFi
         } else {
             "parent_workflow_id IS NULL"
         });
+    }
+    if let Some(attrs) = &filter.attributes {
+        // JSONB containment, served by the partial GIN index on `attributes`.
+        clause(qb);
+        qb.push("attributes @> ")
+            .push_bind(serde_json::Value::Object(attrs.clone()));
     }
     if filter.queues_only {
         clause(qb);
