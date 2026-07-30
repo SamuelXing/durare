@@ -3154,3 +3154,55 @@ async fn pg_queue_upsert_conflict_policy() -> Result<()> {
 
     Ok(())
 }
+
+/// The multi-row bulk-send statement on Postgres: atomic all-or-nothing on a
+/// missing destination, at-most-once for keyed batches.
+#[tokio::test]
+async fn pg_send_bulk_atomic_fan_out() -> Result<()> {
+    use durare::SendMessage;
+
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_send_bulk_atomic_fan_out: DATABASE_URL unset");
+        return Ok(());
+    };
+    let provider = PostgresProvider::connect(&url).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    let run = uuid::Uuid::new_v4().simple().to_string();
+    let (d0, d1) = (format!("sb-{run}-0"), format!("sb-{run}-1"));
+    engine.register("bulk-waiter", |ctx: DurableContext, _: ()| async move {
+        let msg: Option<String> = ctx.recv("t", Duration::from_secs(10)).await?;
+        Ok::<_, Error>(msg.unwrap_or_default())
+    });
+    engine.launch().await?;
+
+    let h0 = engine
+        .start::<_, String>("bulk-waiter", (), durare::WorkflowOptions::with_id(&d0))
+        .await?;
+    let h1 = engine
+        .start::<_, String>("bulk-waiter", (), durare::WorkflowOptions::with_id(&d1))
+        .await?;
+
+    let err = engine
+        .send_bulk(&[
+            SendMessage::new(&d0, "x".to_string(), "t"),
+            SendMessage::new(format!("sb-{run}-missing"), "x".to_string(), "t"),
+        ])
+        .await
+        .expect_err("missing destination rejects the batch");
+    assert!(matches!(err, Error::NonExistentWorkflow(_)), "{err}");
+    assert!(engine.list_workflow_notifications(&d0).await?.is_empty());
+
+    let batch = [
+        SendMessage::new(&d0, "zero".to_string(), "t").idempotency_key(format!("{run}-k0")),
+        SendMessage::new(&d1, "one".to_string(), "t").idempotency_key(format!("{run}-k1")),
+    ];
+    engine.send_bulk(&batch).await?;
+    engine.send_bulk(&batch).await?;
+
+    assert_eq!(h0.result().await?, "zero");
+    assert_eq!(h1.result().await?, "one");
+    assert_eq!(engine.list_workflow_notifications(&d0).await?.len(), 1);
+
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

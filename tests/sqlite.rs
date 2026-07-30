@@ -3290,3 +3290,62 @@ async fn sqlite_durable_now_uuid_replay_across_restart() -> Result<()> {
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+
+/// The multi-row bulk-send statement: fans out in one INSERT, one bad
+/// destination rejects the whole batch atomically, and a keyed batch is
+/// at-most-once across calls.
+#[tokio::test]
+async fn sqlite_send_bulk_atomic_fan_out() -> Result<()> {
+    use durare::SendMessage;
+
+    let (url, path) = temp_db_url("send-bulk");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register("waiter", |ctx: DurableContext, _: ()| async move {
+        let msg: Option<String> = ctx.recv("t", std::time::Duration::from_secs(10)).await?;
+        Ok::<_, Error>(msg.unwrap_or_default())
+    });
+    engine.launch().await?;
+
+    let mut handles = Vec::new();
+    for n in 0..2 {
+        handles.push(
+            engine
+                .start::<_, String>(
+                    "waiter",
+                    (),
+                    durare::WorkflowOptions::with_id(format!("sb-{n}")),
+                )
+                .await?,
+        );
+    }
+
+    // A batch with a missing destination delivers nothing (single statement).
+    let err = engine
+        .send_bulk(&[
+            SendMessage::new("sb-0", "x".to_string(), "t"),
+            SendMessage::new("sb-missing", "x".to_string(), "t"),
+        ])
+        .await
+        .expect_err("missing destination rejects the batch");
+    assert!(matches!(err, Error::NonExistentWorkflow(_)), "{err}");
+    assert!(engine.list_workflow_notifications("sb-0").await?.is_empty());
+
+    // A keyed batch delivered twice lands once per destination.
+    let batch = [
+        SendMessage::new("sb-0", "zero".to_string(), "t").idempotency_key("bk"),
+        SendMessage::new("sb-1", "one".to_string(), "t").idempotency_key("bk2"),
+    ];
+    engine.send_bulk(&batch).await?;
+    engine.send_bulk(&batch).await?;
+
+    let mut got = Vec::new();
+    for h in handles {
+        got.push(h.result().await?);
+    }
+    assert_eq!(got, vec!["zero", "one"]);
+    assert_eq!(engine.list_workflow_notifications("sb-0").await?.len(), 1);
+
+    engine.shutdown(std::time::Duration::from_secs(2)).await?;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}

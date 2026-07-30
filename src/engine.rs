@@ -421,6 +421,80 @@ impl WorkflowOptions {
     }
 }
 
+/// One message in a bulk send ([`DurableEngine::send_bulk`],
+/// [`DurableContext::send_bulk`](crate::DurableContext::send_bulk),
+/// [`Client::send_bulk`](crate::Client::send_bulk)): its own destination,
+/// topic, and optional at-most-once idempotency key. Mixed payload types in
+/// one batch: use `T = serde_json::Value`.
+#[derive(Clone, Debug)]
+pub struct SendMessage<T> {
+    /// Destination workflow id.
+    pub destination_id: String,
+    /// Topic the destination's `recv` listens on.
+    pub topic: String,
+    /// The message payload.
+    pub message: T,
+    /// Optional at-most-once key, scoped per destination like
+    /// [`send_with_idempotency_key`](DurableEngine::send_with_idempotency_key);
+    /// the same key must not repeat within one bulk call.
+    pub idempotency_key: Option<String>,
+}
+
+impl<T> SendMessage<T> {
+    /// A message for `destination_id` on `topic`, without an idempotency key.
+    pub fn new(destination_id: impl Into<String>, message: T, topic: impl Into<String>) -> Self {
+        Self {
+            destination_id: destination_id.into(),
+            topic: topic.into(),
+            message,
+            idempotency_key: None,
+        }
+    }
+
+    /// Attach an at-most-once idempotency key.
+    pub fn idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
+    }
+}
+
+/// Validate a bulk-send batch and serialize it to provider rows: duplicate
+/// provided idempotency keys are rejected up front (each names a distinct
+/// at-most-once delivery — a repeat within one call is a caller bug, matching
+/// the reference behavior), payloads are serialized once.
+pub(crate) fn prepare_bulk<T: Serialize>(
+    messages: &[SendMessage<T>],
+) -> Result<Vec<crate::provider::NotificationInsert>> {
+    let mut keys: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.idempotency_key.as_deref())
+        .collect();
+    keys.sort_unstable();
+    let mut duplicates: Vec<&str> = keys
+        .windows(2)
+        .filter(|w| w[0] == w[1])
+        .map(|w| w[0])
+        .collect();
+    duplicates.dedup();
+    if !duplicates.is_empty() {
+        return Err(Error::app(format!(
+            "send_bulk received duplicate idempotency keys: {}",
+            duplicates.join(", ")
+        )));
+    }
+    messages
+        .iter()
+        .map(|m| {
+            Ok(crate::provider::NotificationInsert {
+                destination_id: m.destination_id.clone(),
+                topic: m.topic.clone(),
+                message: serde_json::to_value(&m.message)?,
+                idempotency_key: m.idempotency_key.clone(),
+            })
+        })
+        .collect()
+}
+
 /// A point-in-time readiness report from [`DurableEngine::health`].
 ///
 /// Each axis is `None` when healthy and carries the failure reason otherwise,
@@ -1738,6 +1812,25 @@ impl DurableEngine {
                 serde_json::to_value(message)?,
                 Some(idempotency_key),
             )
+            .await
+    }
+
+    /// Send many messages in one call — the fan-out counterpart of
+    /// [`send`](Self::send), delivered **atomically** on the SQL backends
+    /// (one multi-row insert: all messages land, or none do). Each message
+    /// carries its own destination, topic, and optional at-most-once
+    /// idempotency key ([`SendMessage`]); a repeated non-`None` key within
+    /// one call is rejected. From workflow code use
+    /// [`DurableContext::send_bulk`], which records the whole batch as one
+    /// durable step.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonExistentWorkflow`] if any destination does not exist (no
+    /// message is delivered in that case on the SQL backends).
+    pub async fn send_bulk<T: Serialize>(&self, messages: &[SendMessage<T>]) -> Result<()> {
+        self.provider
+            .insert_notifications(&prepare_bulk(messages)?)
             .await
     }
 

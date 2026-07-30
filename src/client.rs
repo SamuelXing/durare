@@ -225,6 +225,17 @@ impl Client {
             .await
     }
 
+    /// Send many messages in one call — the fan-out counterpart of
+    /// [`send`](Self::send), delivered atomically on the SQL backends. See
+    /// [`SendMessage`](crate::SendMessage) for per-message fields and
+    /// [`DurableEngine::send_bulk`](crate::DurableEngine::send_bulk) for the
+    /// in-process form.
+    pub async fn send_bulk<T: Serialize>(&self, messages: &[crate::SendMessage<T>]) -> Result<()> {
+        self.provider
+            .insert_notifications(&crate::engine::prepare_bulk(messages)?)
+            .await
+    }
+
     /// Read event `key` of a workflow, waiting up to `timeout` for it to be set.
     /// Returns `None` on timeout.
     pub async fn get_event<T: DeserializeOwned>(
