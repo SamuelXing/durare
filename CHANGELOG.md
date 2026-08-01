@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-01
+
+The schema catches up to the reference SDKs (migrations 38-40) and the
+history-lifecycle story lands end to end: garbage collection with the
+cross-SDK semantics, an opt-in client-side retention policy (a durare
+extension - no reference SDK trims history for self-hosted deployments),
+searchable workflow attributes, and atomic bulk send. Rounding it out:
+the security-posture pass (injection sweep, secret-handling guarantees,
+`cargo deny` in CI) and the admin server's explicit bind address.
+`durare-macros` is unchanged and stays at `0.1.0`.
+
+Compatibility (the 0.x minor lane allows breaking changes): custom
+`StateProvider` implementations must add `set_workflow_attributes`
+(`garbage_collect` and `insert_notifications` ship functional defaults),
+and several public structs gained fields (`WorkflowStatus`,
+`WorkflowOptions`, `ListFilter`, `EngineConfig`, `EngineMetrics`) -
+breaking only for exhaustive struct literals; `..Default::default()`
+construction is unaffected. The schema migrations (38-40) apply
+automatically on first connect and are shared with the other DBOS SDKs.
+
 ### Added
 
 - Retention policy: `EngineConfig::retention(RetentionPolicy)` makes history
@@ -385,7 +405,8 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/SamuelXing/durare/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/SamuelXing/durare/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/SamuelXing/durare/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/SamuelXing/durare/compare/v0.3.0...v0.3.1
