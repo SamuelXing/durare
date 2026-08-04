@@ -80,6 +80,48 @@
 //! The conductor opens no listener at all — it dials out over TLS and serves
 //! management commands across that connection, so no inbound rule is needed.
 //!
+//! # Authorization
+//!
+//! durare carries a run's identity end to end — the
+//! [`AuthContext`](crate::AuthContext) set at start flows into the workflow,
+//! its children, trace spans, and the persisted row. Enforcement is opt-in
+//! per workflow:
+//! [`require_roles`](crate::DurableEngine::require_roles) declares the roles
+//! a caller must hold, and the engine checks the declaration **before the
+//! body runs, on every execution path** — direct starts, queued and
+//! scheduled runs, children, and recovery. The first required role the
+//! caller holds becomes the run's assumed role
+//! ([`assumed_role`](crate::DurableContext::assumed_role)); a caller holding
+//! none is refused with [`Error::NotAuthorized`](crate::Error::NotAuthorized)
+//! and the run is finalized `ERROR` — terminal by construction, because the
+//! persisted identity can never satisfy the check on a retry.
+//!
+//! ```
+//! # use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+//! # use std::sync::Arc;
+//! # async fn run() -> Result<()> {
+//! # let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+//! engine.register("delete-tenant", |_ctx: DurableContext, tenant: String| async move {
+//!     Ok::<_, Error>(tenant)
+//! });
+//! engine.require_roles("delete-tenant", ["admin"]);
+//! # engine.launch().await?;
+//! // Runs only when the caller's identity holds "admin":
+//! let opts = WorkflowOptions::with_id("del-42")
+//!     .authenticated_user("alice")
+//!     .authenticated_roles(["admin"]);
+//! # let _ = engine.start::<String, String>("delete-tenant", "42".into(), opts).await?.await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Two boundaries to keep straight: the check trusts the `AuthContext` you
+//! attach — durare is a library, so *authenticating* the caller (validating
+//! a token, resolving their roles) happens in your API layer before the
+//! start; and enqueueing is not gated (a `Client` has no registry to consult)
+//! — the executor refuses at dequeue, which also protects against callers
+//! that bypass your API and enqueue rows directly.
+//!
 //! # Supply chain
 //!
 //! CI enforces two independent checks on every push and on a daily schedule:

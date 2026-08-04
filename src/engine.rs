@@ -683,6 +683,9 @@ pub struct DurableEngine {
     /// Automatic history retention enforced by a [`launch`](Self::launch)-spawned
     /// sweeper, if configured. See [`EngineConfig::retention`].
     retention: Option<RetentionPolicy>,
+    /// Required-roles declarations keyed by workflow name; see
+    /// [`require_roles`](Self::require_roles).
+    required_roles: HashMap<String, Vec<String>>,
     /// Cancelled by [`shutdown`](Self::shutdown) to stop the background loops.
     /// [`launch`](Self::launch) installs a fresh token after a shutdown, since a
     /// cancelled token can't be reset.
@@ -720,6 +723,7 @@ pub struct DurableEngineBuilder {
     queues: Vec<WorkflowQueue>,
     listen_filter: Option<std::collections::HashSet<String>>,
     max_recovery_attempts: i32,
+    required_roles: HashMap<String, Vec<String>>,
 }
 
 impl DurableEngineBuilder {
@@ -757,6 +761,19 @@ impl DurableEngineBuilder {
     /// Register a durable queue. See [`DurableEngine::register_queue`].
     pub fn register_queue(&mut self, queue: WorkflowQueue) -> &mut Self {
         self.queues.push(queue);
+        self
+    }
+
+    /// Declare the roles required to invoke workflow `name` — see
+    /// [`DurableEngine::require_roles`]. Validated against the registrations
+    /// at [`build`](Self::build).
+    pub fn require_roles<I, S>(&mut self, name: impl Into<String>, roles: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_roles
+            .insert(name.into(), roles.into_iter().map(Into::into).collect());
         self
     }
 
@@ -836,6 +853,16 @@ impl DurableEngineBuilder {
             }
         }
 
+        // A required-roles declaration must name a registered workflow.
+        for name in self.required_roles.keys() {
+            let configured_prefix = format!("{name}/");
+            if !workflows.contains_key(name)
+                && !workflows.keys().any(|k| k.starts_with(&configured_prefix))
+            {
+                return Err(Error::UnknownWorkflow(name.clone()));
+            }
+        }
+
         // Reserve the internal queue first, then add user queues strictly: a
         // duplicate queue name — or a collision with the reserved internal
         // queue that resume/fork/debouncer route through — is rejected, not
@@ -860,6 +887,7 @@ impl DurableEngineBuilder {
             max_recovery_attempts: self.max_recovery_attempts,
             recover_on_launch: self.config.resolve_recover_on_launch(),
             retention: self.config.retention,
+            required_roles: self.required_roles,
             shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             deactivated: Arc::new(AtomicBool::new(false)),
             tasks: TaskTracker::new(),
@@ -935,6 +963,7 @@ impl DurableEngine {
             max_recovery_attempts: 100,
             recover_on_launch: config.resolve_recover_on_launch(),
             retention: config.retention,
+            required_roles: HashMap::new(),
             shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
             deactivated: Arc::new(AtomicBool::new(false)),
             tasks: TaskTracker::new(),
@@ -972,6 +1001,7 @@ impl DurableEngine {
             queues: Vec::new(),
             listen_filter: None,
             max_recovery_attempts: 100,
+            required_roles: HashMap::new(),
         }
     }
 
@@ -1032,6 +1062,7 @@ impl DurableEngine {
                     provider: self.provider.clone(),
                     workflows: self.workflows.clone(),
                     queues: self.queues.clone(),
+                    required_roles: self.required_roles.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
                     tasks: self.tasks.clone(),
@@ -1102,6 +1133,27 @@ impl DurableEngine {
     /// enqueueing to an unregistered queue is an error.
     pub fn register_queue(&mut self, queue: WorkflowQueue) {
         self.queues.insert(queue.name.clone(), Arc::new(queue));
+    }
+
+    /// Declare the roles required to invoke workflow `name`: before the body
+    /// runs — on **every** execution path (direct, queued, scheduled, child,
+    /// recovery) — the run's [`AuthContext`](crate::AuthContext) must hold at
+    /// least one of `roles`, and the first match becomes the run's assumed
+    /// role. A run that fails the check is finalized `ERROR` with a typed
+    /// [`Error::NotAuthorized`] — terminal by construction, since the
+    /// persisted auth context can never satisfy the check on a retry.
+    ///
+    /// Must be called before [`launch`](Self::launch), which validates that
+    /// `name` is a registered workflow. A workflow with no declaration is
+    /// unrestricted (the default).
+    pub fn require_roles<I, S>(&mut self, name: impl Into<String>, roles: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_roles
+            .insert(name.into(), roles.into_iter().map(Into::into).collect());
+        self
     }
 
     /// Restrict which registered queues this process dispatches at
@@ -1377,6 +1429,19 @@ impl DurableEngine {
                 return Err(Error::app(
                     "a retention policy needs a period or a max_rows bound",
                 ));
+            }
+        }
+        // A required-roles declaration for an unregistered workflow is a typo
+        // that would silently enforce nothing — reject it up front.
+        for name in self.required_roles.keys() {
+            let configured_prefix = format!("{name}/");
+            if !self.workflows.contains_key(name)
+                && !self
+                    .workflows
+                    .keys()
+                    .any(|k| k.starts_with(&configured_prefix))
+            {
+                return Err(Error::UnknownWorkflow(name.clone()));
             }
         }
         // A prior `shutdown` cancelled the token and closed the tracker. Install a
@@ -2475,6 +2540,7 @@ pub(crate) async fn dispatch_pending_workflows(
             let _ = run_to_completion(
                 rt.clone(),
                 handler,
+                record.name.clone(),
                 record.id.clone(),
                 record.input.clone(),
                 record.deadline_ms,
@@ -2507,6 +2573,9 @@ pub(crate) struct Runtime {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
     queues: HashMap<String, Arc<WorkflowQueue>>,
+    /// Required-roles declarations keyed by workflow name; enforced before a
+    /// body runs, on every execution path. See [`DurableEngine::require_roles`].
+    required_roles: HashMap<String, Vec<String>>,
     executor_id: String,
     app_version: String,
     tasks: TaskTracker,
@@ -2654,8 +2723,9 @@ impl Runtime {
         // parents under the workflow (or handler) span that started it.
         let span = self.workflow_span(&id, name, None, &auth);
         let rt = self.clone();
+        let name = name.to_string();
         self.tasks.spawn(async move {
-            run_to_completion(rt, handler, id, input, deadline_ms, auth, span).await
+            run_to_completion(rt, handler, name, id, input, deadline_ms, auth, span).await
         })
     }
 
@@ -2895,6 +2965,7 @@ async fn queue_dispatch_loop(
                             let _ = run_to_completion(
                                 run_rt,
                                 handler,
+                                wf.name,
                                 wf.id,
                                 wf.input,
                                 wf.deadline_ms,
@@ -2937,9 +3008,32 @@ async fn queue_dispatch_loop(
 /// Free function (not a method) so it can run inside a spawned task without
 /// borrowing the engine. Carries the [`Runtime`] so the workflow can start child
 /// workflows through its [`DurableContext`].
+/// Check a run's identity against a workflow's required roles: the first
+/// required role the caller holds becomes the run's assumed role; no
+/// authentication information, or no matching role, is a typed denial. The
+/// reference semantics (Python/TS `required_roles`), Rust-shaped.
+fn check_required_roles(name: &str, required: &[String], auth: &AuthContext) -> Result<String> {
+    if auth.authenticated_roles.is_empty() {
+        return Err(Error::NotAuthorized(format!(
+            "workflow `{name}` requires a role, but was invoked without authentication information"
+        )));
+    }
+    required
+        .iter()
+        .find(|r| auth.authenticated_roles.contains(r))
+        .cloned()
+        .ok_or_else(|| {
+            Error::NotAuthorized(format!(
+                "workflow `{name}` has required roles, but the caller is not authenticated for any of them"
+            ))
+        })
+}
+
+#[allow(clippy::too_many_arguments)] // one arg per run coordinate; grouping would obscure
 async fn run_to_completion(
     rt: Arc<Runtime>,
     handler: WorkflowFn,
+    name: String,
     id: String,
     input: Value,
     deadline_ms: Option<i64>,
@@ -2951,6 +3045,23 @@ async fn run_to_completion(
     let recorder = span.clone();
     async move {
     let provider = rt.provider().clone();
+    // Required-roles enforcement, before the body runs — the single gate every
+    // execution path (direct, queued, scheduled, child, recovery) flows
+    // through. On a match the role is assumed for the run; a denial is routed
+    // through the ordinary returned-error path below, finalizing the row
+    // ERROR: the persisted auth context can never satisfy the check on a
+    // retry, so leaving the row PENDING would redequeue it forever.
+    let mut auth = auth;
+    let denial = match rt.required_roles.get(&name) {
+        Some(required) => match check_required_roles(&name, required, &auth) {
+            Ok(role) => {
+                auth.assumed_role = Some(role);
+                None
+            }
+            Err(e) => Some(e),
+        },
+        None => None,
+    };
     let ctx = DurableContext::new(id.clone(), rt, auth);
     // Catch a panic in the workflow body so it can't unwind past the status
     // write below — which would strand the row PENDING with observers waiting
@@ -2962,7 +3073,11 @@ async fn run_to_completion(
     // future is dropped (cancelled at its next await) and the workflow is
     // marked CANCELLED. `caught` is `Ok(returned)` if the body finished (returned
     // Ok or Err) or `Err(panic)` if it panicked.
-    let caught = match deadline_ms {
+    let caught = if let Some(e) = denial {
+        drop(run); // the body never starts on a denial
+        Ok(Err(e))
+    } else {
+        match deadline_ms {
         Some(dl) => {
             let remaining = (dl - chrono::Utc::now().timestamp_millis()).max(0) as u64;
             match tokio::time::timeout(Duration::from_millis(remaining), run).await {
@@ -2977,7 +3092,8 @@ async fn run_to_completion(
                 }
             }
         }
-        None => run.await,
+            None => run.await,
+        }
     };
 
     // A panic in the workflow body is treated as a *recoverable* failure, like a

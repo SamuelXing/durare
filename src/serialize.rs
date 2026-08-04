@@ -301,6 +301,14 @@ pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
     if matches!(serializer, Serializer::Portable) {
         let env = match err {
             Error::Portable(pe) => (**pe).clone(),
+            // The cross-SDK class name for a role denial, so foreign readers
+            // classify it the way Python raises it.
+            Error::NotAuthorized(msg) => PortableWorkflowError {
+                name: "DBOSNotAuthorizedError".to_string(),
+                message: msg.clone(),
+                code: None,
+                data: None,
+            },
             other => PortableWorkflowError {
                 name: PORTABLE_ERROR_NAME.to_string(),
                 message: other.to_string(),

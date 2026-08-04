@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Declarative role-based authorization: `require_roles(name, roles)` on the
+  engine and builder declares the roles a caller must hold to invoke a
+  workflow. The check runs before the body on every execution path (direct,
+  queued, scheduled, child, recovery) against the run's `AuthContext`; the
+  first matching required role becomes the run's assumed role, and a denial
+  is a typed `Error::NotAuthorized` (`ErrorCode::NotAuthorized`) that
+  finalizes the run `ERROR` — terminal by construction, so an unauthorized
+  queued run cannot loop through the dispatcher. Portable-mode rows record
+  the denial under the cross-SDK `DBOSNotAuthorizedError` envelope name. A
+  declaration naming an unregistered workflow is rejected at launch/build.
+  Documented in the `security` guide's new Authorization section.
 ### Documentation
 
 - HTTP triggering recipe: a runnable axum example
