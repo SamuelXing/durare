@@ -19,6 +19,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the denial under the cross-SDK `DBOSNotAuthorizedError` envelope name. A
   declaration naming an unregistered workflow is rejected at launch/build.
   Documented in the `security` guide's new Authorization section.
+### Documentation
+
+- HTTP triggering recipe: a runnable axum example
+  (`examples/http_trigger.rs`) showing the two-line integration — extract
+  the `dbos-idempotency-key` header, make it the workflow id — so retried
+  requests attach to the same run instead of repeating effects. The same
+  shape works in any framework; no adapter crate needed.
+- Event-source receiver recipe: the `messaging` guide now documents the
+  exactly-once consumption pattern (message coordinates as the workflow
+  id; ack only after the start persisted), which turns any at-least-once
+  source — Kafka, SQS, `LISTEN` — into exactly-once workflow execution
+  without a broker integration crate.
 
 ## [0.4.0] - 2026-08-01
 

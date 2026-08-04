@@ -121,7 +121,7 @@
 //! [`messaging`], [`transactions`], [`observability`] (spans, probes, and
 //! metrics), [`operations`] (connections, pool sizing, and the resource
 //! model), and [`security`] (trust boundaries, exposure, and the SQL and
-//! secret-handling invariants). Eleven runnable, end-to-end examples live in
+//! secret-handling invariants). Twelve runnable, end-to-end examples live in
 //! [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
 //!
 //! # Cargo features
