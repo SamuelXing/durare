@@ -89,6 +89,38 @@
 //! offset-ordered, and tailable from outside with
 //! [`DurableEngine::read_stream_values`].
 //!
+//! # Event-source receivers (Kafka, SQS, and friends)
+//!
+//! Consuming an external event source and starting a workflow **exactly once
+//! per message** needs no adapter crate — the workflow id *is* the dedup
+//! mechanism. Make the id from the message's coordinates and start; a
+//! redelivered message attaches to the existing run instead of starting a
+//! second one:
+//!
+//! ```ignore
+//! // In your consumer loop (any at-least-once source works the same way):
+//! loop {
+//!     let msg = consumer.recv().await?;              // Kafka, SQS, LISTEN, ...
+//!     let id = format!("kafka-{}-{}-{}", msg.topic(), msg.partition(), msg.offset());
+//!     engine
+//!         .start::<Payload, ()>(
+//!             "handle_message",
+//!             decode(&msg)?,
+//!             WorkflowOptions::with_id(id),          // coordinates as identity
+//!         )
+//!         .await?;                                    // duplicate ⇒ same run
+//!     consumer.commit(&msg).await?;                   // ack only after the start persisted
+//! }
+//! ```
+//!
+//! The ordering is the whole trick: the workflow row is durable *before* the
+//! source's ack, so a crash between the two redelivers the message — and the
+//! redelivery lands on the already-persisted run. At-least-once delivery plus
+//! an idempotent start composes to exactly-once workflow execution; the
+//! handler itself then gets crash-safety from ordinary steps. Use a durable
+//! queue ([`WorkflowOptions::queue`](crate::WorkflowOptions)) if consumption
+//! should outpace execution.
+//!
 //! [`send`]: DurableContext::send
 //! [`recv`]: DurableContext::recv
 //! [`set_event`]: DurableContext::set_event
