@@ -23,6 +23,9 @@ pub enum ErrorCode {
     /// An enqueue was rejected because its deduplication key is already in use
     /// on the queue.
     QueueDeduplicated,
+    /// The caller's authentication context does not satisfy the workflow's
+    /// required roles.
+    NotAuthorized,
     /// The workflow was cancelled; execution was refused.
     WorkflowCancelled,
     /// The workflow exceeded its configured recovery-attempt cap and was parked
@@ -76,6 +79,13 @@ pub enum Error {
     /// The referenced workflow id does not exist (e.g. sending to it).
     #[error("workflow `{0}` does not exist")]
     NonExistentWorkflow(String),
+
+    /// The caller's authentication context does not satisfy a workflow's
+    /// required roles (see
+    /// [`DurableEngine::require_roles`](crate::DurableEngine::require_roles)).
+    /// Terminal when raised at execution: the run is finalized `ERROR`.
+    #[error("not authorized: {0}")]
+    NotAuthorized(String),
 
     /// An enqueue collided with an existing workflow holding the same
     /// deduplication key on the queue.
@@ -243,6 +253,7 @@ impl Error {
             Error::UnknownQueue(_) => ErrorCode::QueueNotRegistered,
             Error::NonExistentWorkflow(_) => ErrorCode::NonExistentWorkflow,
             Error::QueueDeduplicated { .. } => ErrorCode::QueueDeduplicated,
+            Error::NotAuthorized(_) => ErrorCode::NotAuthorized,
             Error::Cancelled(_) => ErrorCode::WorkflowCancelled,
             Error::MaxRecoveryAttemptsExceeded(_) => ErrorCode::MaxRecoveryAttemptsExceeded,
             Error::ConflictingRegistration(_) => ErrorCode::ConflictingRegistration,
