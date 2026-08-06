@@ -199,6 +199,17 @@ impl DurableContext {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Set the in-transaction flag, refusing a nested transaction (it would
+    /// deadlock on the outer's write lock). The guard clears the flag on drop.
+    fn begin_transaction(&self) -> Result<TxFlagGuard<'_>> {
+        if self.in_transaction.swap(true, Ordering::SeqCst) {
+            return Err(Error::app(
+                "cannot start a transaction inside another transaction",
+            ));
+        }
+        Ok(TxFlagGuard(&self.in_transaction))
+    }
+
     /// The span covering one durable operation (a step or a transaction),
     /// carrying the DBOS trace attributes (see the
     /// [`observability`](crate::observability) guide). Created inside the
@@ -587,24 +598,7 @@ impl DurableContext {
             + Sync
             + 'static,
     {
-        // Reject a transaction nested inside another: the inner would open a
-        // separate connection and block forever on the write lock the outer
-        // already holds (a deadlock). A context clone captured in an outer body
-        // shares this flag, so a nested `ctx.transaction` is caught here rather
-        // than hanging. Checked before consuming a step slot.
-        if self.in_transaction.swap(true, Ordering::SeqCst) {
-            return Err(Error::app(
-                "cannot start a transaction inside another transaction",
-            ));
-        }
-        // Clear the flag on every exit path (including the `?` below).
-        struct ResetOnDrop<'a>(&'a AtomicBool);
-        impl Drop for ResetOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _reset = ResetOnDrop(&self.in_transaction);
+        let _guard = self.begin_transaction()?;
 
         let seq = self.next_seq();
         let span = self.op_span("transaction", &opts.name, seq);
@@ -712,20 +706,7 @@ impl DurableContext {
             + Sync
             + 'static,
     {
-        // Same nesting guard as `transaction_with`: a body that opens another
-        // transaction (on either database) is refused up front.
-        if self.in_transaction.swap(true, Ordering::SeqCst) {
-            return Err(Error::app(
-                "cannot start a transaction inside another transaction",
-            ));
-        }
-        struct ResetOnDrop<'a>(&'a AtomicBool);
-        impl Drop for ResetOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _reset = ResetOnDrop(&self.in_transaction);
+        let _guard = self.begin_transaction()?;
 
         let seq = self.next_seq();
         let span = self.op_span("transaction", &opts.name, seq);
@@ -1821,6 +1802,16 @@ const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 /// A shared identifier, so a patch decision a worker in any language recorded is
 /// read back consistently.
 const PATCH_PREFIX: &str = "DBOS.patch-";
+
+/// Clears the in-transaction flag on drop (see
+/// [`DurableContext::begin_transaction`]).
+struct TxFlagGuard<'a>(&'a AtomicBool);
+
+impl Drop for TxFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Outcome of one application-database attempt in the two-commit protocol
 /// behind [`DurableContext::transaction_on`].
