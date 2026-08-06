@@ -66,7 +66,8 @@
 //! commits. On replay, the recorded outcome is read back and returned without
 //! running the body at all. One consequence of the single-transaction model:
 //! the tables you touch must live in the **same database** as the `dbos`
-//! system schema.
+//! system schema. For tables in a database of their own, see [a separate
+//! application database](#a-separate-application-database) below.
 //!
 //! Transactions require a SQL backend — [`PostgresProvider`] or
 //! [`SqliteProvider`]. On [`InMemoryProvider`] they return an error.
@@ -95,6 +96,54 @@
 //! optional [`retry_if`](TransactionOptions::retry_if) predicate) re-runs the
 //! body on a new transaction with exponential backoff, and only the final
 //! outcome is checkpointed.
+//!
+//! # A separate application database
+//!
+//! When your tables live in their own database — not the one holding the
+//! `dbos` schema — a single commit can no longer cover both the writes and
+//! the checkpoint. [`DurableContext::transaction_on`] keeps the exactly-once
+//! guarantee anyway, with a **two-commit protocol**: construct a
+//! [`PgDataSource`] or [`SqliteDataSource`](crate::SqliteDataSource) over
+//! your own `sqlx` pool, and the body's writes commit atomically **with a
+//! witness row** in a `transaction_completion` table that durare creates in
+//! your database; the ordinary checkpoint follows as a second commit to the
+//! system database. Recovery replays in layers — checkpoint first, then the
+//! witness row (covering a crash between the two commits) — so the body still
+//! runs exactly once.
+//!
+//! Unlike [`Tx`], the body receives the backend's **native `sqlx`
+//! connection** (`&mut sqlx::PgConnection` / `&mut sqlx::SqliteConnection`),
+//! so existing queries, compile-time-checked `sqlx` macros, and data-access
+//! helpers written against `sqlx` work unchanged:
+//!
+//! ```no_run
+//! # use durare::{DurableContext, PgDataSource, Result};
+//! # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
+//! let n: i64 = ctx
+//!     .transaction_on(&ds, "record-order", |conn| Box::pin(async move {
+//!         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
+//!             .bind("widget")
+//!             .execute(&mut *conn)
+//!             .await?;
+//!         Ok(1)
+//!     }))
+//!     .await?;
+//! # let _ = n;
+//! # Ok(()) }
+//! ```
+//!
+//! The trade for the native connection: the body is committed to one backend
+//! at the call site, where a [`Tx`] body runs on either. Failure semantics,
+//! isolation, and the retry policy match [`transaction`] — with the failure
+//! also mirrored into the witness table, so your database is self-describing.
+//! durare owns the transaction: the connection has no commit method, and on
+//! Postgres a raw `COMMIT`/`ROLLBACK` smuggled through SQL is detected and
+//! fails the step. If the "separate" database is actually the system
+//! database, prefer [`transaction`] — one commit instead of two.
+//!
+//! [`transaction`]: crate::DurableContext::transaction
+//! [`DurableContext::transaction_on`]: crate::DurableContext::transaction_on
+//! [`PgDataSource`]: crate::PgDataSource
 //!
 //! # Writing the SQL
 //!

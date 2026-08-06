@@ -109,7 +109,7 @@ const DEFAULT_SCHEMA: &str = "dbos";
 
 /// A schema name safe to interpolate into `CREATE SCHEMA` and `search_path`
 /// without quoting games: `[A-Za-z_][A-Za-z0-9_]*`.
-fn is_plain_identifier(s: &str) -> bool {
+pub(crate) fn is_plain_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')

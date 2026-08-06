@@ -199,6 +199,17 @@ impl DurableContext {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Set the in-transaction flag, refusing a nested transaction (it would
+    /// deadlock on the outer's write lock). The guard clears the flag on drop.
+    fn begin_transaction(&self) -> Result<TxFlagGuard<'_>> {
+        if self.in_transaction.swap(true, Ordering::SeqCst) {
+            return Err(Error::app(
+                "cannot start a transaction inside another transaction",
+            ));
+        }
+        Ok(TxFlagGuard(&self.in_transaction))
+    }
+
     /// The span covering one durable operation (a step or a transaction),
     /// carrying the DBOS trace attributes (see the
     /// [`observability`](crate::observability) guide). Created inside the
@@ -587,24 +598,7 @@ impl DurableContext {
             + Sync
             + 'static,
     {
-        // Reject a transaction nested inside another: the inner would open a
-        // separate connection and block forever on the write lock the outer
-        // already holds (a deadlock). A context clone captured in an outer body
-        // shares this flag, so a nested `ctx.transaction` is caught here rather
-        // than hanging. Checked before consuming a step slot.
-        if self.in_transaction.swap(true, Ordering::SeqCst) {
-            return Err(Error::app(
-                "cannot start a transaction inside another transaction",
-            ));
-        }
-        // Clear the flag on every exit path (including the `?` below).
-        struct ResetOnDrop<'a>(&'a AtomicBool);
-        impl Drop for ResetOnDrop<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _reset = ResetOnDrop(&self.in_transaction);
+        let _guard = self.begin_transaction()?;
 
         let seq = self.next_seq();
         let span = self.op_span("transaction", &opts.name, seq);
@@ -629,6 +623,341 @@ impl DurableContext {
         .await;
         span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
         out
+    }
+
+    /// Run a durable transaction on a **separate application database**.
+    ///
+    /// [`transaction`](Self::transaction) commits the body's SQL and the step
+    /// checkpoint together — but only in the *system* database. This runs the
+    /// body against your own database through a
+    /// [`PgDataSource`](crate::PgDataSource) or
+    /// [`SqliteDataSource`](crate::SqliteDataSource), keeping the same
+    /// exactly-once guarantee with a two-commit protocol: the body's writes
+    /// and a `transaction_completion` witness row commit atomically on the
+    /// application database, then the ordinary checkpoint is written to the
+    /// system database. Recovery replays in layers — checkpoint first, then
+    /// the completion row (a crash between the two commits) — and re-runs the
+    /// body only when neither exists.
+    ///
+    /// The body receives the backend's **native `sqlx` connection**
+    /// (`&mut sqlx::PgConnection` / `&mut sqlx::SqliteConnection`), so
+    /// existing queries, `sqlx` macros, and data-access helpers work
+    /// unchanged. durare owns the transaction: there is no commit method on a
+    /// plain connection, and on Postgres a raw `COMMIT`/`ROLLBACK` statement
+    /// smuggled through SQL is detected and fails the step. Like
+    /// [`transaction`](Self::transaction), the body must be re-runnable
+    /// (`Fn`): a serialization conflict or deadlock restarts it on a fresh
+    /// transaction.
+    ///
+    /// If your application database *is* the system database, prefer
+    /// [`transaction`](Self::transaction) — one commit instead of two.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, PgDataSource, Result};
+    /// # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
+    /// let total: i64 = ctx
+    ///     .transaction_on(&ds, "record-order", |conn| Box::pin(async move {
+    ///         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
+    ///             .bind("widget")
+    ///             .execute(&mut *conn)
+    ///             .await?;
+    ///         let n = sqlx::query_scalar("SELECT count(*) FROM orders")
+    ///             .fetch_one(&mut *conn)
+    ///             .await?;
+    ///         Ok(n)
+    ///     }))
+    ///     .await?;
+    /// # let _ = total;
+    /// # Ok(()) }
+    /// ```
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn transaction_on<DS, T, F>(&self, ds: &DS, name: &str, f: F) -> Result<T>
+    where
+        DS: crate::datasource::DataSource,
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.transaction_on_with(ds, TransactionOptions::new(name), f)
+            .await
+    }
+
+    /// Like [`transaction_on`](Self::transaction_on) but with explicit
+    /// [`TransactionOptions`] — isolation level (advisory on SQLite),
+    /// read-only, and the application-error retry policy. Conflicts and
+    /// transient database errors are retried on a fresh transaction
+    /// regardless, without consuming the `max_retries` budget; once that
+    /// budget is exhausted the failure is recorded in **both** databases, so a
+    /// replay returns the same error without re-running the body.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    pub async fn transaction_on_with<DS, T, F>(
+        &self,
+        ds: &DS,
+        opts: TransactionOptions,
+        f: F,
+    ) -> Result<T>
+    where
+        DS: crate::datasource::DataSource,
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let _guard = self.begin_transaction()?;
+
+        let seq = self.next_seq();
+        let span = self.op_span("transaction", &opts.name, seq);
+        let out = self
+            .run_datasource_transaction(ds, &opts, &f, seq)
+            .instrument(span.clone())
+            .await;
+        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+        out
+    }
+
+    /// The two-commit protocol behind [`transaction_on`](Self::transaction_on):
+    /// layered replay, then fresh execution under the same two-loop retry
+    /// structure as the single-database transactional step.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn run_datasource_transaction<DS, T, F>(
+        &self,
+        ds: &DS,
+        opts: &TransactionOptions,
+        f: &F,
+        seq: i32,
+    ) -> Result<T>
+    where
+        DS: crate::datasource::DataSource,
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        // Layer 1: the system-database checkpoint — a completed run.
+        if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
+            return Ok(stored);
+        }
+        let started = chrono::Utc::now().timestamp_millis();
+
+        // Layer 2: a completion row without a checkpoint — the application
+        // transaction committed but the run crashed before the system commit.
+        // Replay the stored outcome without re-running the body.
+        if let Some(row) = ds.fetch_completion(&self.workflow_id, seq).await? {
+            return self
+                .replay_completion_row(seq, &opts.name, row, started)
+                .await;
+        }
+
+        let ser = self.provider.serializer();
+
+        // OUTER loop: the user-facing retry policy for application errors,
+        // mirroring the single-database transactional step. Conflicts are
+        // handled by the inner loop and don't count against this budget.
+        let mut user_attempt: u32 = 0;
+        let body_err = loop {
+            // INNER loop: one committed attempt, or an application error
+            // surfaced to the outer loop. A serialization/deadlock conflict or
+            // transient DB error rolls back and retries on a fresh transaction
+            // — unbounded (until it clears or the workflow is cancelled).
+            let mut conflict_attempt: u32 = 0;
+            let outcome = loop {
+                match self.datasource_attempt(ds, opts, f, seq, &ser).await {
+                    Ok(DsAttempt::Committed(value)) => break Ok(value),
+                    // Another execution committed this step first: its row is
+                    // the canonical outcome — replay it.
+                    Ok(DsAttempt::AlreadyCompleted) => {
+                        let row = ds
+                            .fetch_completion(&self.workflow_id, seq)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::app(
+                                    "transaction_completion row vanished after a duplicate insert",
+                                )
+                            })?;
+                        return self
+                            .replay_completion_row(seq, &opts.name, row, started)
+                            .await;
+                    }
+                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                        self.datasource_conflict_wait(conflict_attempt).await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            match outcome {
+                Ok(value) => {
+                    // Second commit: checkpoint into the system database. The
+                    // application transaction is already durable, so a racing
+                    // writer's canonical outcome wins if there is one.
+                    let stored = self
+                        .provider
+                        .record_step_result(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            value,
+                            None,
+                            Some(started),
+                        )
+                        .await?;
+                    return outcome_value(stored);
+                }
+                Err(e) if opts.should_user_retry(&e, user_attempt) => {
+                    let delay = opts.user_retry_backoff(user_attempt);
+                    tracing::warn!(
+                        step = %opts.name,
+                        attempt = user_attempt + 1,
+                        error = %e,
+                        "transaction failed; retrying after backoff"
+                    );
+                    tokio::time::sleep(delay).await;
+                    user_attempt += 1;
+                }
+                Err(e) => break e,
+            }
+        };
+
+        // Mirror the permanent failure into the application database (the
+        // body's transaction rolled back, so this is a standalone insert),
+        // written before the system-database record to keep the
+        // layer-1-then-layer-2 recovery order. Best-effort: the system
+        // database remains the source of truth.
+        let encoded = crate::serialize::encode_error(&ser, &body_err);
+        if let Err(mirror_err) = ds
+            .insert_failure(&self.workflow_id, seq, &encoded, ser.name())
+            .await
+        {
+            tracing::warn!(
+                step = %opts.name,
+                error = %mirror_err,
+                "failed to mirror the transaction failure into the application database"
+            );
+        }
+        self.record_failure(seq, &opts.name, body_err, Some(started))
+            .await
+    }
+
+    /// One fresh application-database attempt: begin, run the body, write the
+    /// completion row, commit — all atomic. Begins a fresh transaction on
+    /// every call so a closed/aborted one never leaks into a retry.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn datasource_attempt<DS, T, F>(
+        &self,
+        ds: &DS,
+        opts: &TransactionOptions,
+        f: &F,
+        seq: i32,
+        ser: &crate::serialize::Serializer,
+    ) -> Result<DsAttempt>
+    where
+        DS: crate::datasource::DataSource,
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
+        let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
+        match f(&mut *tx).await {
+            Ok(v) => {
+                let value = serde_json::to_value(v)?;
+                // A body that ended our transaction via raw SQL would make the
+                // completion row commit separately from the writes it
+                // witnesses — detect and refuse instead of breaking atomicity.
+                if let Some(expected) = &fingerprint {
+                    if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
+                        let _ = ds.rollback(tx).await;
+                        return Err(Error::app(
+                            "the transaction body terminated the surrounding database \
+                             transaction (a raw COMMIT or ROLLBACK?), so its writes cannot \
+                             be committed atomically with the durability record",
+                        ));
+                    }
+                }
+                let encoded = ser.encode(&value)?;
+                if !ds
+                    .insert_completion(
+                        &mut *tx,
+                        &self.workflow_id,
+                        seq,
+                        Some(&encoded),
+                        None,
+                        ser.name(),
+                    )
+                    .await?
+                {
+                    let _ = ds.rollback(tx).await;
+                    return Ok(DsAttempt::AlreadyCompleted);
+                }
+                ds.commit(tx).await?;
+                Ok(DsAttempt::Committed(value))
+            }
+            Err(e) => {
+                let _ = ds.rollback(tx).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Replay a layer-2 completion row: backfill the system-database
+    /// checkpoint from it, then surface the stored outcome — the recorded
+    /// output, or the recorded failure as its reconstructed error.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn replay_completion_row<T: DeserializeOwned>(
+        &self,
+        seq: i32,
+        name: &str,
+        row: crate::datasource::CompletionRow,
+        started: i64,
+    ) -> Result<T> {
+        tracing::Span::current().record("dbos.step.replayed", true);
+        if let Some(err_text) = row.error.as_deref() {
+            let stored = self
+                .provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    name,
+                    Value::Null,
+                    Some(err_text),
+                    Some(started),
+                )
+                .await?;
+            return outcome_value(stored);
+        }
+        let output = row
+            .output
+            .as_deref()
+            .ok_or_else(|| Error::app("transaction completion row has neither output nor error"))?;
+        let ser = self.provider.serializer();
+        let value = crate::serialize::decode(&ser, row.serialization.as_deref(), output)?;
+        let stored = self
+            .provider
+            .record_step_result(&self.workflow_id, seq, name, value, None, Some(started))
+            .await?;
+        outcome_value(stored)
+    }
+
+    /// Back off after an application-database conflict, bailing out if the
+    /// workflow has been cancelled — so a transaction stuck on contention or a
+    /// transient outage keeps retrying until it clears or the workflow is
+    /// actually cancelled.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn datasource_conflict_wait(&self, attempt: u32) -> Result<()> {
+        if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
+            if status.status == STATUS_CANCELLED {
+                return Err(Error::Cancelled(self.workflow_id.clone()));
+            }
+        }
+        let ms = (1u64 << attempt.min(10)).min(1000);
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        Ok(())
     }
 
     /// Race several async `branches` and return the `(index, value)` of the first
@@ -1473,6 +1802,27 @@ const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 /// A shared identifier, so a patch decision a worker in any language recorded is
 /// read back consistently.
 const PATCH_PREFIX: &str = "DBOS.patch-";
+
+/// Clears the in-transaction flag on drop (see
+/// [`DurableContext::begin_transaction`]).
+struct TxFlagGuard<'a>(&'a AtomicBool);
+
+impl Drop for TxFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Outcome of one application-database attempt in the two-commit protocol
+/// behind [`DurableContext::transaction_on`].
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+enum DsAttempt {
+    /// The body ran and its transaction committed; carries the JSON output.
+    Committed(Value),
+    /// A completion row already existed — another execution committed this
+    /// step first, and its row is the canonical outcome.
+    AlreadyCompleted,
+}
 
 /// Turn a recorded step outcome into the typed value a step returns: a recorded
 /// output is deserialized; a recorded failure is surfaced as its reconstructed
