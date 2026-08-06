@@ -19,6 +19,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the denial under the cross-SDK `DBOSNotAuthorizedError` envelope name. A
   declaration naming an unregistered workflow is rejected at launch/build.
   Documented in the `security` guide's new Authorization section.
+- Durable transactions on a separate application database:
+  `ctx.transaction_on(&ds, name, |conn| …)` (and `transaction_on_with` for
+  isolation/read-only/retry options) runs a body against your own database
+  through a `PgDataSource` or `SqliteDataSource` over your `sqlx` pool. The
+  body's writes commit atomically with a `transaction_completion` witness
+  row in your database (table shape matches the Go SDK's; created on
+  construction, schema configurable on Postgres), then the step checkpoint
+  commits to the system database; recovery replays checkpoint-first, then
+  the witness row, so the body runs exactly once even across a crash
+  between the two commits. The body receives the backend's native `sqlx`
+  connection (`&mut PgConnection` / `&mut SqliteConnection`), so existing
+  queries, `sqlx` macros, and DAOs work unchanged; on Postgres a raw
+  `COMMIT`/`ROLLBACK` inside the body is detected and refused. Permanent
+  failures are mirrored into the witness table; conflicts retry on fresh
+  transactions without consuming the application retry budget. The
+  `DataSource` trait is sealed. Documented in the `transactions` guide.
 ### Documentation
 
 - HTTP triggering recipe: a runnable axum example

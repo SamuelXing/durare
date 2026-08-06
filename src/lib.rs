@@ -177,6 +177,8 @@ mod client;
 #[cfg(feature = "conductor")]
 mod conductor;
 mod context;
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+mod datasource;
 mod debounce;
 mod engine;
 mod error;
@@ -200,6 +202,14 @@ pub use client::Client;
 #[cfg_attr(docsrs, doc(cfg(feature = "conductor")))]
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
 pub use context::{AuthContext, DurableContext, RetryPredicate, StepOptions};
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub use datasource::DataSource;
+#[cfg(feature = "postgres")]
+#[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
+pub use datasource::PgDataSource;
+#[cfg(feature = "sqlite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
+pub use datasource::SqliteDataSource;
 pub use debounce::{Debouncer, DebouncerClient};
 /// Macro plumbing referenced by `#[durare::workflow]`; not public API.
 #[doc(hidden)]
