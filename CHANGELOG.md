@@ -8,6 +8,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Single-commit fast path for application tables in the system database:
+  `PostgresProvider::system_datasource()` / `SqliteProvider::system_datasource()`
+  return a data source over the provider's own pool, so `transaction_on`
+  commits the body's writes and the step checkpoint in one transaction — the
+  same guarantee as `ctx.transaction`, with no witness table — while the body
+  keeps the native `sqlx` connection and its full type support (`jsonb`,
+  arrays, `uuid`, …) that the portable `Param` set can't express. Sameness is
+  established by construction (the provider hands out its own pool), never by
+  detection: a user-constructed `PgDataSource` always uses the two-commit
+  protocol, which stays correct on any database. A system data source is
+  bound to the provider instance that minted it via the new `ProviderIdentity`
+  token (`StateProvider::provider_identity`, a defaulted method — custom
+  providers are unaffected); used under a different engine it is rejected
+  with an error instead of misrouting its checkpoint. The fast path's
+  checkpoint insert is schema-qualified, so nothing a body does to
+  `search_path` can redirect it, and a duplicate execution that loses the
+  checkpoint race is rolled back — its writes discarded — and replays the
+  canonical outcome, keeping the step exactly-once even under double
+  execution.
+
 - Declarative role-based authorization: `require_roles(name, roles)` on the
   engine and builder declares the roles a caller must hold to invoke a
   workflow. The check runs before the body on every execution path (direct,

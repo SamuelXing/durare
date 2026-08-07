@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Map a `workflow_status` insert failure to a typed deduplication error when it
@@ -1207,6 +1208,46 @@ pub struct DequeueRequest {
 /// The pluggable durable-state backend.
 ///
 /// This is the single seam that decouples the runtime from storage. v0.1 ships a
+/// An opaque identity for one provider *instance*: two handles match only if
+/// they were cloned from the same original. Compared by pointer, so a match is
+/// unforgeable — there is no way to construct an identity equal to another's.
+///
+/// Used to bind a system data source (`system_datasource`) to the provider
+/// that minted it, so
+/// [`transaction_on`](crate::DurableContext::transaction_on) takes its
+/// single-commit fast path only against that provider's own database and
+/// rejects a system data source from a different engine.
+#[derive(Clone)]
+pub struct ProviderIdentity(Arc<IdentityMarker>);
+
+/// INVARIANT: this must stay behind an `Arc`. Identity is the address of the
+/// per-instance `ArcInner` allocation — `Arc::new` allocates one even for a
+/// zero-sized value, so every identity is distinct and clones compare equal.
+/// A `Box`/`Rc`-of-static "simplification" would give every zero-sized
+/// instance the same dangling address and make ALL identities match.
+struct IdentityMarker;
+
+// No `Default`: `default()` conventionally yields one canonical value, but a
+// fresh identity is unique by design — two `default()` calls would not match.
+#[allow(clippy::new_without_default)]
+impl ProviderIdentity {
+    /// A fresh identity, equal only to its own clones.
+    pub fn new() -> Self {
+        Self(Arc::new(IdentityMarker))
+    }
+
+    /// Whether `other` was cloned from the same original as `self`.
+    pub fn matches(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for ProviderIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ProviderIdentity({:p})", Arc::as_ptr(&self.0))
+    }
+}
+
 /// Postgres implementation and an in-memory one; a DynamoDB / Aurora DSQL
 /// implementation can be added later **without touching the engine**.
 ///
@@ -1237,6 +1278,15 @@ pub trait StateProvider: Send + Sync {
     /// their configured serializer.
     fn serializer(&self) -> crate::serialize::Serializer {
         crate::serialize::Serializer::Json
+    }
+
+    /// This provider instance's [`ProviderIdentity`], if it issues one. Used to
+    /// verify that a system data source was minted by *this* provider before
+    /// the single-commit fast path is taken. The default (`None`) is fail-safe:
+    /// a provider without an identity never matches, so the fast path is never
+    /// wrongly taken against it.
+    fn provider_identity(&self) -> Option<&ProviderIdentity> {
+        None
     }
 
     /// Whether this backend pushes change signals (Postgres `LISTEN`/`NOTIFY`),

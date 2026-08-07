@@ -132,6 +132,8 @@ pub struct PostgresProvider {
     notify_hub: Arc<NotifyHub>,
     /// Cancels the background listener task when the provider is dropped.
     listener_token: CancellationToken,
+    /// This instance's identity; binds system data sources to it.
+    identity: crate::provider::ProviderIdentity,
     /// Ensures the listener task is spawned at most once (on the first `init`).
     listener_started: AtomicBool,
 }
@@ -193,6 +195,7 @@ impl PostgresProvider {
             notify_hub: Arc::new(NotifyHub::default()),
             listener_token: CancellationToken::new(),
             listener_started: AtomicBool::new(false),
+            identity: crate::provider::ProviderIdentity::new(),
         }
     }
 
@@ -200,6 +203,38 @@ impl PostgresProvider {
     /// share the provider's connections and search path).
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// A [`PgDataSource`](crate::PgDataSource) over this provider's own pool,
+    /// for application tables that live **in the system database**.
+    ///
+    /// Because the pool is known to be the system database's,
+    /// [`transaction_on`](crate::DurableContext::transaction_on) takes a
+    /// **single-commit fast path**: the body's writes and the step checkpoint
+    /// commit in one transaction — the same guarantee as
+    /// [`transaction`](crate::DurableContext::transaction), but the body gets
+    /// the native `&mut sqlx::PgConnection` (full Postgres type support:
+    /// `jsonb`, arrays, `uuid`, …) instead of the `Param`-limited [`Tx`]
+    /// wrapper. No completion table is used or created.
+    ///
+    /// A **durare extension**.
+    ///
+    /// # Trust note
+    ///
+    /// The connection handed to a transaction body is unrestricted by design:
+    /// it can address the system tables, because the application owns the
+    /// database and the credential — not the SDK — is the real protection
+    /// boundary (the same is true of [`Tx`], whose SQL text is equally
+    /// unfiltered). What *is* guarded is the silent accident: a stray
+    /// `COMMIT`/`ROLLBACK` in the body is detected and fails the step. Also
+    /// note these connections start with `search_path` set to the system
+    /// schema, so **unqualified** DDL in a body (`CREATE TABLE orders …`)
+    /// lands in that schema next to the system tables — qualify your table
+    /// names if you care where they live.
+    ///
+    /// [`Tx`]: crate::Tx
+    pub fn system_datasource(&self) -> crate::PgDataSource {
+        crate::PgDataSource::system(self.pool.clone(), self.identity.clone(), &self.schema)
     }
 
     /// Choose the format new values are encoded with. Use [`Serializer::Portable`]
@@ -387,6 +422,10 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
 
 #[async_trait]
 impl StateProvider for PostgresProvider {
+    fn provider_identity(&self) -> Option<&crate::provider::ProviderIdentity> {
+        Some(&self.identity)
+    }
+
     async fn ping(&self) -> Result<()> {
         // One round trip proves reachability and that the dbos system schema
         // is migrated: `_sqlx_migrations` (in this pool's search_path schema)

@@ -409,3 +409,367 @@ async fn pg_datasource_end_to_end() -> Result<()> {
     common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
 }
+
+/// The system-datasource fast path: writes and checkpoint in one commit on the
+/// system database's own pool, no witness table, native connection, replay
+/// from the ordinary checkpoint.
+#[tokio::test]
+async fn system_datasource_single_commit_without_witness_table() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-sysds-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let provider = SqliteProvider::connect(&url).await?;
+    let ds = provider.system_datasource();
+    let pool = ds.pool().clone();
+    let runs = Arc::new(AtomicU32::new(0));
+
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    sqlx::query("CREATE TABLE sys_orders (item TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (wf_ds, wf_runs) = (ds.clone(), runs.clone());
+    engine.register("sys-order", move |ctx: DurableContext, (): ()| {
+        let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
+        async move {
+            ctx.transaction_on(&ds, "sys-tx", move |conn| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('gear')")
+                        .execute(&mut *conn)
+                        .await?;
+                    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sys_orders")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    Ok(n)
+                })
+            })
+            .await
+        }
+    });
+    engine.launch().await?;
+
+    let n: i64 = engine
+        .start::<(), i64>("sys-order", (), WorkflowOptions::with_id("sysds-1"))
+        .await?
+        .await?;
+    assert_eq!(n, 1);
+
+    // No witness table was ever created — the fast path doesn't need one.
+    let witness_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'transaction_completion'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(witness_tables, 0, "fast path creates no witness table");
+
+    // The checkpoint committed with the writes, as an ordinary step row.
+    let checkpoints: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM operation_outputs
+         WHERE workflow_uuid = 'sysds-1' AND function_name = 'sys-tx' AND output IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checkpoints, 1);
+
+    // Replay: same workflow id returns the recorded result, body untouched.
+    let again: i64 = engine
+        .start::<(), i64>("sys-order", (), WorkflowOptions::with_id("sysds-1"))
+        .await?
+        .await?;
+    assert_eq!(again, 1);
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "body ran exactly once");
+    Ok(())
+}
+
+/// Fast-path failure: the body's writes roll back with nothing half-committed,
+/// the error is recorded as an ordinary step failure, and a replay returns the
+/// same error without re-running the body.
+#[tokio::test]
+async fn system_datasource_failure_rolls_back_and_replays() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-sysds-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let provider = SqliteProvider::connect(&url).await?;
+    let ds = provider.system_datasource();
+    let pool = ds.pool().clone();
+    let runs = Arc::new(AtomicU32::new(0));
+
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    sqlx::query("CREATE TABLE sys_orders (item TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (wf_ds, wf_runs) = (ds.clone(), runs.clone());
+    engine.register("sys-doomed", move |ctx: DurableContext, (): ()| {
+        let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
+        async move {
+            ctx.transaction_on(&ds, "sys-doomed-tx", move |conn| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('rolled-back')")
+                        .execute(&mut *conn)
+                        .await?;
+                    Err::<i64, _>(Error::app("sys-boom"))
+                })
+            })
+            .await
+        }
+    });
+    engine.launch().await?;
+
+    let err = engine
+        .start::<(), i64>("sys-doomed", (), WorkflowOptions::with_id("sysds-fail"))
+        .await?
+        .await
+        .expect_err("body error propagates");
+    assert!(err.to_string().contains("sys-boom"), "{err}");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sys_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "the insert rolled back");
+
+    let before = runs.load(Ordering::SeqCst);
+    let err = engine
+        .start::<(), i64>("sys-doomed", (), WorkflowOptions::with_id("sysds-fail"))
+        .await?
+        .await
+        .expect_err("recorded failure replays");
+    assert!(err.to_string().contains("sys-boom"), "{err}");
+    assert_eq!(runs.load(Ordering::SeqCst), before, "body never re-ran");
+    Ok(())
+}
+
+/// Postgres fast path, end to end: the motivating case — rich Postgres types
+/// (jsonb, bigint arrays) bound natively in a single-commit durable
+/// transaction — plus no witness table anywhere in the database.
+#[tokio::test]
+async fn pg_system_datasource_rich_types_single_commit() -> Result<()> {
+    use durare::PostgresProvider;
+
+    let Some(base) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("skipping pg_system_datasource_rich_types_single_commit: DATABASE_URL unset");
+        return Ok(());
+    };
+    let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_sysds").await;
+    let provider = PostgresProvider::connect(&url).await?;
+    let ds = provider.system_datasource();
+    let pool = ds.pool().clone();
+
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    sqlx::query("CREATE TABLE sys_orders (meta JSONB NOT NULL, tags BIGINT[] NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let wf_ds = ds.clone();
+    engine.register("sys-rich", move |ctx: DurableContext, (): ()| {
+        let ds = wf_ds.clone();
+        async move {
+            ctx.transaction_on(&ds, "sys-rich-tx", |conn| {
+                Box::pin(async move {
+                    // Types Param cannot express, bound natively.
+                    sqlx::query("INSERT INTO sys_orders(meta, tags) VALUES ($1, $2)")
+                        .bind(serde_json::json!({"reason": "fee", "amount": 42}))
+                        .bind(vec![7i64, 11, 13])
+                        .execute(&mut *conn)
+                        .await?;
+                    let amount: i64 =
+                        sqlx::query_scalar("SELECT (meta->>'amount')::bigint FROM sys_orders")
+                            .fetch_one(&mut *conn)
+                            .await?;
+                    // A body that redirects search_path must not redirect the
+                    // checkpoint: the fast-path insert (which runs after the
+                    // body, inside this same transaction) is schema-qualified.
+                    // LOCAL so the redirect dies with the transaction instead
+                    // of poisoning the pooled connection for later users.
+                    sqlx::query("SET LOCAL search_path TO public")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(amount)
+                })
+            })
+            .await
+        }
+    });
+    engine.launch().await?;
+
+    let amount: i64 = engine
+        .start::<(), i64>("sys-rich", (), WorkflowOptions::with_id("pg-sysds-1"))
+        .await?
+        .await?;
+    assert_eq!(
+        amount, 42,
+        "jsonb round-tripped through the native connection"
+    );
+
+    let tags: Vec<i64> = sqlx::query_scalar("SELECT tags FROM sys_orders")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tags, vec![7, 11, 13], "array round-tripped");
+
+    // No witness table anywhere: the fast path never creates one.
+    let witness_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'transaction_completion'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(witness_tables, 0, "fast path creates no witness table");
+
+    // The checkpoint is an ordinary step row, committed with the writes.
+    let checkpoints: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM operation_outputs
+         WHERE workflow_uuid = 'pg-sysds-1' AND function_name = 'sys-rich-tx' AND output IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checkpoints, 1);
+
+    engine.shutdown(std::time::Duration::from_secs(5)).await?;
+    pool.close().await;
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
+    Ok(())
+}
+
+/// A system data source is bound to the provider that minted it: used under a
+/// different engine, the fast path is refused instead of misrouting the
+/// checkpoint into the wrong system database.
+#[tokio::test]
+async fn foreign_system_datasource_is_rejected() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path_a = std::env::temp_dir();
+    path_a.push(format!("durare-sysds-a-{}.db", uuid::Uuid::new_v4()));
+    let provider_a = SqliteProvider::connect(&format!("sqlite://{}", path_a.display())).await?;
+    let foreign_ds = provider_a.system_datasource();
+    // Engine A exists so provider A's database is real and migrated.
+    let _engine_a = DurableEngine::new(Arc::new(provider_a)).await?;
+
+    let mut path_b = std::env::temp_dir();
+    path_b.push(format!("durare-sysds-b-{}.db", uuid::Uuid::new_v4()));
+    let provider_b = SqliteProvider::connect(&format!("sqlite://{}", path_b.display())).await?;
+    let runs = Arc::new(AtomicU32::new(0));
+
+    let mut engine_b = DurableEngine::new(Arc::new(provider_b)).await?;
+    let (wf_ds, wf_runs) = (foreign_ds.clone(), runs.clone());
+    engine_b.register("misrouted", move |ctx: DurableContext, (): ()| {
+        let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
+        async move {
+            ctx.transaction_on(&ds, "misrouted-tx", move |conn| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .await
+        }
+    });
+    engine_b.launch().await?;
+
+    let err = engine_b
+        .start::<(), ()>("misrouted", (), WorkflowOptions::with_id("sysds-foreign"))
+        .await?
+        .await
+        .expect_err("foreign system datasource must be refused");
+    assert!(
+        err.to_string().contains("minted by a different provider"),
+        "{err}"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "the body never ran");
+    Ok(())
+}
+
+/// A duplicate execution that loses the checkpoint race has its writes rolled
+/// back and the canonical outcome replayed — the fast path is exactly-once
+/// even under double execution. The rival checkpoint is planted from inside
+/// the body over a separate connection, landing in the exact window between
+/// the body's writes and this attempt's checkpoint insert.
+#[tokio::test]
+async fn duplicate_fast_path_execution_rolls_back_and_replays() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-sysds-dup-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let provider = SqliteProvider::connect(&url).await?;
+    let ds = provider.system_datasource();
+    let pool = ds.pool().clone();
+    let runs = Arc::new(AtomicU32::new(0));
+
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    sqlx::query("CREATE TABLE sys_orders (item TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (wf_ds, wf_runs, rival_pool) = (ds.clone(), runs.clone(), pool.clone());
+    engine.register("sys-dup", move |ctx: DurableContext, (): ()| {
+        let (ds, runs, rival_pool) = (wf_ds.clone(), wf_runs.clone(), rival_pool.clone());
+        let wf_id = ctx.workflow_id().to_string();
+        async move {
+            ctx.transaction_on(&ds, "dup-tx", move |conn| {
+                let (runs, rival_pool, wf_id) = (runs.clone(), rival_pool.clone(), wf_id.clone());
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    // The "other executor" commits this step's checkpoint on a
+                    // separate connection, right in the race window.
+                    let ser = Serializer::Json;
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
+                             (workflow_uuid, function_id, function_name, output, serialization,
+                              started_at_epoch_ms, completed_at_epoch_ms)
+                         VALUES (?, 0, 'dup-tx', ?, ?, 0, 0)",
+                    )
+                    .bind(&wf_id)
+                    .bind(ser.encode(&serde_json::json!(99))?)
+                    .bind(ser.name())
+                    .execute(&rival_pool)
+                    .await?;
+                    // This attempt's own write — must be rolled back.
+                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('duplicate')")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(1i64)
+                })
+            })
+            .await
+        }
+    });
+    engine.launch().await?;
+
+    let n: i64 = engine
+        .start::<(), i64>("sys-dup", (), WorkflowOptions::with_id("sysds-dup"))
+        .await?
+        .await?;
+    assert_eq!(n, 99, "the rival's canonical outcome replayed, not ours");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "body ran once");
+    assert_eq!(
+        order_count_in(&pool, "sys_orders").await,
+        0,
+        "the losing attempt's writes rolled back"
+    );
+    Ok(())
+}
+
+async fn order_count_in(pool: &sqlx::SqlitePool, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
