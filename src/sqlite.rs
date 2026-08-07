@@ -77,7 +77,7 @@ impl SqliteProvider {
     /// [`transaction_on`](crate::DurableContext::transaction_on) then takes
     /// the single-commit fast path — writes and checkpoint in one transaction,
     /// with the body on the native `&mut sqlx::SqliteConnection`; no
-    /// completion table is used or created. See
+    /// completion table is used or created. A durare extension; see
     /// `PostgresProvider::system_datasource` for the full story, including
     /// the trust note (the connection is unrestricted by design — the
     /// application owns the database).

@@ -214,6 +214,8 @@ impl PostgresProvider {
     /// `jsonb`, arrays, `uuid`, …) instead of the `Param`-limited [`Tx`]
     /// wrapper. No completion table is used or created.
     ///
+    /// A **durare extension**.
+    ///
     /// # Trust note
     ///
     /// The connection handed to a transaction body is unrestricted by design:

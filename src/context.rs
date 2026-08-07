@@ -541,6 +541,13 @@ impl DurableContext {
     /// step. Requires a SQL backend (Postgres or SQLite); on the in-memory
     /// backend it returns an error.
     ///
+    /// This is the default transactional step: the body stays portable across
+    /// backends. When a step's types outgrow [`Param`](crate::Param) (`jsonb`,
+    /// arrays, `uuid`, …) or it should reuse sqlx-typed helpers, switch that
+    /// step to [`transaction_on`](Self::transaction_on) — see the
+    /// [`transactions`](crate::transactions) guide's "Which transaction API?"
+    /// table.
+    ///
     /// The body receives a [`Tx`] and returns a boxed future — `Box::pin(async
     /// move { … })`, mirroring sqlx's own transaction closures. SQL is written
     /// with `?` placeholders (rewritten to `$1, $2, …` for Postgres) and bound
