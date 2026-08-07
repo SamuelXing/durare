@@ -132,6 +132,8 @@ pub struct PostgresProvider {
     notify_hub: Arc<NotifyHub>,
     /// Cancels the background listener task when the provider is dropped.
     listener_token: CancellationToken,
+    /// This instance's identity; binds system data sources to it.
+    identity: crate::provider::ProviderIdentity,
     /// Ensures the listener task is spawned at most once (on the first `init`).
     listener_started: AtomicBool,
 }
@@ -193,6 +195,7 @@ impl PostgresProvider {
             notify_hub: Arc::new(NotifyHub::default()),
             listener_token: CancellationToken::new(),
             listener_started: AtomicBool::new(false),
+            identity: crate::provider::ProviderIdentity::new(),
         }
     }
 
@@ -231,7 +234,7 @@ impl PostgresProvider {
     ///
     /// [`Tx`]: crate::Tx
     pub fn system_datasource(&self) -> crate::PgDataSource {
-        crate::PgDataSource::system(self.pool.clone())
+        crate::PgDataSource::system(self.pool.clone(), self.identity.clone())
     }
 
     /// Choose the format new values are encoded with. Use [`Serializer::Portable`]
@@ -419,6 +422,10 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
 
 #[async_trait]
 impl StateProvider for PostgresProvider {
+    fn provider_identity(&self) -> Option<&crate::provider::ProviderIdentity> {
+        Some(&self.identity)
+    }
+
     async fn ping(&self) -> Result<()> {
         // One round trip proves reachability and that the dbos system schema
         // is migrated: `_sqlx_migrations` (in this pool's search_path schema)

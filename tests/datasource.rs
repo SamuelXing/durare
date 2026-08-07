@@ -636,3 +636,53 @@ async fn pg_system_datasource_rich_types_single_commit() -> Result<()> {
     common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
 }
+
+/// A system data source is bound to the provider that minted it: used under a
+/// different engine, the fast path is refused instead of misrouting the
+/// checkpoint into the wrong system database.
+#[tokio::test]
+async fn foreign_system_datasource_is_rejected() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path_a = std::env::temp_dir();
+    path_a.push(format!("durare-sysds-a-{}.db", uuid::Uuid::new_v4()));
+    let provider_a = SqliteProvider::connect(&format!("sqlite://{}", path_a.display())).await?;
+    let foreign_ds = provider_a.system_datasource();
+    // Engine A exists so provider A's database is real and migrated.
+    let _engine_a = DurableEngine::new(Arc::new(provider_a)).await?;
+
+    let mut path_b = std::env::temp_dir();
+    path_b.push(format!("durare-sysds-b-{}.db", uuid::Uuid::new_v4()));
+    let provider_b = SqliteProvider::connect(&format!("sqlite://{}", path_b.display())).await?;
+    let runs = Arc::new(AtomicU32::new(0));
+
+    let mut engine_b = DurableEngine::new(Arc::new(provider_b)).await?;
+    let (wf_ds, wf_runs) = (foreign_ds.clone(), runs.clone());
+    engine_b.register("misrouted", move |ctx: DurableContext, (): ()| {
+        let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
+        async move {
+            ctx.transaction_on(&ds, "misrouted-tx", move |conn| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .await
+        }
+    });
+    engine_b.launch().await?;
+
+    let err = engine_b
+        .start::<(), ()>("misrouted", (), WorkflowOptions::with_id("sysds-foreign"))
+        .await?
+        .await
+        .expect_err("foreign system datasource must be refused");
+    assert!(
+        err.to_string().contains("minted by a different provider"),
+        "{err}"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "the body never ran");
+    Ok(())
+}

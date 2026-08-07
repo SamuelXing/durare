@@ -760,11 +760,30 @@ impl DurableContext {
 
         // A system data source runs on the system database's own pool, so one
         // commit can cover the body's writes and the checkpoint — no witness
-        // row, no crash window, no layer 2.
-        if ds.is_system() {
-            return self
-                .run_system_datasource_transaction(ds, opts, f, seq, &ser, started)
-                .await;
+        // row, no crash window, no layer 2. But only under the engine whose
+        // provider minted it: the fast path writes the checkpoint through the
+        // data source's pool, which is only this workflow's system database if
+        // the identities match. A mismatch is a wiring bug — fail loudly
+        // rather than splitting the checkpoint from the status row.
+        match ds.kind() {
+            crate::datasource::DataSourceKind::System(identity)
+                if self
+                    .provider
+                    .provider_identity()
+                    .is_some_and(|own| identity.matches(own)) =>
+            {
+                return self
+                    .run_system_datasource_transaction(ds, opts, f, seq, &ser, started)
+                    .await;
+            }
+            crate::datasource::DataSourceKind::System(_) => {
+                return Err(Error::app(
+                    "this system data source was minted by a different provider than the \
+                     one this workflow runs on; use system_datasource() from this \
+                     engine's own provider (or an external data source)",
+                ));
+            }
+            crate::datasource::DataSourceKind::External => {}
         }
 
         // Layer 2: a completion row without a checkpoint — the application

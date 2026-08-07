@@ -29,6 +29,19 @@ pub struct CompletionRow {
     pub(crate) serialization: Option<String>,
 }
 
+/// What a data source points at, as far as durability is concerned.
+#[derive(Clone)]
+pub enum DataSourceKind {
+    /// A user-owned application database: the two-commit protocol with a
+    /// witness row applies.
+    External,
+    /// The system database itself, minted by the identified provider's
+    /// `system_datasource`. The single-commit fast path applies — but only
+    /// under an engine whose provider carries the *same* identity; any other
+    /// engine rejects the data source rather than misrouting its checkpoint.
+    System(crate::provider::ProviderIdentity),
+}
+
 pub(crate) mod sealed {
     use super::*;
 
@@ -91,11 +104,10 @@ pub(crate) mod sealed {
             serialization: &str,
         ) -> Result<()>;
 
-        /// Whether this data source runs on the system database's own pool
-        /// (built by a provider's `system_datasource`), enabling the
-        /// single-commit fast path: the checkpoint commits with the body's
-        /// writes, no completion row needed.
-        fn is_system(&self) -> bool;
+        /// What this data source points at — external application database,
+        /// or the system database of an identified provider (see
+        /// [`DataSourceKind`]).
+        fn kind(&self) -> &DataSourceKind;
 
         /// Insert the step checkpoint into `operation_outputs` on the caller's
         /// transaction — the fast-path equivalent of the completion row plus
@@ -162,10 +174,9 @@ const COMPLETION_COLUMNS: &str = "workflow_id, step_id, output, error, serializa
 pub struct PgDataSource {
     pool: sqlx::PgPool,
     table: String,
-    /// True when built by `PostgresProvider::system_datasource` — the pool is
-    /// the system database's own, so `transaction_on` takes the single-commit
-    /// fast path and the completion table is never used (or created).
-    system: bool,
+    /// What this data source points at; `System` enables the single-commit
+    /// fast path, bound to the minting provider's identity.
+    kind: DataSourceKind,
 }
 
 #[cfg(feature = "postgres")]
@@ -205,18 +216,18 @@ impl PgDataSource {
         Ok(Self {
             pool,
             table,
-            system: false,
+            kind: DataSourceKind::External,
         })
     }
 
     /// A data source over the system database's own pool (see
     /// `PostgresProvider::system_datasource`). Creates nothing: the fast path
     /// never touches a completion table.
-    pub(crate) fn system(pool: sqlx::PgPool) -> Self {
+    pub(crate) fn system(pool: sqlx::PgPool, identity: crate::provider::ProviderIdentity) -> Self {
         Self {
             pool,
             table: "transaction_completion".to_string(),
-            system: true,
+            kind: DataSourceKind::System(identity),
         }
     }
 
@@ -336,8 +347,8 @@ impl sealed::Backend for PgDataSource {
         Ok(())
     }
 
-    fn is_system(&self) -> bool {
-        self.system
+    fn kind(&self) -> &DataSourceKind {
+        &self.kind
     }
 
     async fn insert_checkpoint(
@@ -388,9 +399,8 @@ impl sealed::Backend for PgDataSource {
 #[derive(Clone)]
 pub struct SqliteDataSource {
     pool: sqlx::SqlitePool,
-    /// True when built by `SqliteProvider::system_datasource` — see
-    /// [`PgDataSource`]'s `system` field.
-    system: bool,
+    /// What this data source points at — see [`PgDataSource`]'s `kind` field.
+    kind: DataSourceKind,
 }
 
 #[cfg(feature = "sqlite")]
@@ -413,14 +423,20 @@ impl SqliteDataSource {
         .await?;
         Ok(Self {
             pool,
-            system: false,
+            kind: DataSourceKind::External,
         })
     }
 
     /// A data source over the system database's own pool (see
     /// `SqliteProvider::system_datasource`). Creates nothing.
-    pub(crate) fn system(pool: sqlx::SqlitePool) -> Self {
-        Self { pool, system: true }
+    pub(crate) fn system(
+        pool: sqlx::SqlitePool,
+        identity: crate::provider::ProviderIdentity,
+    ) -> Self {
+        Self {
+            pool,
+            kind: DataSourceKind::System(identity),
+        }
     }
 
     /// The pool this data source runs on.
@@ -525,8 +541,8 @@ impl sealed::Backend for SqliteDataSource {
         Ok(())
     }
 
-    fn is_system(&self) -> bool {
-        self.system
+    fn kind(&self) -> &DataSourceKind {
+        &self.kind
     }
 
     async fn insert_checkpoint(

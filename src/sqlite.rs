@@ -40,6 +40,8 @@ pub struct SqliteProvider {
     /// Format used when *encoding* stored values; decoding follows each row's
     /// recorded format. See [`crate::Serializer`].
     serializer: Serializer,
+    /// This instance's identity; binds system data sources to it.
+    identity: crate::provider::ProviderIdentity,
 }
 
 impl SqliteProvider {
@@ -69,6 +71,7 @@ impl SqliteProvider {
         Self {
             pool,
             serializer: Serializer::default(),
+            identity: crate::provider::ProviderIdentity::new(),
         }
     }
 
@@ -82,7 +85,7 @@ impl SqliteProvider {
     /// the trust note (the connection is unrestricted by design — the
     /// application owns the database).
     pub fn system_datasource(&self) -> crate::SqliteDataSource {
-        crate::SqliteDataSource::system(self.pool.clone())
+        crate::SqliteDataSource::system(self.pool.clone(), self.identity.clone())
     }
 
     /// Back off before the next attempt of the unbounded transaction-conflict
@@ -175,6 +178,10 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
 
 #[async_trait]
 impl StateProvider for SqliteProvider {
+    fn provider_identity(&self) -> Option<&crate::provider::ProviderIdentity> {
+        Some(&self.identity)
+    }
+
     async fn ping(&self) -> Result<()> {
         // One round trip proves reachability and that the dbos system schema
         // is migrated (see the Postgres provider for the rule; a newer schema
