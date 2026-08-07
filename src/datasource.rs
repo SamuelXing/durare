@@ -111,8 +111,10 @@ pub(crate) mod sealed {
 
         /// Insert the step checkpoint into `operation_outputs` on the caller's
         /// transaction — the fast-path equivalent of the completion row plus
-        /// the system commit, in one. Only valid on a system data source,
-        /// whose pool resolves the unqualified system tables.
+        /// the system commit, in one. Only valid on a system data source.
+        /// Returns `false` when a checkpoint already exists (another execution
+        /// committed this step first — the caller rolls back, discarding this
+        /// attempt's writes, and replays the canonical outcome).
         #[allow(clippy::too_many_arguments)]
         async fn insert_checkpoint(
             &self,
@@ -123,7 +125,7 @@ pub(crate) mod sealed {
             output: &str,
             serialization: &str,
             started_at_ms: i64,
-        ) -> Result<()>;
+        ) -> Result<bool>;
     }
 }
 
@@ -360,10 +362,10 @@ impl sealed::Backend for PgDataSource {
         output: &str,
         serialization: &str,
         started_at_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Unqualified: the system pool's per-connection search_path resolves
         // the system schema, same as the provider's own queries.
-        sqlx::query(
+        let res = sqlx::query(
             "INSERT INTO operation_outputs
                  (workflow_uuid, function_id, function_name, output, serialization,
                   started_at_epoch_ms, completed_at_epoch_ms)
@@ -379,7 +381,7 @@ impl sealed::Backend for PgDataSource {
         .bind(chrono::Utc::now().timestamp_millis())
         .execute(conn)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 }
 
@@ -554,8 +556,8 @@ impl sealed::Backend for SqliteDataSource {
         output: &str,
         serialization: &str,
         started_at_ms: i64,
-    ) -> Result<()> {
-        sqlx::query(
+    ) -> Result<bool> {
+        let res = sqlx::query(
             "INSERT INTO operation_outputs
                  (workflow_uuid, function_id, function_name, output, serialization,
                   started_at_epoch_ms, completed_at_epoch_ms)
@@ -571,6 +573,6 @@ impl sealed::Backend for SqliteDataSource {
         .bind(chrono::Utc::now().timestamp_millis())
         .execute(conn)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() == 1)
     }
 }

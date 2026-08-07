@@ -974,7 +974,17 @@ impl DurableContext {
                     .system_datasource_attempt(ds, opts, f, seq, ser, started)
                     .await
                 {
-                    Ok(value) => break Ok(value),
+                    Ok(DsAttempt::Committed(value)) => break Ok(value),
+                    // Another execution checkpointed this step first; its
+                    // recorded outcome is canonical — replay it.
+                    Ok(DsAttempt::AlreadyCompleted) => {
+                        return self
+                            .replay_or_guard::<T>(seq, &opts.name)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::app("checkpoint row vanished after a duplicate insert")
+                            });
+                    }
                     Err(e) if e.is_tx_conflict() || e.is_retryable() => {
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
@@ -1006,6 +1016,9 @@ impl DurableContext {
 
     /// One fast-path attempt: begin on the system pool, run the body, insert
     /// the `operation_outputs` checkpoint in the same transaction, commit.
+    /// `AlreadyCompleted` means another execution checkpointed this step
+    /// first: this attempt rolled back — its writes discarded — and the
+    /// caller replays the canonical outcome.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn system_datasource_attempt<DS, T, F>(
         &self,
@@ -1015,7 +1028,7 @@ impl DurableContext {
         seq: i32,
         ser: &crate::serialize::Serializer,
         started: i64,
-    ) -> Result<Value>
+    ) -> Result<DsAttempt>
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
@@ -1038,18 +1051,27 @@ impl DurableContext {
                     }
                 }
                 let encoded = ser.encode(&value)?;
-                ds.insert_checkpoint(
-                    &mut *tx,
-                    &self.workflow_id,
-                    seq,
-                    &opts.name,
-                    &encoded,
-                    ser.name(),
-                    started,
-                )
-                .await?;
+                if !ds
+                    .insert_checkpoint(
+                        &mut *tx,
+                        &self.workflow_id,
+                        seq,
+                        &opts.name,
+                        &encoded,
+                        ser.name(),
+                        started,
+                    )
+                    .await?
+                {
+                    // Another execution already checkpointed this step. Roll
+                    // back — discarding this attempt's writes keeps the step
+                    // exactly-once even under duplicate execution — and let
+                    // the caller replay the canonical outcome.
+                    let _ = ds.rollback(tx).await;
+                    return Ok(DsAttempt::AlreadyCompleted);
+                }
                 ds.commit(tx).await?;
-                Ok(value)
+                Ok(DsAttempt::Committed(value))
             }
             Err(e) => {
                 let _ = ds.rollback(tx).await;

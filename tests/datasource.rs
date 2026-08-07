@@ -686,3 +686,82 @@ async fn foreign_system_datasource_is_rejected() -> Result<()> {
     assert_eq!(runs.load(Ordering::SeqCst), 0, "the body never ran");
     Ok(())
 }
+
+/// A duplicate execution that loses the checkpoint race has its writes rolled
+/// back and the canonical outcome replayed — the fast path is exactly-once
+/// even under double execution. The rival checkpoint is planted from inside
+/// the body over a separate connection, landing in the exact window between
+/// the body's writes and this attempt's checkpoint insert.
+#[tokio::test]
+async fn duplicate_fast_path_execution_rolls_back_and_replays() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-sysds-dup-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let provider = SqliteProvider::connect(&url).await?;
+    let ds = provider.system_datasource();
+    let pool = ds.pool().clone();
+    let runs = Arc::new(AtomicU32::new(0));
+
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
+    sqlx::query("CREATE TABLE sys_orders (item TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let (wf_ds, wf_runs, rival_pool) = (ds.clone(), runs.clone(), pool.clone());
+    engine.register("sys-dup", move |ctx: DurableContext, (): ()| {
+        let (ds, runs, rival_pool) = (wf_ds.clone(), wf_runs.clone(), rival_pool.clone());
+        let wf_id = ctx.workflow_id().to_string();
+        async move {
+            ctx.transaction_on(&ds, "dup-tx", move |conn| {
+                let (runs, rival_pool, wf_id) = (runs.clone(), rival_pool.clone(), wf_id.clone());
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    // The "other executor" commits this step's checkpoint on a
+                    // separate connection, right in the race window.
+                    let ser = Serializer::Json;
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
+                             (workflow_uuid, function_id, function_name, output, serialization,
+                              started_at_epoch_ms, completed_at_epoch_ms)
+                         VALUES (?, 0, 'dup-tx', ?, ?, 0, 0)",
+                    )
+                    .bind(&wf_id)
+                    .bind(ser.encode(&serde_json::json!(99))?)
+                    .bind(ser.name())
+                    .execute(&rival_pool)
+                    .await?;
+                    // This attempt's own write — must be rolled back.
+                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('duplicate')")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(1i64)
+                })
+            })
+            .await
+        }
+    });
+    engine.launch().await?;
+
+    let n: i64 = engine
+        .start::<(), i64>("sys-dup", (), WorkflowOptions::with_id("sysds-dup"))
+        .await?
+        .await?;
+    assert_eq!(n, 99, "the rival's canonical outcome replayed, not ours");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "body ran once");
+    assert_eq!(
+        order_count_in(&pool, "sys_orders").await,
+        0,
+        "the losing attempt's writes rolled back"
+    );
+    Ok(())
+}
+
+async fn order_count_in(pool: &sqlx::SqlitePool, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
