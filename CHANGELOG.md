@@ -17,7 +17,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arrays, `uuid`, …) that the portable `Param` set can't express. Sameness is
   established by construction (the provider hands out its own pool), never by
   detection: a user-constructed `PgDataSource` always uses the two-commit
-  protocol, which stays correct on any database.
+  protocol, which stays correct on any database. A system data source is
+  bound to the provider instance that minted it via the new `ProviderIdentity`
+  token (`StateProvider::provider_identity`, a defaulted method — custom
+  providers are unaffected); used under a different engine it is rejected
+  with an error instead of misrouting its checkpoint. The fast path's
+  checkpoint insert is schema-qualified, so nothing a body does to
+  `search_path` can redirect it, and a duplicate execution that loses the
+  checkpoint race is rolled back — its writes discarded — and replays the
+  canonical outcome, keeping the step exactly-once even under double
+  execution.
 
 - Declarative role-based authorization: `require_roles(name, roles)` on the
   engine and builder declares the roles a caller must hold to invoke a
