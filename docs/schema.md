@@ -4,7 +4,7 @@ DBOS keeps all of its durable state in the database (Postgres, or SQLite for
 local use). If a process dies partway through a workflow, everything needed to
 resume it lives in these tables, so it's worth knowing how they fit together.
 
-There are ten tables, built up over the 37 migrations in
+There are ten tables, built up over the 40 migrations in
 [`migrations/`](../migrations). The layout matches the Go and Python SDKs
 column-for-column, which is what lets a workflow written by one SDK be read or
 recovered by another.
@@ -57,6 +57,7 @@ erDiagram
         TEXT    assumed_role
         TEXT    authenticated_roles
         TEXT    request
+        JSONB   attributes
         TEXT    owner_xid
         TEXT    serialization
         VARCHAR class_name
@@ -106,6 +107,7 @@ erDiagram
         TEXT    key PK
         INTEGER offset PK
         TEXT    value
+        INTEGER function_id
         TEXT    serialization
     }
 
@@ -174,6 +176,7 @@ and the management APIs need. Grouped by what they're for:
 | Queueing | `queue_name`, `queue_partition_key`, `priority`, `deduplication_id`, `rate_limited`, `delay_until_epoch_ms` |
 | Timing | `created_at`, `updated_at`, `started_at_epoch_ms`, `completed_at`, `workflow_timeout_ms`, `workflow_deadline_epoch_ms` |
 | Auth and context | `authenticated_user`, `assumed_role`, `authenticated_roles`, `request` |
+| User metadata | `attributes` — a JSON object of caller-defined key-value pairs (migration 40), searchable by containment; a partial GIN index serves those lookups on Postgres |
 
 A run moves through a small set of states:
 
@@ -210,8 +213,9 @@ history of those events, keyed by `(workflow_uuid, function_id, key)` so replay
 is deterministic.
 
 **`streams`** backs `write_stream`: an append-only log keyed by
-`(workflow_uuid, key, offset)`. Closing a stream writes a sentinel row
-(`__DBOS_STREAM_CLOSED__`) rather than deleting anything.
+`(workflow_uuid, key, offset)`, with `function_id` recording which step wrote
+each value. Closing a stream writes a sentinel row (`__DBOS_STREAM_CLOSED__`)
+rather than deleting anything.
 
 ## The standalone tables
 
@@ -251,14 +255,26 @@ by another.
 **Cascade deletes** from `workflow_status` mean one delete cleans up a
 workflow's steps, events, streams, and messages together.
 
-On Postgres, the **`LISTEN`/`NOTIFY` triggers** on `notifications` and
-`workflow_events` turn polling into push, so blocked `recv`/`get_event` calls
-wake promptly. SQLite doesn't have that, so it polls instead.
+On Postgres, the **`LISTEN`/`NOTIFY` triggers** on `notifications`,
+`workflow_events`, and (since migration 39) `streams` turn polling into push,
+so blocked `recv`/`get_event`/stream-read calls wake promptly. SQLite doesn't
+have that, so it polls instead.
 
 Finally, a lot of the later migrations (roughly 22 through 37) just drop full
 indexes and recreate them as **partial indexes** scoped to the rows the
 dispatcher actually scans — pending, failed, in-flight. It keeps the hot path
 cheap as the table grows.
+
+## One table that lives elsewhere
+
+If you use durable transactions on a separate application database
+(`ctx.transaction_on` over a `PgDataSource`/`SqliteDataSource`), you'll find a
+`transaction_completion` table **in that application database** — under the
+`dbos` schema on Postgres, unqualified on SQLite. It's not part of the system
+schema or the migrations here: the data source creates it on construction, and
+it holds the witness rows (`workflow_id`, `step_id`, `output`, `error`,
+`serialization`, `created_at`) that make the two-commit protocol exactly-once.
+See the `transactions` guide's "A separate application database" section.
 
 ---
 
