@@ -179,6 +179,9 @@ pub struct PgDataSource {
     /// What this data source points at; `System` enables the single-commit
     /// fast path, bound to the minting provider's identity.
     kind: DataSourceKind,
+    /// Where the fast path writes its checkpoint: schema-qualified when the
+    /// minting provider's schema is known, immune to `search_path` changes.
+    checkpoint_table: String,
 }
 
 #[cfg(feature = "postgres")]
@@ -219,16 +222,31 @@ impl PgDataSource {
             pool,
             table,
             kind: DataSourceKind::External,
+            checkpoint_table: "operation_outputs".to_string(),
         })
     }
 
     /// A data source over the system database's own pool (see
     /// `PostgresProvider::system_datasource`). Creates nothing: the fast path
-    /// never touches a completion table.
-    pub(crate) fn system(pool: sqlx::PgPool, identity: crate::provider::ProviderIdentity) -> Self {
+    /// never touches a completion table. `schema` is the provider's system
+    /// schema, used to fully qualify the checkpoint insert so nothing the
+    /// body does to `search_path` can redirect it; empty (a `from_pool`
+    /// provider) falls back to search_path resolution, the documented
+    /// contract for caller-owned pools.
+    pub(crate) fn system(
+        pool: sqlx::PgPool,
+        identity: crate::provider::ProviderIdentity,
+        schema: &str,
+    ) -> Self {
+        let checkpoint_table = if schema.is_empty() {
+            "operation_outputs".to_string()
+        } else {
+            format!("\"{schema}\".operation_outputs")
+        };
         Self {
             pool,
             table: "transaction_completion".to_string(),
+            checkpoint_table,
             kind: DataSourceKind::System(identity),
         }
     }
@@ -363,15 +381,15 @@ impl sealed::Backend for PgDataSource {
         serialization: &str,
         started_at_ms: i64,
     ) -> Result<bool> {
-        // Unqualified: the system pool's per-connection search_path resolves
-        // the system schema, same as the provider's own queries.
-        let res = sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization,
-                  started_at_epoch_ms, completed_at_epoch_ms)
+        // Fully qualified (when the minting provider's schema is known), so
+        // nothing the body does to `search_path` can redirect the checkpoint.
+        let res = sqlx::query(&format!(
+            "INSERT INTO {} (workflow_uuid, function_id, function_name, output, serialization,
+                             started_at_epoch_ms, completed_at_epoch_ms)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
+            self.checkpoint_table
+        ))
         .bind(workflow_id)
         .bind(step_id)
         .bind(name)

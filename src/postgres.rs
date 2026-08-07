@@ -234,7 +234,7 @@ impl PostgresProvider {
     ///
     /// [`Tx`]: crate::Tx
     pub fn system_datasource(&self) -> crate::PgDataSource {
-        crate::PgDataSource::system(self.pool.clone(), self.identity.clone())
+        crate::PgDataSource::system(self.pool.clone(), self.identity.clone(), &self.schema)
     }
 
     /// Choose the format new values are encoded with. Use [`Serializer::Portable`]

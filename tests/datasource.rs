@@ -589,6 +589,11 @@ async fn pg_system_datasource_rich_types_single_commit() -> Result<()> {
                         sqlx::query_scalar("SELECT (meta->>'amount')::bigint FROM sys_orders")
                             .fetch_one(&mut *conn)
                             .await?;
+                    // A body that redirects search_path must not redirect the
+                    // checkpoint: the fast-path insert is schema-qualified.
+                    sqlx::query("SET search_path TO public")
+                        .execute(&mut *conn)
+                        .await?;
                     Ok(amount)
                 })
             })
