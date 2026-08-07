@@ -526,8 +526,9 @@ impl sealed::Backend for SqliteDataSource {
         serialization: &str,
     ) -> Result<bool> {
         let res = sqlx::query(&format!(
-            "INSERT OR IGNORE INTO transaction_completion ({COMPLETION_COLUMNS})
-             VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transaction_completion ({COMPLETION_COLUMNS})
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workflow_id, step_id) DO NOTHING"
         ))
         .bind(workflow_id)
         .bind(step_id)
@@ -548,8 +549,9 @@ impl sealed::Backend for SqliteDataSource {
         serialization: &str,
     ) -> Result<()> {
         sqlx::query(&format!(
-            "INSERT OR IGNORE INTO transaction_completion ({COMPLETION_COLUMNS})
-             VALUES (?, ?, NULL, ?, ?, ?)"
+            "INSERT INTO transaction_completion ({COMPLETION_COLUMNS})
+             VALUES (?, ?, NULL, ?, ?, ?)
+             ON CONFLICT (workflow_id, step_id) DO NOTHING"
         ))
         .bind(workflow_id)
         .bind(step_id)
