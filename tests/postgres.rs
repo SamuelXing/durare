@@ -3206,3 +3206,62 @@ async fn pg_send_bulk_atomic_fan_out() -> Result<()> {
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+/// SQL in a transactional step can change the connection's `search_path` —
+/// session state that survives both the transaction and the step, since the
+/// connection returns to the pool. The provider's own queries are
+/// schema-qualified, so neither the step checkpoint written right after the
+/// body (same transaction, same connection) nor any later durable operation
+/// is redirected by it.
+#[tokio::test]
+async fn pg_system_queries_survive_search_path_change() -> Result<()> {
+    use durare::params;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_system_queries_survive_search_path_change: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("sweep_{tag}");
+    let id = format!("wf-sweep-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("redirect", |ctx: DurableContext, n: i64| async move {
+        // Deliberately session-scoped (not SET LOCAL): still in effect when
+        // the checkpoint is inserted moments later on this same transaction,
+        // and still poisoning the pooled connection afterwards.
+        let doubled: i64 = ctx
+            .transaction::<i64, _>("hijack", move |tx| {
+                Box::pin(async move {
+                    tx.execute("SET search_path TO public", &params![]).await?;
+                    Ok(n * 2)
+                })
+            })
+            .await?;
+        // Later durable work draws pooled connections that may still carry
+        // the redirected search_path; qualified system queries must not care.
+        let plus = ctx
+            .step("after", || async { Ok::<_, Error>(1_i64) })
+            .await?;
+        Ok::<_, Error>(doubled + plus)
+    });
+
+    let out: i64 = engine
+        .start::<_, i64>("redirect", 21_i64, WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(out, 43);
+
+    // Both step checkpoints landed in the provider's schema.
+    let steps = provider.get_workflow_steps(&id).await?;
+    let names: Vec<_> = steps.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"hijack") && names.contains(&"after"));
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(provider.pool())
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
