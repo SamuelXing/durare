@@ -665,6 +665,27 @@ impl DurableContext {
     /// row, no crash window) while the body keeps the native connection —
     /// unlike [`transaction`](Self::transaction), whose
     /// [`Param`](crate::Param) bindings cover only a small portable type set.
+    /// A system data source is bound to the provider that minted it; used
+    /// under a different engine it is rejected rather than misrouting its
+    /// checkpoint.
+    ///
+    /// # The data source is part of the workflow's contract
+    ///
+    /// Which database `ds` points at is invisible to the engine — it cannot
+    /// tell a right database from a wrong one, and running against the wrong
+    /// one **succeeds silently**. Two rules keep that from biting:
+    ///
+    /// - **Derive `ds` from the workflow's input**, deterministically (e.g.
+    ///   look the tenant up in a map keyed by an input field) — never from
+    ///   ambient state that can disagree with the input, and never captured
+    ///   once at registration for all runs.
+    /// - **Keep the wiring stable across executions**, exactly like the
+    ///   workflow's code: recovery looks for the witness row in whatever
+    ///   database `ds` points at *now*, so repointing it while runs are
+    ///   in flight (e.g. migrating a tenant's data mid-run) strands the
+    ///   witness and re-runs the body. Drain in-flight workflows before
+    ///   moving a database, or move the `transaction_completion` table with
+    ///   the data.
     ///
     /// ```no_run
     /// # use durare::{DurableContext, PgDataSource, Result};

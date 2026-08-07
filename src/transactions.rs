@@ -177,7 +177,21 @@
 //! [`PgDataSource`] never takes the fast path, even if its pool happens to
 //! point at the system database: a wrong "same database" guess would break
 //! atomicity, so the shortcut is reserved for the case that can't be wrong.
-//! This is a durare extension.
+//! For the same reason, a system data source used under a *different* engine
+//! is rejected rather than misrouting its checkpoint. This is a durare
+//! extension.
+//!
+//! ## The data source is part of the workflow's contract
+//!
+//! The engine cannot tell a right database from a wrong one — a body run
+//! against the wrong tenant's database **succeeds silently**, and recovery
+//! looks for the witness row in whatever database the data source points at
+//! *now*. So treat the wiring like the workflow's code: derive the data
+//! source deterministically from the workflow's input (a lookup keyed by an
+//! input field, not a value captured once at registration), and keep it
+//! pointing at the same database for the life of every run — drain in-flight
+//! workflows before migrating a database, or move `transaction_completion`
+//! along with the data.
 //!
 //! # Which transaction API?
 //!
