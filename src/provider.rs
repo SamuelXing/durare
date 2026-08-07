@@ -1217,16 +1217,23 @@ pub struct DequeueRequest {
 /// [`transaction_on`](crate::DurableContext::transaction_on) takes its
 /// single-commit fast path only against that provider's own database and
 /// rejects a system data source from a different engine.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ProviderIdentity(Arc<IdentityMarker>);
 
-#[derive(Default)]
+/// INVARIANT: this must stay behind an `Arc`. Identity is the address of the
+/// per-instance `ArcInner` allocation — `Arc::new` allocates one even for a
+/// zero-sized value, so every identity is distinct and clones compare equal.
+/// A `Box`/`Rc`-of-static "simplification" would give every zero-sized
+/// instance the same dangling address and make ALL identities match.
 struct IdentityMarker;
 
+// No `Default`: `default()` conventionally yields one canonical value, but a
+// fresh identity is unique by design — two `default()` calls would not match.
+#[allow(clippy::new_without_default)]
 impl ProviderIdentity {
     /// A fresh identity, equal only to its own clones.
     pub fn new() -> Self {
-        Self::default()
+        Self(Arc::new(IdentityMarker))
     }
 
     /// Whether `other` was cloned from the same original as `self`.
