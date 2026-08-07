@@ -786,6 +786,12 @@ impl DurableContext {
         // data source's pool, which is only this workflow's system database if
         // the identities match. A mismatch is a wiring bug — fail loudly
         // rather than splitting the checkpoint from the status row.
+        //
+        // This check deliberately sits AFTER the layer-1 replay above: a step
+        // that already completed replays from its checkpoint even when the
+        // wiring is now foreign, so recovering finished work is never hostage
+        // to a configuration change — only a fresh execution is rejected. Do
+        // not hoist the (cheaper) match above the replay read.
         match ds.kind() {
             crate::datasource::DataSourceKind::System(identity)
                 if self
