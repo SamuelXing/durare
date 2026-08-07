@@ -90,6 +90,28 @@ pub(crate) mod sealed {
             error: &str,
             serialization: &str,
         ) -> Result<()>;
+
+        /// Whether this data source runs on the system database's own pool
+        /// (built by a provider's `system_datasource`), enabling the
+        /// single-commit fast path: the checkpoint commits with the body's
+        /// writes, no completion row needed.
+        fn is_system(&self) -> bool;
+
+        /// Insert the step checkpoint into `operation_outputs` on the caller's
+        /// transaction — the fast-path equivalent of the completion row plus
+        /// the system commit, in one. Only valid on a system data source,
+        /// whose pool resolves the unqualified system tables.
+        #[allow(clippy::too_many_arguments)]
+        async fn insert_checkpoint(
+            &self,
+            conn: &mut Self::Conn,
+            workflow_id: &str,
+            step_id: i32,
+            name: &str,
+            output: &str,
+            serialization: &str,
+            started_at_ms: i64,
+        ) -> Result<()>;
     }
 }
 
@@ -140,6 +162,10 @@ const COMPLETION_COLUMNS: &str = "workflow_id, step_id, output, error, serializa
 pub struct PgDataSource {
     pool: sqlx::PgPool,
     table: String,
+    /// True when built by `PostgresProvider::system_datasource` — the pool is
+    /// the system database's own, so `transaction_on` takes the single-commit
+    /// fast path and the completion table is never used (or created).
+    system: bool,
 }
 
 #[cfg(feature = "postgres")]
@@ -176,7 +202,22 @@ impl PgDataSource {
         ))
         .execute(&pool)
         .await?;
-        Ok(Self { pool, table })
+        Ok(Self {
+            pool,
+            table,
+            system: false,
+        })
+    }
+
+    /// A data source over the system database's own pool (see
+    /// `PostgresProvider::system_datasource`). Creates nothing: the fast path
+    /// never touches a completion table.
+    pub(crate) fn system(pool: sqlx::PgPool) -> Self {
+        Self {
+            pool,
+            table: "transaction_completion".to_string(),
+            system: true,
+        }
     }
 
     /// The pool this data source runs on.
@@ -294,6 +335,41 @@ impl sealed::Backend for PgDataSource {
         .await?;
         Ok(())
     }
+
+    fn is_system(&self) -> bool {
+        self.system
+    }
+
+    async fn insert_checkpoint(
+        &self,
+        conn: &mut Self::Conn,
+        workflow_id: &str,
+        step_id: i32,
+        name: &str,
+        output: &str,
+        serialization: &str,
+        started_at_ms: i64,
+    ) -> Result<()> {
+        // Unqualified: the system pool's per-connection search_path resolves
+        // the system schema, same as the provider's own queries.
+        sqlx::query(
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(step_id)
+        .bind(name)
+        .bind(output)
+        .bind(serialization)
+        .bind(started_at_ms)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
 }
 
 /// A [`DataSource`] over a SQLite application database.
@@ -312,6 +388,9 @@ impl sealed::Backend for PgDataSource {
 #[derive(Clone)]
 pub struct SqliteDataSource {
     pool: sqlx::SqlitePool,
+    /// True when built by `SqliteProvider::system_datasource` — see
+    /// [`PgDataSource`]'s `system` field.
+    system: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -332,7 +411,16 @@ impl SqliteDataSource {
         )
         .execute(&pool)
         .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            system: false,
+        })
+    }
+
+    /// A data source over the system database's own pool (see
+    /// `SqliteProvider::system_datasource`). Creates nothing.
+    pub(crate) fn system(pool: sqlx::SqlitePool) -> Self {
+        Self { pool, system: true }
     }
 
     /// The pool this data source runs on.
@@ -433,6 +521,39 @@ impl sealed::Backend for SqliteDataSource {
         .bind(serialization)
         .bind(chrono::Utc::now().timestamp_millis())
         .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn is_system(&self) -> bool {
+        self.system
+    }
+
+    async fn insert_checkpoint(
+        &self,
+        conn: &mut Self::Conn,
+        workflow_id: &str,
+        step_id: i32,
+        name: &str,
+        output: &str,
+        serialization: &str,
+        started_at_ms: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(step_id)
+        .bind(name)
+        .bind(output)
+        .bind(serialization)
+        .bind(started_at_ms)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(conn)
         .await?;
         Ok(())
     }

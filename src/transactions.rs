@@ -138,8 +138,34 @@
 //! also mirrored into the witness table, so your database is self-describing.
 //! durare owns the transaction: the connection has no commit method, and on
 //! Postgres a raw `COMMIT`/`ROLLBACK` smuggled through SQL is detected and
-//! fails the step. If the "separate" database is actually the system
-//! database, prefer [`transaction`] — one commit instead of two.
+//! fails the step.
+//!
+//! ## Application tables in the system database
+//!
+//! When your tables share the database that holds the `dbos` schema, ask the
+//! **provider** for the data source instead of building one yourself:
+//!
+//! ```no_run
+//! # use durare::{DurableEngine, PostgresProvider, Result};
+//! # use std::sync::Arc;
+//! # async fn ex(url: &str) -> Result<()> {
+//! let provider = PostgresProvider::connect(url).await?;
+//! let ds = provider.system_datasource(); // provider's own pool — no guessing
+//! let engine = DurableEngine::new(Arc::new(provider)).await?;
+//! # let _ = (ds, engine);
+//! # Ok(()) }
+//! ```
+//!
+//! Because that data source is built from the provider's own pool, sameness
+//! is true by construction (never detected or guessed), and `transaction_on`
+//! takes a **single-commit fast path**: the body's writes and the step
+//! checkpoint commit in one transaction — the same guarantee as
+//! [`transaction`], with no witness table at all — while the body keeps the
+//! native connection and its full type support (`jsonb`, arrays, `uuid`, …)
+//! that [`Param`]'s portable set can't express. A user-constructed
+//! [`PgDataSource`] never takes the fast path, even if its pool happens to
+//! point at the system database: a wrong "same database" guess would break
+//! atomicity, so the shortcut is reserved for the case that can't be wrong.
 //!
 //! [`transaction`]: crate::DurableContext::transaction
 //! [`DurableContext::transaction_on`]: crate::DurableContext::transaction_on

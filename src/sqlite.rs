@@ -72,6 +72,19 @@ impl SqliteProvider {
         }
     }
 
+    /// A [`SqliteDataSource`](crate::SqliteDataSource) over this provider's
+    /// own pool, for application tables that live **in the system database**.
+    /// [`transaction_on`](crate::DurableContext::transaction_on) then takes
+    /// the single-commit fast path — writes and checkpoint in one transaction,
+    /// with the body on the native `&mut sqlx::SqliteConnection`; no
+    /// completion table is used or created. See
+    /// `PostgresProvider::system_datasource` for the full story, including
+    /// the trust note (the connection is unrestricted by design — the
+    /// application owns the database).
+    pub fn system_datasource(&self) -> crate::SqliteDataSource {
+        crate::SqliteDataSource::system(self.pool.clone())
+    }
+
     /// Back off before the next attempt of the unbounded transaction-conflict
     /// retry loop, unless the workflow has been cancelled — in which case return
     /// [`Error::Cancelled`] so an operator can stop a transaction wedged on a

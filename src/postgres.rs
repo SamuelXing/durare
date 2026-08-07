@@ -202,6 +202,36 @@ impl PostgresProvider {
         &self.pool
     }
 
+    /// A [`PgDataSource`](crate::PgDataSource) over this provider's own pool,
+    /// for application tables that live **in the system database**.
+    ///
+    /// Because the pool is known to be the system database's,
+    /// [`transaction_on`](crate::DurableContext::transaction_on) takes a
+    /// **single-commit fast path**: the body's writes and the step checkpoint
+    /// commit in one transaction — the same guarantee as
+    /// [`transaction`](crate::DurableContext::transaction), but the body gets
+    /// the native `&mut sqlx::PgConnection` (full Postgres type support:
+    /// `jsonb`, arrays, `uuid`, …) instead of the `Param`-limited [`Tx`]
+    /// wrapper. No completion table is used or created.
+    ///
+    /// # Trust note
+    ///
+    /// The connection handed to a transaction body is unrestricted by design:
+    /// it can address the system tables, because the application owns the
+    /// database and the credential — not the SDK — is the real protection
+    /// boundary (the same is true of [`Tx`], whose SQL text is equally
+    /// unfiltered). What *is* guarded is the silent accident: a stray
+    /// `COMMIT`/`ROLLBACK` in the body is detected and fails the step. Also
+    /// note these connections start with `search_path` set to the system
+    /// schema, so **unqualified** DDL in a body (`CREATE TABLE orders …`)
+    /// lands in that schema next to the system tables — qualify your table
+    /// names if you care where they live.
+    ///
+    /// [`Tx`]: crate::Tx
+    pub fn system_datasource(&self) -> crate::PgDataSource {
+        crate::PgDataSource::system(self.pool.clone())
+    }
+
     /// Choose the format new values are encoded with. Use [`Serializer::Portable`]
     /// when this database is shared with DBOS workers in other languages.
     pub fn with_serializer(mut self, serializer: Serializer) -> Self {
