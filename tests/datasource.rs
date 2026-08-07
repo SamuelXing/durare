@@ -590,8 +590,11 @@ async fn pg_system_datasource_rich_types_single_commit() -> Result<()> {
                             .fetch_one(&mut *conn)
                             .await?;
                     // A body that redirects search_path must not redirect the
-                    // checkpoint: the fast-path insert is schema-qualified.
-                    sqlx::query("SET search_path TO public")
+                    // checkpoint: the fast-path insert (which runs after the
+                    // body, inside this same transaction) is schema-qualified.
+                    // LOCAL so the redirect dies with the transaction instead
+                    // of poisoning the pooled connection for later users.
+                    sqlx::query("SET LOCAL search_path TO public")
                         .execute(&mut *conn)
                         .await?;
                     Ok(amount)
