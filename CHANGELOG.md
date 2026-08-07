@@ -215,6 +215,16 @@ unchanged and stays at `0.1.0`.
 
 ### Fixed
 
+- Every Postgres provider query now names its system tables with an explicit
+  schema (`<schema>.workflow_status`) instead of relying on the connection's
+  `search_path`. The search path is mutable session state on pooled
+  connections: SQL in a transactional step that changed it could redirect the
+  step's own checkpoint insert — running in the same transaction — and any
+  later system query on the reused connection into the wrong schema. `init`
+  likewise pins `search_path` on the one connection it runs migrations over,
+  since their DDL is unqualified by design. `from_pool` providers have no
+  configured schema and keep the documented contract: the caller's pool
+  decides where unqualified names resolve.
 - The conductor documentation pointed at `wss://conductor.dbos.dev`, a
   hostname that does not exist — following it produced an endless
   DNS-failure retry loop. The real endpoint is the default above.

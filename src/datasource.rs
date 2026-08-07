@@ -238,10 +238,12 @@ impl PgDataSource {
         identity: crate::provider::ProviderIdentity,
         schema: &str,
     ) -> Self {
+        // Unquoted on purpose: the provider's `CREATE SCHEMA` and `search_path`
+        // see the name unquoted, so quoting here would case-fold differently.
         let checkpoint_table = if schema.is_empty() {
             "operation_outputs".to_string()
         } else {
-            format!("\"{schema}\".operation_outputs")
+            format!("{schema}.operation_outputs")
         };
         Self {
             pool,
