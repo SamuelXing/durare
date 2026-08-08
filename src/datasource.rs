@@ -201,6 +201,10 @@ impl PgDataSource {
                 "invalid Postgres schema name {schema:?}: must match [A-Za-z_][A-Za-z0-9_]*"
             )));
         }
+        // Quoted, unlike the system provider's tables: this path both creates
+        // the schema and references it, always quoted, so the two sides
+        // case-fold identically. The system path must stay unquoted instead
+        // because its name is also seen unquoted by `search_path`.
         sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
             .execute(&pool)
             .await?;
