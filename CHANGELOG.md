@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-13
+
+Durable transactions land end to end: run a step's SQL against your own
+application database through your existing `sqlx` pool with exactly-once
+semantics, or — when the tables live in the system database — through a
+single-commit fast path with no witness table at all. Alongside them:
+declarative role-based authorization, and a hardening pass that stops the
+Postgres provider from trusting `search_path` — mutable session state that
+a transactional step could change out from under the system's own queries.
+`durare-macros` is unchanged and stays at `0.1.0`.
+
+Compatibility: additive throughout — code written against 0.4.0 compiles
+and behaves unchanged. The one trait addition,
+`StateProvider::provider_identity`, ships a functional default, so custom
+providers are unaffected.
+
 ### Added
 
 - Single-commit fast path for application tables in the system database:
@@ -55,6 +71,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   failures are mirrored into the witness table; conflicts retry on fresh
   transactions without consuming the application retry budget. The
   `DataSource` trait is sealed. Documented in the `transactions` guide.
+
+### Fixed
+
+- Every Postgres provider query now names its system tables with an explicit
+  schema (`<schema>.workflow_status`) instead of relying on the connection's
+  `search_path`. The search path is mutable session state on pooled
+  connections: SQL in a transactional step that changed it could redirect the
+  step's own checkpoint insert — running in the same transaction — and any
+  later system query on the reused connection into the wrong schema. `init`
+  likewise pins `search_path` on the one connection it runs migrations over,
+  since their DDL is unqualified by design. `from_pool` providers have no
+  configured schema and keep the documented contract: the caller's pool
+  decides where unqualified names resolve.
+
 ### Documentation
 
 - HTTP triggering recipe: a runnable axum example
@@ -215,16 +245,6 @@ unchanged and stays at `0.1.0`.
 
 ### Fixed
 
-- Every Postgres provider query now names its system tables with an explicit
-  schema (`<schema>.workflow_status`) instead of relying on the connection's
-  `search_path`. The search path is mutable session state on pooled
-  connections: SQL in a transactional step that changed it could redirect the
-  step's own checkpoint insert — running in the same transaction — and any
-  later system query on the reused connection into the wrong schema. `init`
-  likewise pins `search_path` on the one connection it runs migrations over,
-  since their DDL is unqualified by design. `from_pool` providers have no
-  configured schema and keep the documented contract: the caller's pool
-  decides where unqualified names resolve.
 - The conductor documentation pointed at `wss://conductor.dbos.dev`, a
   hostname that does not exist — following it produced an endless
   DNS-failure retry loop. The real endpoint is the default above.
@@ -477,7 +497,8 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/SamuelXing/durare/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/SamuelXing/durare/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/SamuelXing/durare/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/SamuelXing/durare/compare/v0.3.1...v0.3.2
