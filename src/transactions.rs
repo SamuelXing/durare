@@ -138,10 +138,75 @@
 //! also mirrored into the witness table, so your database is self-describing.
 //! durare owns the transaction: the connection has no commit method, and on
 //! Postgres a raw `COMMIT`/`ROLLBACK` smuggled through SQL is detected and
-//! fails the step. If the "separate" database is actually the system
-//! database, prefer [`transaction`] — one commit instead of two.
+//! fails the step.
+//!
+//! ## Application tables in the system database
+//!
+//! When your tables share the database that holds the `dbos` schema, ask the
+//! **provider** for the data source instead of building one yourself:
+//!
+//! ```no_run
+//! # use durare::{DurableContext, DurableEngine, PostgresProvider, Result};
+//! # use std::sync::Arc;
+//! # async fn ex(ctx: DurableContext, url: &str) -> Result<()> {
+//! let provider = PostgresProvider::connect(url).await?;
+//! let ds = provider.system_datasource(); // provider's own pool — no guessing
+//! let engine = DurableEngine::new(Arc::new(provider)).await?;
+//!
+//! ctx.transaction_on(&ds, "audit", |conn| Box::pin(async move {
+//!     // Qualify table names in fast-path bodies: this pool's search_path
+//!     // points at the system schema.
+//!     sqlx::query("INSERT INTO public.audit_log(entry) VALUES ($1)")
+//!         .bind(serde_json::json!({"kind": "transfer"})) // jsonb, natively
+//!         .execute(&mut *conn)
+//!         .await?;
+//!     Ok(())
+//! }))
+//! .await?;
+//! # let _ = engine;
+//! # Ok(()) }
+//! ```
+//!
+//! Because that data source is built from the provider's own pool, sameness
+//! is true by construction (never detected or guessed), and `transaction_on`
+//! takes a **single-commit fast path**: the body's writes and the step
+//! checkpoint commit in one transaction — the same guarantee as
+//! [`transaction`], with no witness table at all — while the body keeps the
+//! native connection and its full type support (`jsonb`, arrays, `uuid`, …)
+//! that [`Param`]'s portable set can't express. A user-constructed
+//! [`PgDataSource`] never takes the fast path, even if its pool happens to
+//! point at the system database: a wrong "same database" guess would break
+//! atomicity, so the shortcut is reserved for the case that can't be wrong.
+//! For the same reason, a system data source used under a *different* engine
+//! is rejected rather than misrouting its checkpoint. This is a durare
+//! extension.
+//!
+//! ## The data source is part of the workflow's contract
+//!
+//! The engine cannot tell a right database from a wrong one — a body run
+//! against the wrong tenant's database **succeeds silently**, and recovery
+//! looks for the witness row in whatever database the data source points at
+//! *now*. So treat the wiring like the workflow's code: derive the data
+//! source deterministically from the workflow's input (a lookup keyed by an
+//! input field, not a value captured once at registration), and keep it
+//! pointing at the same database for the life of every run — drain in-flight
+//! workflows before migrating a database, or move `transaction_completion`
+//! along with the data.
+//!
+//! # Which transaction API?
+//!
+//! | Your situation | Use | Body receives | Commits |
+//! |---|---|---|---|
+//! | Simple types, tables in the system database | [`transaction`] | [`Tx`] — portable `?` SQL | 1 |
+//! | Rich types or existing sqlx code, tables in the system database | [`transaction_on`] + `system_datasource()` | native connection | 1 |
+//! | Tables in a separate database | [`transaction_on`] + [`PgDataSource`] | native connection | 2 |
+//!
+//! Rule of thumb: start with [`transaction`] — it keeps the body portable
+//! across backends. Switch a step to [`transaction_on`] when its types
+//! outgrow [`Param`] or it should reuse sqlx-typed helpers.
 //!
 //! [`transaction`]: crate::DurableContext::transaction
+//! [`transaction_on`]: crate::DurableContext::transaction_on
 //! [`DurableContext::transaction_on`]: crate::DurableContext::transaction_on
 //! [`PgDataSource`]: crate::PgDataSource
 //!

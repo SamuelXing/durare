@@ -541,6 +541,13 @@ impl DurableContext {
     /// step. Requires a SQL backend (Postgres or SQLite); on the in-memory
     /// backend it returns an error.
     ///
+    /// This is the default transactional step: the body stays portable across
+    /// backends. When a step's types outgrow [`Param`](crate::Param) (`jsonb`,
+    /// arrays, `uuid`, …) or it should reuse sqlx-typed helpers, switch that
+    /// step to [`transaction_on`](Self::transaction_on) — see the
+    /// [`transactions`](crate::transactions) guide's "Which transaction API?"
+    /// table.
+    ///
     /// The body receives a [`Tx`] and returns a boxed future — `Box::pin(async
     /// move { … })`, mirroring sqlx's own transaction closures. SQL is written
     /// with `?` placeholders (rewritten to `$1, $2, …` for Postgres) and bound
@@ -649,8 +656,36 @@ impl DurableContext {
     /// (`Fn`): a serialization conflict or deadlock restarts it on a fresh
     /// transaction.
     ///
-    /// If your application database *is* the system database, prefer
-    /// [`transaction`](Self::transaction) — one commit instead of two.
+    /// If your application tables live **in the system database**, get the
+    /// data source from the provider instead —
+    /// `PostgresProvider::system_datasource` /
+    /// `SqliteProvider::system_datasource`. Sameness is then known by
+    /// construction, and this call takes a **single-commit fast path**: the
+    /// body's writes and the checkpoint commit in one transaction (no witness
+    /// row, no crash window) while the body keeps the native connection —
+    /// unlike [`transaction`](Self::transaction), whose
+    /// [`Param`](crate::Param) bindings cover only a small portable type set.
+    /// A system data source is bound to the provider that minted it; used
+    /// under a different engine it is rejected rather than misrouting its
+    /// checkpoint.
+    ///
+    /// # The data source is part of the workflow's contract
+    ///
+    /// Which database `ds` points at is invisible to the engine — it cannot
+    /// tell a right database from a wrong one, and running against the wrong
+    /// one **succeeds silently**. Two rules keep that from biting:
+    ///
+    /// - **Derive `ds` from the workflow's input**, deterministically (e.g.
+    ///   look the tenant up in a map keyed by an input field) — never from
+    ///   ambient state that can disagree with the input, and never captured
+    ///   once at registration for all runs.
+    /// - **Keep the wiring stable across executions**, exactly like the
+    ///   workflow's code: recovery looks for the witness row in whatever
+    ///   database `ds` points at *now*, so repointing it while runs are
+    ///   in flight (e.g. migrating a tenant's data mid-run) strands the
+    ///   witness and re-runs the body. Drain in-flight workflows before
+    ///   moving a database, or move the `transaction_completion` table with
+    ///   the data.
     ///
     /// ```no_run
     /// # use durare::{DurableContext, PgDataSource, Result};
@@ -742,6 +777,41 @@ impl DurableContext {
             return Ok(stored);
         }
         let started = chrono::Utc::now().timestamp_millis();
+        let ser = self.provider.serializer();
+
+        // A system data source runs on the system database's own pool, so one
+        // commit can cover the body's writes and the checkpoint — no witness
+        // row, no crash window, no layer 2. But only under the engine whose
+        // provider minted it: the fast path writes the checkpoint through the
+        // data source's pool, which is only this workflow's system database if
+        // the identities match. A mismatch is a wiring bug — fail loudly
+        // rather than splitting the checkpoint from the status row.
+        //
+        // This check deliberately sits AFTER the layer-1 replay above: a step
+        // that already completed replays from its checkpoint even when the
+        // wiring is now foreign, so recovering finished work is never hostage
+        // to a configuration change — only a fresh execution is rejected. Do
+        // not hoist the (cheaper) match above the replay read.
+        match ds.kind() {
+            crate::datasource::DataSourceKind::System(identity)
+                if self
+                    .provider
+                    .provider_identity()
+                    .is_some_and(|own| identity.matches(own)) =>
+            {
+                return self
+                    .run_system_datasource_transaction(ds, opts, f, seq, &ser, started)
+                    .await;
+            }
+            crate::datasource::DataSourceKind::System(_) => {
+                return Err(Error::app(
+                    "this system data source was minted by a different provider than the \
+                     one this workflow runs on; use system_datasource() from this \
+                     engine's own provider (or an external data source)",
+                ));
+            }
+            crate::datasource::DataSourceKind::External => {}
+        }
 
         // Layer 2: a completion row without a checkpoint — the application
         // transaction committed but the run crashed before the system commit.
@@ -751,8 +821,6 @@ impl DurableContext {
                 .replay_completion_row(seq, &opts.name, row, started)
                 .await;
         }
-
-        let ser = self.provider.serializer();
 
         // OUTER loop: the user-facing retry policy for application errors,
         // mirroring the single-database transactional step. Conflicts are
@@ -873,11 +941,7 @@ impl DurableContext {
                 if let Some(expected) = &fingerprint {
                     if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
                         let _ = ds.rollback(tx).await;
-                        return Err(Error::app(
-                            "the transaction body terminated the surrounding database \
-                             transaction (a raw COMMIT or ROLLBACK?), so its writes cannot \
-                             be committed atomically with the durability record",
-                        ));
+                        return Err(Error::app(TX_TERMINATED_MSG));
                     }
                 }
                 let encoded = ser.encode(&value)?;
@@ -892,6 +956,144 @@ impl DurableContext {
                     )
                     .await?
                 {
+                    let _ = ds.rollback(tx).await;
+                    return Ok(DsAttempt::AlreadyCompleted);
+                }
+                ds.commit(tx).await?;
+                Ok(DsAttempt::Committed(value))
+            }
+            Err(e) => {
+                let _ = ds.rollback(tx).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// The single-commit fast path behind [`transaction_on`](Self::transaction_on)
+    /// for a **system** data source (one built by a provider's
+    /// `system_datasource`): the pool is the system database's own, so the
+    /// step checkpoint commits inside the body's transaction — same guarantee
+    /// as [`transaction`](Self::transaction), no witness row, no crash window.
+    /// Same two-loop retry structure as the two-commit path.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn run_system_datasource_transaction<DS, T, F>(
+        &self,
+        ds: &DS,
+        opts: &TransactionOptions,
+        f: &F,
+        seq: i32,
+        ser: &crate::serialize::Serializer,
+        started: i64,
+    ) -> Result<T>
+    where
+        DS: crate::datasource::DataSource,
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut user_attempt: u32 = 0;
+        let body_err = loop {
+            let mut conflict_attempt: u32 = 0;
+            let outcome = loop {
+                match self
+                    .system_datasource_attempt(ds, opts, f, seq, ser, started)
+                    .await
+                {
+                    Ok(DsAttempt::Committed(value)) => break Ok(value),
+                    // Another execution checkpointed this step first; its
+                    // recorded outcome is canonical — replay it.
+                    Ok(DsAttempt::AlreadyCompleted) => {
+                        return self
+                            .replay_or_guard::<T>(seq, &opts.name)
+                            .await?
+                            .ok_or_else(|| {
+                                Error::app("checkpoint row vanished after a duplicate insert")
+                            });
+                    }
+                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                        self.datasource_conflict_wait(conflict_attempt).await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            match outcome {
+                Ok(value) => return Ok(serde_json::from_value(value)?),
+                Err(e) if opts.should_user_retry(&e, user_attempt) => {
+                    let delay = opts.user_retry_backoff(user_attempt);
+                    tracing::warn!(
+                        step = %opts.name,
+                        attempt = user_attempt + 1,
+                        error = %e,
+                        "transaction failed; retrying after backoff"
+                    );
+                    tokio::time::sleep(delay).await;
+                    user_attempt += 1;
+                }
+                Err(e) => break e,
+            }
+        };
+        // No witness table on the fast path: the failure is recorded in the
+        // system database only, like the single-database transactional step.
+        self.record_failure(seq, &opts.name, body_err, Some(started))
+            .await
+    }
+
+    /// One fast-path attempt: begin on the system pool, run the body, insert
+    /// the `operation_outputs` checkpoint in the same transaction, commit.
+    /// `AlreadyCompleted` means another execution checkpointed this step
+    /// first: this attempt rolled back — its writes discarded — and the
+    /// caller replays the canonical outcome.
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    async fn system_datasource_attempt<DS, T, F>(
+        &self,
+        ds: &DS,
+        opts: &TransactionOptions,
+        f: &F,
+        seq: i32,
+        ser: &crate::serialize::Serializer,
+        started: i64,
+    ) -> Result<DsAttempt>
+    where
+        DS: crate::datasource::DataSource,
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
+        let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
+        match f(&mut *tx).await {
+            Ok(v) => {
+                let value = serde_json::to_value(v)?;
+                // Ending our transaction via raw SQL would split the writes
+                // from their checkpoint — detect and refuse.
+                if let Some(expected) = &fingerprint {
+                    if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
+                        let _ = ds.rollback(tx).await;
+                        return Err(Error::app(TX_TERMINATED_MSG));
+                    }
+                }
+                let encoded = ser.encode(&value)?;
+                if !ds
+                    .insert_checkpoint(
+                        &mut *tx,
+                        &self.workflow_id,
+                        seq,
+                        &opts.name,
+                        &encoded,
+                        ser.name(),
+                        started,
+                    )
+                    .await?
+                {
+                    // Another execution already checkpointed this step. Roll
+                    // back — discarding this attempt's writes keeps the step
+                    // exactly-once even under duplicate execution — and let
+                    // the caller replay the canonical outcome.
                     let _ = ds.rollback(tx).await;
                     return Ok(DsAttempt::AlreadyCompleted);
                 }
@@ -1802,6 +2004,14 @@ const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 /// A shared identifier, so a patch decision a worker in any language recorded is
 /// read back consistently.
 const PATCH_PREFIX: &str = "DBOS.patch-";
+
+/// Error for a `transaction_on` body that ended durare's database transaction
+/// via raw SQL, which would split the writes from their durability record.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+const TX_TERMINATED_MSG: &str =
+    "the transaction body terminated the surrounding database transaction (a raw \
+     COMMIT or ROLLBACK?), so its writes cannot be committed atomically with the \
+     durability record";
 
 /// Clears the in-transaction flag on drop (see
 /// [`DurableContext::begin_transaction`]).

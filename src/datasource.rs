@@ -29,6 +29,19 @@ pub struct CompletionRow {
     pub(crate) serialization: Option<String>,
 }
 
+/// What a data source points at, as far as durability is concerned.
+#[derive(Clone)]
+pub enum DataSourceKind {
+    /// A user-owned application database: the two-commit protocol with a
+    /// witness row applies.
+    External,
+    /// The system database itself, minted by the identified provider's
+    /// `system_datasource`. The single-commit fast path applies — but only
+    /// under an engine whose provider carries the *same* identity; any other
+    /// engine rejects the data source rather than misrouting its checkpoint.
+    System(crate::provider::ProviderIdentity),
+}
+
 pub(crate) mod sealed {
     use super::*;
 
@@ -90,6 +103,29 @@ pub(crate) mod sealed {
             error: &str,
             serialization: &str,
         ) -> Result<()>;
+
+        /// What this data source points at — external application database,
+        /// or the system database of an identified provider (see
+        /// [`DataSourceKind`]).
+        fn kind(&self) -> &DataSourceKind;
+
+        /// Insert the step checkpoint into `operation_outputs` on the caller's
+        /// transaction — the fast-path equivalent of the completion row plus
+        /// the system commit, in one. Only valid on a system data source.
+        /// Returns `false` when a checkpoint already exists (another execution
+        /// committed this step first — the caller rolls back, discarding this
+        /// attempt's writes, and replays the canonical outcome).
+        #[allow(clippy::too_many_arguments)]
+        async fn insert_checkpoint(
+            &self,
+            conn: &mut Self::Conn,
+            workflow_id: &str,
+            step_id: i32,
+            name: &str,
+            output: &str,
+            serialization: &str,
+            started_at_ms: i64,
+        ) -> Result<bool>;
     }
 }
 
@@ -140,6 +176,12 @@ const COMPLETION_COLUMNS: &str = "workflow_id, step_id, output, error, serializa
 pub struct PgDataSource {
     pool: sqlx::PgPool,
     table: String,
+    /// What this data source points at; `System` enables the single-commit
+    /// fast path, bound to the minting provider's identity.
+    kind: DataSourceKind,
+    /// Where the fast path writes its checkpoint: schema-qualified when the
+    /// minting provider's schema is known, immune to `search_path` changes.
+    checkpoint_table: String,
 }
 
 #[cfg(feature = "postgres")]
@@ -176,7 +218,37 @@ impl PgDataSource {
         ))
         .execute(&pool)
         .await?;
-        Ok(Self { pool, table })
+        Ok(Self {
+            pool,
+            table,
+            kind: DataSourceKind::External,
+            checkpoint_table: "operation_outputs".to_string(),
+        })
+    }
+
+    /// A data source over the system database's own pool (see
+    /// `PostgresProvider::system_datasource`). Creates nothing: the fast path
+    /// never touches a completion table. `schema` is the provider's system
+    /// schema, used to fully qualify the checkpoint insert so nothing the
+    /// body does to `search_path` can redirect it; empty (a `from_pool`
+    /// provider) falls back to search_path resolution, the documented
+    /// contract for caller-owned pools.
+    pub(crate) fn system(
+        pool: sqlx::PgPool,
+        identity: crate::provider::ProviderIdentity,
+        schema: &str,
+    ) -> Self {
+        let checkpoint_table = if schema.is_empty() {
+            "operation_outputs".to_string()
+        } else {
+            format!("\"{schema}\".operation_outputs")
+        };
+        Self {
+            pool,
+            table: "transaction_completion".to_string(),
+            checkpoint_table,
+            kind: DataSourceKind::System(identity),
+        }
     }
 
     /// The pool this data source runs on.
@@ -294,6 +366,41 @@ impl sealed::Backend for PgDataSource {
         .await?;
         Ok(())
     }
+
+    fn kind(&self) -> &DataSourceKind {
+        &self.kind
+    }
+
+    async fn insert_checkpoint(
+        &self,
+        conn: &mut Self::Conn,
+        workflow_id: &str,
+        step_id: i32,
+        name: &str,
+        output: &str,
+        serialization: &str,
+        started_at_ms: i64,
+    ) -> Result<bool> {
+        // Fully qualified (when the minting provider's schema is known), so
+        // nothing the body does to `search_path` can redirect the checkpoint.
+        let res = sqlx::query(&format!(
+            "INSERT INTO {} (workflow_uuid, function_id, function_name, output, serialization,
+                             started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+            self.checkpoint_table
+        ))
+        .bind(workflow_id)
+        .bind(step_id)
+        .bind(name)
+        .bind(output)
+        .bind(serialization)
+        .bind(started_at_ms)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(conn)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
 }
 
 /// A [`DataSource`] over a SQLite application database.
@@ -312,6 +419,8 @@ impl sealed::Backend for PgDataSource {
 #[derive(Clone)]
 pub struct SqliteDataSource {
     pool: sqlx::SqlitePool,
+    /// What this data source points at — see [`PgDataSource`]'s `kind` field.
+    kind: DataSourceKind,
 }
 
 #[cfg(feature = "sqlite")]
@@ -332,7 +441,22 @@ impl SqliteDataSource {
         )
         .execute(&pool)
         .await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            kind: DataSourceKind::External,
+        })
+    }
+
+    /// A data source over the system database's own pool (see
+    /// `SqliteProvider::system_datasource`). Creates nothing.
+    pub(crate) fn system(
+        pool: sqlx::SqlitePool,
+        identity: crate::provider::ProviderIdentity,
+    ) -> Self {
+        Self {
+            pool,
+            kind: DataSourceKind::System(identity),
+        }
     }
 
     /// The pool this data source runs on.
@@ -402,8 +526,9 @@ impl sealed::Backend for SqliteDataSource {
         serialization: &str,
     ) -> Result<bool> {
         let res = sqlx::query(&format!(
-            "INSERT OR IGNORE INTO transaction_completion ({COMPLETION_COLUMNS})
-             VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transaction_completion ({COMPLETION_COLUMNS})
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workflow_id, step_id) DO NOTHING"
         ))
         .bind(workflow_id)
         .bind(step_id)
@@ -424,8 +549,9 @@ impl sealed::Backend for SqliteDataSource {
         serialization: &str,
     ) -> Result<()> {
         sqlx::query(&format!(
-            "INSERT OR IGNORE INTO transaction_completion ({COMPLETION_COLUMNS})
-             VALUES (?, ?, NULL, ?, ?, ?)"
+            "INSERT INTO transaction_completion ({COMPLETION_COLUMNS})
+             VALUES (?, ?, NULL, ?, ?, ?)
+             ON CONFLICT (workflow_id, step_id) DO NOTHING"
         ))
         .bind(workflow_id)
         .bind(step_id)
@@ -435,5 +561,38 @@ impl sealed::Backend for SqliteDataSource {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    fn kind(&self) -> &DataSourceKind {
+        &self.kind
+    }
+
+    async fn insert_checkpoint(
+        &self,
+        conn: &mut Self::Conn,
+        workflow_id: &str,
+        step_id: i32,
+        name: &str,
+        output: &str,
+        serialization: &str,
+        started_at_ms: i64,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(step_id)
+        .bind(name)
+        .bind(output)
+        .bind(serialization)
+        .bind(started_at_ms)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(conn)
+        .await?;
+        Ok(res.rows_affected() == 1)
     }
 }
