@@ -346,6 +346,20 @@ async fn recover_is_version_gated() -> Result<()> {
 
     let n = engine.recover().await?;
     assert_eq!(n, 1, "only the matching-version workflow is recovered");
+    // The re-dispatched run completes on a background task; wait for it.
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = provider
+            .get_workflow_status("wf-cur")
+            .await?
+            .unwrap()
+            .status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, STATUS_SUCCESS, "the current-version run completes");
     assert_eq!(RUNS.load(Ordering::SeqCst), 1);
     assert_eq!(
         provider

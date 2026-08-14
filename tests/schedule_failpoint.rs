@@ -85,6 +85,18 @@ async fn tick_survives_crash_before_run() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
         assert!(engine.recover().await? >= 1, "recovery picked up the tick");
+        // The re-dispatched tick completes on a background task; wait for it.
+        for _ in 0..250 {
+            let status = provider
+                .get_workflow_status(&tick_id)
+                .await?
+                .unwrap()
+                .status;
+            if status == STATUS_SUCCESS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     assert_eq!(WORK.load(Ordering::SeqCst), 1, "recovered tick ran once");
     assert_eq!(
@@ -167,6 +179,14 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
         assert!(engine.recover().await? >= 1, "recovery picked up the ticks");
+        // Every re-dispatched tick completes in the background; wait them out.
+        for _ in 0..250 {
+            let rows = sched_rows(&provider).await?;
+            if rows.iter().all(|r| r.status == STATUS_SUCCESS) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
     assert_eq!(S1.load(Ordering::SeqCst), n, "s1 not re-run on replay");
     assert_eq!(S2.load(Ordering::SeqCst), n, "s2 ran exactly once per tick");

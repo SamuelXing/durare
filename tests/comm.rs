@@ -109,9 +109,22 @@ async fn recv_replay_does_not_double_consume() -> Result<()> {
     engine.send("wf-replay", "m1".to_string(), "t").await?;
     engine.send("wf-replay", "m2".to_string(), "t").await?;
 
+    // recover() dispatches the run to the background and returns; each
+    // execution is awaited by polling for a terminal status.
+    let settled = |provider: Arc<InMemoryProvider>| async move {
+        for _ in 0..250 {
+            let s = provider.get_workflow_status("wf-replay").await?.unwrap();
+            if s.status != STATUS_PENDING {
+                return Ok::<_, Error>(s);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("recovered run never settled");
+    };
+
     // First execution consumes m1 and completes.
     assert_eq!(engine.recover().await?, 1);
-    let first = provider.get_workflow_status("wf-replay").await?.unwrap();
+    let first = settled(provider.clone()).await?;
     assert_eq!(first.output, Some(Value::String("m1".into())));
 
     // Force a re-execution of the body: the recv must replay its checkpoint
@@ -120,7 +133,7 @@ async fn recv_replay_does_not_double_consume() -> Result<()> {
         .set_workflow_status("wf-replay", STATUS_PENDING, None, None)
         .await?;
     assert_eq!(engine.recover().await?, 1);
-    let second = provider.get_workflow_status("wf-replay").await?.unwrap();
+    let second = settled(provider.clone()).await?;
     assert_eq!(second.output, Some(Value::String("m1".into())));
 
     // m2 must still be unconsumed.
