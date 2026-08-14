@@ -835,9 +835,12 @@ impl DurableContext {
             let outcome = loop {
                 match self.datasource_attempt(ds, opts, f, seq, &ser).await {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
-                    // Another execution committed this step first: its row is
-                    // the canonical outcome — replay it.
-                    Ok(DsAttempt::AlreadyCompleted) => {
+                    // Another execution committed this step first. An identical
+                    // stored row is a replay/retry of this same logical write —
+                    // converge on it. A divergent one is a live rival execution:
+                    // stop, and let the engine adopt the recorded workflow
+                    // outcome rather than doubling every remaining step.
+                    Ok(DsAttempt::AlreadyCompleted { value }) => {
                         let row = ds
                             .fetch_completion(&self.workflow_id, seq)
                             .await?
@@ -846,6 +849,9 @@ impl DurableContext {
                                     "transaction_completion row vanished after a duplicate insert",
                                 )
                             })?;
+                        if !completion_row_matches(&ser, &row, &value)? {
+                            return Err(Error::WorkflowConflict(self.workflow_id.clone()));
+                        }
                         return self
                             .replay_completion_row(seq, &opts.name, row, started)
                             .await;
@@ -958,7 +964,7 @@ impl DurableContext {
                     .await?
                 {
                     let _ = ds.rollback(tx).await;
-                    return Ok(DsAttempt::AlreadyCompleted);
+                    return Ok(DsAttempt::AlreadyCompleted { value });
                 }
                 ds.commit(tx).await?;
                 Ok(DsAttempt::Committed(value))
@@ -1003,15 +1009,34 @@ impl DurableContext {
                     .await
                 {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
-                    // Another execution checkpointed this step first; its
-                    // recorded outcome is canonical — replay it.
-                    Ok(DsAttempt::AlreadyCompleted) => {
-                        return self
-                            .replay_or_guard::<T>(seq, &opts.name)
+                    // Another execution checkpointed this step first. An
+                    // identical recorded output is a replay/retry of this same
+                    // logical write — converge on it. Anything else is a live
+                    // rival execution: stop, and let the engine adopt the
+                    // recorded workflow outcome rather than doubling every
+                    // remaining step.
+                    Ok(DsAttempt::AlreadyCompleted { value }) => {
+                        let rec = self
+                            .provider
+                            .get_step_result(&self.workflow_id, seq)
                             .await?
                             .ok_or_else(|| {
                                 Error::app("checkpoint row vanished after a duplicate insert")
-                            });
+                            })?;
+                        if rec.name != opts.name {
+                            return Err(Error::unexpected_step(
+                                &self.workflow_id,
+                                seq,
+                                &opts.name,
+                                rec.name,
+                            ));
+                        }
+                        if !matches!(&rec.outcome, StepOutcome::Output(stored) if *stored == value)
+                        {
+                            return Err(Error::WorkflowConflict(self.workflow_id.clone()));
+                        }
+                        tracing::Span::current().record("dbos.step.replayed", true);
+                        return Ok(serde_json::from_value(value)?);
                     }
                     Err(e) if e.is_tx_conflict() || e.is_retryable() => {
                         self.datasource_conflict_wait(conflict_attempt).await?;
@@ -1094,9 +1119,9 @@ impl DurableContext {
                     // Another execution already checkpointed this step. Roll
                     // back — discarding this attempt's writes keeps the step
                     // exactly-once even under duplicate execution — and let
-                    // the caller replay the canonical outcome.
+                    // the caller classify the stored row.
                     let _ = ds.rollback(tx).await;
-                    return Ok(DsAttempt::AlreadyCompleted);
+                    return Ok(DsAttempt::AlreadyCompleted { value });
                 }
                 ds.commit(tx).await?;
                 Ok(DsAttempt::Committed(value))
@@ -2074,8 +2099,35 @@ enum DsAttempt {
     /// The body ran and its transaction committed; carries the JSON output.
     Committed(Value),
     /// A completion row already existed — another execution committed this
-    /// step first, and its row is the canonical outcome.
-    AlreadyCompleted,
+    /// step first, and this attempt rolled back. Carries the output this
+    /// attempt computed, so the caller can classify the stored row: identical
+    /// content is a replay/retry converging on the canonical outcome, anything
+    /// else is a live rival execution ([`Error::WorkflowConflict`]).
+    AlreadyCompleted {
+        /// The rolled-back attempt's computed output.
+        value: Value,
+    },
+}
+
+/// Whether a stored completion row records the same successful outcome this
+/// attempt computed: a recorded success whose decoded output equals `value`.
+/// A recorded failure, or a divergent output, is another live execution's
+/// write — the caller reports [`Error::WorkflowConflict`]. (The witness table
+/// carries no step name or start instant, so content is the whole comparison.)
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+fn completion_row_matches(
+    ser: &crate::serialize::Serializer,
+    row: &crate::datasource::CompletionRow,
+    value: &Value,
+) -> Result<bool> {
+    let Some(output) = row.output.as_deref() else {
+        return Ok(false);
+    };
+    if row.error.is_some() {
+        return Ok(false);
+    }
+    let stored = crate::serialize::decode(ser, row.serialization.as_deref(), output)?;
+    Ok(stored == *value)
 }
 
 /// Turn a recorded step outcome into the typed value a step returns: a recorded

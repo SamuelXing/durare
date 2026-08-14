@@ -321,6 +321,51 @@ impl PostgresProvider {
         Ok(())
     }
 
+    /// After a transactional checkpoint insert lost the `(workflow, seq)` race
+    /// — the body's transaction has already been rolled back — classify the
+    /// stored row. An identical write (same name, content, and start instant)
+    /// is a replay or retry of this same logical write and converges (`Ok`). A
+    /// different name is non-determinism
+    /// ([`UnexpectedStep`](Error::UnexpectedStep)); anything else is a live
+    /// rival execution ([`WorkflowConflict`](Error::WorkflowConflict)) — the
+    /// caller must stop executing and adopt the recorded workflow outcome.
+    async fn classify_lost_txn_checkpoint(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        output_col: Option<&str>,
+        error_col: Option<&str>,
+        started_at_ms: i64,
+    ) -> Result<()> {
+        let row = sqlx::query(&format!(
+            "SELECT function_name, output, error, started_at_epoch_ms
+             FROM {operation_outputs}
+             WHERE workflow_uuid = $1 AND function_id = $2",
+            operation_outputs = self.tables.operation_outputs
+        ))
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        // A vanished row (deleted between the losing insert and this read,
+        // e.g. by garbage collection) still proves a rival existed.
+        let Some(row) = row else {
+            return Err(Error::WorkflowConflict(workflow_id.to_string()));
+        };
+        let stored_name: String = row.get("function_name");
+        if stored_name != name {
+            return Err(Error::unexpected_step(workflow_id, seq, name, stored_name));
+        }
+        let same_write = row.get::<Option<String>, _>("output").as_deref() == output_col
+            && row.get::<Option<String>, _>("error").as_deref() == error_col
+            && row.get::<Option<i64>, _>("started_at_epoch_ms") == Some(started_at_ms);
+        if !same_write {
+            return Err(Error::WorkflowConflict(workflow_id.to_string()));
+        }
+        Ok(())
+    }
+
     /// Back off before the next attempt of the unbounded transaction-conflict
     /// retry loop, unless the workflow has been cancelled — in which case return
     /// [`Error::Cancelled`] so an operator can stop a transaction wedged on a
@@ -975,7 +1020,8 @@ impl StateProvider for PostgresProvider {
                         // Success: checkpoint the output in the same transaction, so
                         // the body's writes and the checkpoint commit atomically.
                         Ok(value) => {
-                            sqlx::query(&format!("INSERT INTO {operation_outputs}
+                            let encoded = self.serializer.encode(&value)?;
+                            let won = sqlx::query(&format!("INSERT INTO {operation_outputs}
                                      (workflow_uuid, function_id, function_name, output, serialization,
                                       started_at_epoch_ms, completed_at_epoch_ms)
                                  VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -984,12 +1030,33 @@ impl StateProvider for PostgresProvider {
                             .bind(workflow_id)
                             .bind(seq)
                             .bind(name)
-                            .bind(self.serializer.encode(&value)?)
+                            .bind(&encoded)
                             .bind(self.serializer.name())
                             .bind(started_at_ms)
                             .bind(Utc::now().timestamp_millis())
                             .execute(&mut *tx)
-                            .await?;
+                            .await?
+                            .rows_affected()
+                                > 0;
+                            if !won {
+                                // Another execution checkpointed this step while
+                                // this transaction was open. Committing would
+                                // apply the body's writes a second time: roll
+                                // back, then classify against the stored row —
+                                // an identical write converges, anything else
+                                // errors.
+                                tx.rollback().await?;
+                                self.classify_lost_txn_checkpoint(
+                                    workflow_id,
+                                    seq,
+                                    name,
+                                    Some(&encoded),
+                                    None,
+                                    started_at_ms,
+                                )
+                                .await?;
+                                return Ok(value);
+                            }
                             tx.commit().await?;
                             Ok(value)
                         }
@@ -1023,6 +1090,15 @@ impl StateProvider for PostgresProvider {
                 }
             };
 
+            // A lost checkpoint race is a final classification, not an
+            // application error: it must never re-run the body, whatever the
+            // user's retry predicate says.
+            if matches!(
+                body_err,
+                Error::WorkflowConflict(_) | Error::UnexpectedStep { .. }
+            ) {
+                return Err(body_err);
+            }
             // A body error reached the user-retry policy. Retry the whole body if
             // the budget allows and the predicate accepts; otherwise record the
             // failure durably (outside any transaction) so a replay returns it
@@ -1039,7 +1115,8 @@ impl StateProvider for PostgresProvider {
                 user_attempt += 1;
                 continue;
             }
-            sqlx::query(&format!(
+            let encoded_err = serialize::encode_error(&self.serializer, &body_err);
+            let won = sqlx::query(&format!(
                 "INSERT INTO {operation_outputs}
                      (workflow_uuid, function_id, function_name, error, serialization,
                       started_at_epoch_ms, completed_at_epoch_ms)
@@ -1050,12 +1127,29 @@ impl StateProvider for PostgresProvider {
             .bind(workflow_id)
             .bind(seq)
             .bind(name)
-            .bind(serialize::encode_error(&self.serializer, &body_err))
+            .bind(&encoded_err)
             .bind(self.serializer.name())
             .bind(started_at_ms)
             .bind(Utc::now().timestamp_millis())
             .execute(&self.pool)
-            .await?;
+            .await?
+            .rows_affected()
+                > 0;
+            if !won {
+                // Another execution recorded this step first — commonly its
+                // success. An identical recorded failure still surfaces
+                // `body_err`; anything else is the rival's outcome, and this
+                // execution must stop rather than report its own result.
+                self.classify_lost_txn_checkpoint(
+                    workflow_id,
+                    seq,
+                    name,
+                    None,
+                    Some(&encoded_err),
+                    started_at_ms,
+                )
+                .await?;
+            }
             return Err(body_err);
         }
     }
