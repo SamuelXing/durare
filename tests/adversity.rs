@@ -284,11 +284,16 @@ async fn pg_recovery_honors_executor_ownership() -> Result<()> {
         recovered.contains(&wf_id),
         "explicit recovery by executor id takes over A's workflow"
     );
-    assert_eq!(
-        probe.get_workflow_status(&wf_id).await?.unwrap().status,
-        STATUS_SUCCESS,
-        "the taken-over workflow completes"
-    );
+    // The re-dispatched run completes on a background task; wait for it.
+    let mut status = String::new();
+    for _ in 0..250 {
+        status = probe.get_workflow_status(&wf_id).await?.unwrap().status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, STATUS_SUCCESS, "the taken-over workflow completes");
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         2,
@@ -588,10 +593,18 @@ async fn pg_takeover_of_live_stalled_executor_is_bounded() -> Result<()> {
     let recovered = b.recover_pending_for(std::slice::from_ref(&exec_a)).await?;
     assert!(recovered.contains(&wf_id), "takeover re-dispatched the run");
 
+    // The re-dispatched run completes on a background task; wait for it.
     let probe = PostgresProvider::connect(&url).await?;
+    let mut status = String::new();
+    for _ in 0..250 {
+        status = probe.get_workflow_status(&wf_id).await?.unwrap().status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
-        probe.get_workflow_status(&wf_id).await?.unwrap().status,
-        STATUS_SUCCESS,
+        status, STATUS_SUCCESS,
         "the takeover completed the workflow while the owner still lives"
     );
     assert_eq!(

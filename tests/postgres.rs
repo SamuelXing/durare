@@ -401,6 +401,21 @@ async fn pg_patch() -> Result<()> {
     provider2
         .record_step_result(&old, 0, "legacy_step", serde_json::json!(1), None, None)
         .await?;
+    // The seeded row is PENDING with no live owner: recovery re-executes it
+    // (same-id start of a non-terminal run returns a handle without spawning
+    // a second execution). Scoped to the seeded row's (empty) executor id so
+    // this cannot steal a concurrently running test's pending workflows.
+    // Wait for it to settle, then read the recorded output through a
+    // same-id handle.
+    let recovered = engine.recover_pending_for(&[String::new()]).await?;
+    assert!(recovered.contains(&old), "recovery picks up the seeded run");
+    for _ in 0..250 {
+        let s = provider2.get_workflow_status(&old).await?.unwrap().status;
+        if s != STATUS_PENDING {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let patched: bool = engine
         .start::<_, bool>("wf", (), WorkflowOptions::with_id(&old))
         .await?
