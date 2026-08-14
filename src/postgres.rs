@@ -116,6 +116,122 @@ pub(crate) fn is_plain_identifier(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// PostgreSQL's reserved keywords (the fully-reserved set plus the
+/// type/function-name set): none can appear unquoted where a schema name goes,
+/// so a schema called `user` or `select` would sail through shape validation
+/// and then fail `CREATE SCHEMA` at `init` with a bare syntax error that says
+/// nothing about the cause. Checked only on the unquoted path
+/// ([`connect_with_schema`](PostgresProvider::connect_with_schema)); quoted
+/// identifiers may use any name. (List from the PostgreSQL keyword table; an
+/// unlisted keyword still fails at `CREATE SCHEMA`, just less clearly.)
+pub(crate) fn is_reserved_sql_keyword(s: &str) -> bool {
+    const RESERVED: &[&str] = &[
+        "all",
+        "analyse",
+        "analyze",
+        "and",
+        "any",
+        "array",
+        "as",
+        "asc",
+        "asymmetric",
+        "authorization",
+        "binary",
+        "both",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "collation",
+        "column",
+        "concurrently",
+        "constraint",
+        "create",
+        "cross",
+        "current_catalog",
+        "current_date",
+        "current_role",
+        "current_schema",
+        "current_time",
+        "current_timestamp",
+        "current_user",
+        "default",
+        "deferrable",
+        "desc",
+        "distinct",
+        "do",
+        "else",
+        "end",
+        "except",
+        "false",
+        "fetch",
+        "for",
+        "foreign",
+        "freeze",
+        "from",
+        "full",
+        "grant",
+        "group",
+        "having",
+        "ilike",
+        "in",
+        "initially",
+        "inner",
+        "intersect",
+        "into",
+        "is",
+        "isnull",
+        "join",
+        "lateral",
+        "leading",
+        "left",
+        "like",
+        "limit",
+        "localtime",
+        "localtimestamp",
+        "natural",
+        "not",
+        "notnull",
+        "null",
+        "offset",
+        "on",
+        "only",
+        "or",
+        "order",
+        "outer",
+        "overlaps",
+        "placing",
+        "primary",
+        "references",
+        "returning",
+        "right",
+        "select",
+        "session_user",
+        "similar",
+        "some",
+        "symmetric",
+        "table",
+        "tablesample",
+        "then",
+        "to",
+        "trailing",
+        "true",
+        "union",
+        "unique",
+        "user",
+        "using",
+        "variadic",
+        "verbose",
+        "when",
+        "where",
+        "window",
+        "with",
+    ];
+    RESERVED
+        .binary_search(&s.to_ascii_lowercase().as_str())
+        .is_ok()
+}
+
 /// Schema-qualified system-table names, computed once at construction. Every
 /// query names its table through these instead of relying on the connection's
 /// `search_path` — mutable session state that SQL in a transactional step can
@@ -220,6 +336,12 @@ impl PostgresProvider {
             return Err(Error::app(format!(
                 "invalid schema name {schema:?}: use letters, digits, and underscores, \
                  not starting with a digit"
+            )));
+        }
+        if is_reserved_sql_keyword(schema) {
+            return Err(Error::app(format!(
+                "invalid schema name {schema:?}: a reserved SQL keyword cannot be used \
+                 unquoted as a schema name"
             )));
         }
         use std::str::FromStr as _;

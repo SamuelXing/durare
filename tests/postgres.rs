@@ -3519,3 +3519,33 @@ async fn pg_read_only_fast_path_checkpoints_after_commit() -> Result<()> {
         .map_err(Error::from)?;
     Ok(())
 }
+
+/// A schema named after a reserved SQL keyword passes shape validation but
+/// would fail `CREATE SCHEMA` at `init` with a bare syntax error. The
+/// constructor now rejects it up front with a clear message. (Validation runs
+/// before any connection, so no database is needed.)
+#[tokio::test]
+async fn pg_reserved_keyword_schema_rejected_up_front() -> Result<()> {
+    for name in ["user", "select", "table", "User"] {
+        let Err(err) = PostgresProvider::connect_with_schema("postgres://invalid/none", name).await
+        else {
+            panic!("reserved keyword {name:?} must be rejected");
+        };
+        assert!(
+            err.to_string().contains("reserved SQL keyword"),
+            "unexpected error for {name:?}: {err}"
+        );
+    }
+    // A plain name still proceeds past validation (failing later on the
+    // unreachable host, not on the name).
+    let Err(err) =
+        PostgresProvider::connect_with_schema("postgres://invalid:1/none", "dbos_app").await
+    else {
+        panic!("unreachable host must fail");
+    };
+    assert!(
+        !err.to_string().contains("invalid schema name"),
+        "a plain identifier must pass validation: {err}"
+    );
+    Ok(())
+}
