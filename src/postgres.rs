@@ -359,10 +359,40 @@ impl PostgresProvider {
         Ok(provider)
     }
 
+    /// Like [`from_pool`](Self::from_pool), but with system tables under
+    /// `schema` — created on `init` if missing, exactly as
+    /// [`connect_with_schema`](Self::connect_with_schema) does. Every system
+    /// query names the schema explicitly, so nothing that changes the pool's
+    /// `search_path` can redirect them.
+    ///
+    /// One difference from `connect_with_schema`: the caller owns the pool, so
+    /// its connections' `search_path` is left untouched — a transactional
+    /// step's *user* SQL resolves unqualified names wherever the pool's own
+    /// configuration says, not in `schema`.
+    pub fn from_pool_with_schema(pool: PgPool, schema: &str) -> Result<Self> {
+        if !is_plain_identifier(schema) {
+            return Err(Error::app(format!(
+                "invalid schema name {schema:?}: use letters, digits, and underscores, \
+                 not starting with a digit"
+            )));
+        }
+        if is_reserved_sql_keyword(schema) {
+            return Err(Error::app(format!(
+                "invalid schema name {schema:?}: a reserved SQL keyword cannot be used \
+                 unquoted as a schema name"
+            )));
+        }
+        let mut provider = Self::from_pool(pool);
+        provider.schema = schema.to_string();
+        provider.tables = SystemTables::new(schema);
+        Ok(provider)
+    }
+
     /// Build a provider from an existing pool (useful if your app already owns
     /// one). The pool's own configuration controls the search path, so system
     /// tables live wherever it resolves unqualified names (no schema is created
-    /// on `init`).
+    /// on `init`). To pin the system tables to a schema instead, use
+    /// [`from_pool_with_schema`](Self::from_pool_with_schema).
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
             pool,
