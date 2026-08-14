@@ -780,52 +780,86 @@ impl StateProvider for PostgresProvider {
             Some(e) => (None, Some(e.to_string())),
             None => (Some(self.serializer.encode(&value)?), None),
         };
-        let won = sqlx::query(&format!(
-            "INSERT INTO {operation_outputs}
-                 (workflow_uuid, function_id, function_name, output, error, serialization,
-                  started_at_epoch_ms, completed_at_epoch_ms)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            operation_outputs = self.tables.operation_outputs
-        ))
-        .bind(workflow_id)
-        .bind(seq)
-        .bind(name)
-        .bind(&output_col)
-        .bind(&error_col)
-        .bind(self.serializer.name())
-        .bind(started_at_ms)
-        .bind(Utc::now().timestamp_millis())
-        .execute(&self.pool)
-        .await?
-        .rows_affected()
-            > 0;
-
-        // Winning the checkpoint proves this executor is the one actually
-        // running the workflow; refresh the row's executor_id so it reports
-        // that. Best-effort — a failure never fails the checkpoint itself.
-        if won {
-            if let Some(executor) = executor_id {
-                if let Err(e) = sqlx::query(&format!(
-                    "UPDATE {workflow_status} SET executor_id = $1
-                     WHERE workflow_uuid = $2 AND (executor_id IS NULL OR executor_id <> $1)",
+        // One round trip covers the whole common case: the checkpoint insert
+        // and — when it wins and an executor is given — the executor refresh,
+        // since winning the checkpoint proves this executor is the one
+        // actually running the workflow. The refresh is gated on the insert
+        // through the CTE (a data-modifying CTE's RETURNING is visible to its
+        // siblings even though the table change is not), grants no
+        // exclusivity, and updates zero rows when the insert lost or the id
+        // already matches.
+        let won = match executor_id {
+            Some(executor) => {
+                sqlx::query_scalar::<_, bool>(&format!(
+                    "WITH ins AS (
+                     INSERT INTO {operation_outputs}
+                         (workflow_uuid, function_id, function_name, output, error, serialization,
+                          started_at_epoch_ms, completed_at_epoch_ms)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (workflow_uuid, function_id) DO NOTHING
+                     RETURNING 1
+                 ),
+                 refresh AS (
+                     UPDATE {workflow_status} SET executor_id = $9
+                     WHERE workflow_uuid = $1 AND EXISTS (SELECT 1 FROM ins)
+                       AND (executor_id IS NULL OR executor_id <> $9)
+                     RETURNING 1
+                 )
+                 SELECT EXISTS (SELECT 1 FROM ins)",
+                    operation_outputs = self.tables.operation_outputs,
                     workflow_status = self.tables.workflow_status
                 ))
-                .bind(executor)
                 .bind(workflow_id)
-                .execute(&self.pool)
-                .await
-                {
-                    tracing::warn!(
-                        workflow = %workflow_id,
-                        error = %e,
-                        "failed to refresh workflow executor id after step checkpoint"
-                    );
-                }
+                .bind(seq)
+                .bind(name)
+                .bind(&output_col)
+                .bind(&error_col)
+                .bind(self.serializer.name())
+                .bind(started_at_ms)
+                .bind(Utc::now().timestamp_millis())
+                .bind(executor)
+                .fetch_one(&self.pool)
+                .await?
             }
+            None => {
+                sqlx::query(&format!(
+                    "INSERT INTO {operation_outputs}
+                         (workflow_uuid, function_id, function_name, output, error, serialization,
+                          started_at_epoch_ms, completed_at_epoch_ms)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+                    operation_outputs = self.tables.operation_outputs
+                ))
+                .bind(workflow_id)
+                .bind(seq)
+                .bind(name)
+                .bind(&output_col)
+                .bind(&error_col)
+                .bind(self.serializer.name())
+                .bind(started_at_ms)
+                .bind(Utc::now().timestamp_millis())
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                    > 0
+            }
+        };
+
+        // Winning means the stored row is exactly this write — no read-back.
+        if won {
+            return Ok(step_outcome_from(
+                &self.serializer,
+                Some(self.serializer.name()),
+                output_col.as_deref(),
+                error_col.as_deref(),
+            )?
+            .unwrap_or(StepOutcome::Output(Value::Null)));
         }
 
-        // Read back the canonical outcome (ours, or a racing writer's that won).
+        // Someone else's row is already at this position: read it to classify.
+        // Identical content and start instant means a replay or a retry of
+        // this same logical write — adopt it. Anything else is a live rival
+        // execution (or a non-deterministic function, when the name differs).
         let row = sqlx::query(&format!(
             "SELECT function_name, output, error, serialization, started_at_epoch_ms
              FROM {operation_outputs}
@@ -836,21 +870,15 @@ impl StateProvider for PostgresProvider {
         .bind(seq)
         .fetch_one(&self.pool)
         .await?;
-        if !won {
-            // Someone else's row is already at this position. Identical content
-            // and start instant means a replay or a retry of this same logical
-            // write — adopt it. Anything else is a live rival execution (or a
-            // non-deterministic function, when the name differs).
-            let stored_name: String = row.get("function_name");
-            if stored_name != name {
-                return Err(Error::unexpected_step(workflow_id, seq, name, stored_name));
-            }
-            let same_write = row.get::<Option<String>, _>("output") == output_col
-                && row.get::<Option<String>, _>("error") == error_col
-                && row.get::<Option<i64>, _>("started_at_epoch_ms") == started_at_ms;
-            if !same_write {
-                return Err(Error::WorkflowConflict(workflow_id.to_string()));
-            }
+        let stored_name: String = row.get("function_name");
+        if stored_name != name {
+            return Err(Error::unexpected_step(workflow_id, seq, name, stored_name));
+        }
+        let same_write = row.get::<Option<String>, _>("output") == output_col
+            && row.get::<Option<String>, _>("error") == error_col
+            && row.get::<Option<i64>, _>("started_at_epoch_ms") == started_at_ms;
+        if !same_write {
+            return Err(Error::WorkflowConflict(workflow_id.to_string()));
         }
         Ok(step_outcome_from(
             &self.serializer,

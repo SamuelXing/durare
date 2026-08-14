@@ -412,6 +412,8 @@ impl StateProvider for SqliteProvider {
         // Winning the checkpoint proves this executor is the one actually
         // running the workflow; refresh the row's executor_id so it reports
         // that. Best-effort — a failure never fails the checkpoint itself.
+        // (Two statements, unlike Postgres's single CTE: SQLite has no
+        // data-modifying CTEs, and the round trip is in-process anyway.)
         if won {
             if let Some(executor) = executor_id {
                 if let Err(e) = sqlx::query(
@@ -431,8 +433,21 @@ impl StateProvider for SqliteProvider {
                     );
                 }
             }
+            // Winning means the stored row is exactly this write — no
+            // read-back.
+            return Ok(step_outcome_from(
+                &self.serializer,
+                Some(self.serializer.name()),
+                output_col.as_deref(),
+                error_col.as_deref(),
+            )?
+            .unwrap_or(StepOutcome::Output(Value::Null)));
         }
 
+        // Someone else's row is already at this position: read it to classify.
+        // Identical content and start instant means a replay or a retry of
+        // this same logical write — adopt it. Anything else is a live rival
+        // execution (or a non-deterministic function, when the name differs).
         let row = sqlx::query(
             "SELECT function_name, output, error, serialization, started_at_epoch_ms
              FROM operation_outputs
@@ -442,21 +457,15 @@ impl StateProvider for SqliteProvider {
         .bind(seq)
         .fetch_one(&self.pool)
         .await?;
-        if !won {
-            // Someone else's row is already at this position. Identical content
-            // and start instant means a replay or a retry of this same logical
-            // write — adopt it. Anything else is a live rival execution (or a
-            // non-deterministic function, when the name differs).
-            let stored_name: String = row.get("function_name");
-            if stored_name != name {
-                return Err(Error::unexpected_step(workflow_id, seq, name, stored_name));
-            }
-            let same_write = row.get::<Option<String>, _>("output") == output_col
-                && row.get::<Option<String>, _>("error") == error_col
-                && row.get::<Option<i64>, _>("started_at_epoch_ms") == started_at_ms;
-            if !same_write {
-                return Err(Error::WorkflowConflict(workflow_id.to_string()));
-            }
+        let stored_name: String = row.get("function_name");
+        if stored_name != name {
+            return Err(Error::unexpected_step(workflow_id, seq, name, stored_name));
+        }
+        let same_write = row.get::<Option<String>, _>("output") == output_col
+            && row.get::<Option<String>, _>("error") == error_col
+            && row.get::<Option<i64>, _>("started_at_epoch_ms") == started_at_ms;
+        if !same_write {
+            return Err(Error::WorkflowConflict(workflow_id.to_string()));
         }
         Ok(step_outcome_from(
             &self.serializer,
