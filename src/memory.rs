@@ -1,11 +1,11 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, encode_roles, is_terminal, DequeueRequest, ExportedWorkflow,
-    ForkParams, ListFilter, NotificationInfo, RecordedStep, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
-    STREAM_CLOSED_SENTINEL,
+    ForkParams, ListFilter, NotificationInfo, RecordedStep, RecoveryClaim, RecoveryClaimRequest,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
@@ -131,14 +131,24 @@ impl StateProvider for InMemoryProvider {
         status: &str,
         output: Option<&Value>,
         error: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut g = self.inner.lock().await;
         if let Some(row) = g.workflows.get_mut(id) {
-            // A workflow cancelled during its final step must stay cancelled: a
-            // SUCCESS/ERROR completion is not allowed to overwrite a CANCELLED row.
-            let is_completion = status == STATUS_SUCCESS || status == STATUS_ERROR;
-            if is_completion && row.status == STATUS_CANCELLED {
-                return Err(Error::Cancelled(id.to_string()));
+            // Terminal writes are guarded (see the trait doc): an outcome or a
+            // recovery parking lands only on a PENDING row, and a cancellation
+            // never overwrites a completed one.
+            let allowed = match status {
+                STATUS_SUCCESS | STATUS_ERROR | STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
+                    row.status == STATUS_PENDING
+                }
+                STATUS_CANCELLED => !matches!(
+                    row.status.as_str(),
+                    STATUS_SUCCESS | STATUS_ERROR | STATUS_CANCELLED
+                ),
+                _ => true,
+            };
+            if !allowed {
+                return Ok(false);
             }
             row.status = status.to_string();
             if let Some(o) = output {
@@ -155,8 +165,9 @@ impl StateProvider for InMemoryProvider {
                 row.dedup_id = None;
             }
             row.updated_at = now;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
@@ -169,6 +180,7 @@ impl StateProvider for InMemoryProvider {
             }))
     }
 
+    #[allow(clippy::too_many_arguments)] // one argument per checkpoint column
     async fn record_step_result(
         &self,
         workflow_id: &str,
@@ -177,6 +189,7 @@ impl StateProvider for InMemoryProvider {
         value: Value,
         error: Option<&str>,
         started_at_ms: Option<i64>,
+        executor_id: Option<&str>,
     ) -> Result<StepOutcome> {
         let mut g = self.inner.lock().await;
         // A failure records its error with no output; a success records the
@@ -185,18 +198,45 @@ impl StateProvider for InMemoryProvider {
             Some(e) => (None, Some(e.to_string())),
             None => (Some(value), None),
         };
-        let row = g
-            .steps
-            .entry((workflow_id.to_string(), seq))
-            .or_insert_with(|| StepRow {
+        let key = (workflow_id.to_string(), seq);
+        if let Some(row) = g.steps.get(&key) {
+            // Someone else's row is already at this position. Identical content
+            // and start instant means a replay or a retry of this same logical
+            // write — adopt it. Anything else is a live rival execution (or a
+            // non-deterministic function, when the name differs).
+            if row.name != name {
+                return Err(Error::unexpected_step(workflow_id, seq, name, &row.name));
+            }
+            let same_write = row.output == output
+                && row.error == error_field
+                && row.started_at_ms == started_at_ms;
+            if !same_write {
+                return Err(Error::WorkflowConflict(workflow_id.to_string()));
+            }
+            return Ok(step_row_outcome(row));
+        }
+        g.steps.insert(
+            key.clone(),
+            StepRow {
                 name: name.to_string(),
                 output,
                 error: error_field,
                 child_workflow_id: None,
                 started_at_ms,
                 completed_at_ms: Some(Utc::now().timestamp_millis()),
-            });
-        Ok(step_row_outcome(row))
+            },
+        );
+        // Winning the checkpoint proves this executor is the one actually
+        // running the workflow; refresh the row's executor_id so it reports
+        // that.
+        if let Some(executor) = executor_id {
+            if let Some(wf) = g.workflows.get_mut(workflow_id) {
+                if wf.executor_id != executor {
+                    wf.executor_id = executor.to_string();
+                }
+            }
+        }
+        Ok(step_row_outcome(&g.steps[&key]))
     }
 
     async fn run_transaction_step(
@@ -967,19 +1007,40 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
-    async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32> {
+    async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim> {
         let mut g = self.inner.lock().await;
-        let Some(row) = g.workflows.get_mut(id) else {
-            return Ok(0);
+        let Some(row) = g.workflows.get_mut(req.workflow_id) else {
+            return Ok(RecoveryClaim::Lost);
         };
+        // The compare-and-set predicate: the row is still PENDING, still owned
+        // by the executor the sweep observed, and still at the attempt count it
+        // observed. Any interleaved transition loses the claim.
+        if row.status != STATUS_PENDING
+            || row.executor_id != req.expected_executor
+            || row.recovery_attempts != req.expected_attempts
+        {
+            return Ok(RecoveryClaim::Lost);
+        }
+        let now = Utc::now();
         row.recovery_attempts += 1;
+        row.updated_at = now;
         let attempts = row.recovery_attempts;
-        if attempts > max {
+        Ok(if attempts > req.max_attempts {
+            // This dispatch would exceed the cap: park the row instead.
             row.status = STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string();
             row.dedup_id = None;
-            row.updated_at = Utc::now();
-        }
-        Ok(attempts)
+            RecoveryClaim::Parked { attempts }
+        } else if req.requeue {
+            // Give the row back to its queue; the dispatcher's own atomic
+            // ENQUEUED → PENDING claim admits exactly one runner.
+            row.status = STATUS_ENQUEUED.to_string();
+            row.started_at_ms = None;
+            RecoveryClaim::Requeued
+        } else {
+            // Claim it for direct re-dispatch by this executor.
+            row.executor_id = req.new_executor.to_string();
+            RecoveryClaim::Claimed { attempts }
+        })
     }
 
     async fn record_child_workflow(

@@ -40,6 +40,9 @@ pub enum ErrorCode {
     /// A replay found a different step recorded at this position — the
     /// workflow function is non-deterministic.
     UnexpectedStep,
+    /// Another live execution of the same workflow id checkpointed this step
+    /// first; this execution no longer owns the workflow.
+    WorkflowConflict,
     /// An error raised by user code.
     Application,
 }
@@ -139,6 +142,17 @@ pub enum Error {
         /// The operation recorded at this position by the original execution.
         recorded: String,
     },
+
+    /// Another live execution of workflow `{0}` checkpointed the step this
+    /// execution was about to record: two executions of the same workflow id
+    /// were running at once (e.g. overlapping recovery sweeps), and this one
+    /// lost the checkpoint race. The losing execution must stop executing and
+    /// wait for the winner's recorded outcome instead.
+    #[error(
+        "workflow `{0}` is being executed concurrently by another process; \
+         this execution lost the step-checkpoint race"
+    )]
+    WorkflowConflict(String),
 
     /// An error raised by user code inside a step or workflow, with an optional
     /// underlying `source` so `{:?}` and error-reporting tools can walk the
@@ -259,6 +273,7 @@ impl Error {
             Error::ConflictingRegistration(_) => ErrorCode::ConflictingRegistration,
             Error::Timeout => ErrorCode::Timeout,
             Error::UnexpectedStep { .. } => ErrorCode::UnexpectedStep,
+            Error::WorkflowConflict(_) => ErrorCode::WorkflowConflict,
             Error::App { .. } | Error::Portable(_) => ErrorCode::Application,
         }
     }

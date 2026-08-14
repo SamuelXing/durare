@@ -871,6 +871,7 @@ impl DurableContext {
                             value,
                             None,
                             Some(started),
+                            Some(self.runtime.executor_id()),
                         )
                         .await?;
                     return outcome_value(stored);
@@ -1129,6 +1130,7 @@ impl DurableContext {
                     Value::Null,
                     Some(err_text),
                     Some(started),
+                    Some(self.runtime.executor_id()),
                 )
                 .await?;
             return outcome_value(stored);
@@ -1141,7 +1143,15 @@ impl DurableContext {
         let value = crate::serialize::decode(&ser, row.serialization.as_deref(), output)?;
         let stored = self
             .provider
-            .record_step_result(&self.workflow_id, seq, name, value, None, Some(started))
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                name,
+                value,
+                None,
+                Some(started),
+                Some(self.runtime.executor_id()),
+            )
             .await?;
         outcome_value(stored)
     }
@@ -1281,7 +1291,15 @@ impl DurableContext {
         let json = serde_json::to_value(&result)?;
         let outcome = self
             .provider
-            .record_step_result(&self.workflow_id, seq, name, json, None, started_at_ms)
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                name,
+                json,
+                None,
+                started_at_ms,
+                Some(self.runtime.executor_id()),
+            )
             .await?;
         outcome_value(outcome)
     }
@@ -1308,6 +1326,7 @@ impl DurableContext {
                 Value::Null,
                 Some(&encoded),
                 started_at_ms,
+                Some(self.runtime.executor_id()),
             )
             .await?;
         match outcome {
@@ -1425,6 +1444,7 @@ impl DurableContext {
                         serde_json::to_value(proposed)?,
                         None,
                         None,
+                        Some(self.runtime.executor_id()),
                     )
                     .await?;
                 outcome_value(outcome)
@@ -1508,6 +1528,7 @@ impl DurableContext {
                         serde_json::to_value(&value)?,
                         None,
                         None,
+                        Some(self.runtime.executor_id()),
                     )
                     .await?;
                 outcome_value(outcome)
@@ -1550,7 +1571,15 @@ impl DurableContext {
             .insert_notification(destination_id, topic, serde_json::to_value(message)?, None)
             .await?;
         self.provider
-            .record_step_result(&self.workflow_id, seq, "DBOS.send", Value::Null, None, None)
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                "DBOS.send",
+                Value::Null,
+                None,
+                None,
+                Some(self.runtime.executor_id()),
+            )
             .await?;
         Ok(())
     }
@@ -1590,6 +1619,7 @@ impl DurableContext {
                 Value::Null,
                 None,
                 None,
+                Some(self.runtime.executor_id()),
             )
             .await?;
         Ok(())
@@ -1623,6 +1653,7 @@ impl DurableContext {
                 Value::Null,
                 None,
                 None,
+                Some(self.runtime.executor_id()),
             )
             .await?;
         Ok(())
@@ -1693,6 +1724,7 @@ impl DurableContext {
                         Value::Null,
                         None,
                         None,
+                        Some(self.runtime.executor_id()),
                     )
                     .await?;
                 return Ok(None);
@@ -1743,6 +1775,7 @@ impl DurableContext {
                 Value::Null,
                 None,
                 None,
+                Some(self.runtime.executor_id()),
             )
             .await?;
         Ok(())
@@ -1795,7 +1828,15 @@ impl DurableContext {
             {
                 let outcome = self
                     .provider
-                    .record_step_result(&self.workflow_id, seq, "DBOS.getEvent", value, None, None)
+                    .record_step_result(
+                        &self.workflow_id,
+                        seq,
+                        "DBOS.getEvent",
+                        value,
+                        None,
+                        None,
+                        Some(self.runtime.executor_id()),
+                    )
                     .await?;
                 return Ok(Some(outcome_value(outcome)?));
             }
@@ -1814,6 +1855,7 @@ impl DurableContext {
                         Value::Null,
                         None,
                         None,
+                        Some(self.runtime.executor_id()),
                     )
                     .await?;
                 return Ok(None);
@@ -1880,6 +1922,7 @@ impl DurableContext {
                 Value::Null,
                 None,
                 None,
+                Some(self.runtime.executor_id()),
             )
             .await?;
         Ok(())
@@ -1909,6 +1952,7 @@ impl DurableContext {
                 Value::Null,
                 None,
                 None,
+                Some(self.runtime.executor_id()),
             )
             .await?;
         Ok(())

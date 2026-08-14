@@ -230,10 +230,10 @@ pub use memory::InMemoryProvider;
 pub use postgres::PostgresProvider;
 pub use provider::{
     is_terminal, ChangeWait, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
-    NotificationInsert, ProviderIdentity, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    NotificationInsert, ProviderIdentity, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use schedule::{

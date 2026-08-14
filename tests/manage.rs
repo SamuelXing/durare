@@ -128,7 +128,15 @@ async fn cancel_then_resume() -> Result<()> {
         ))
         .await?;
     provider
-        .record_step_result("wf-cancel", 0, "first", serde_json::json!(1), None, None)
+        .record_step_result(
+            "wf-cancel",
+            0,
+            "first",
+            serde_json::json!(1),
+            None,
+            None,
+            None,
+        )
         .await?;
     engine.cancel_workflow("wf-cancel").await?;
     assert_eq!(
@@ -400,14 +408,25 @@ async fn recover_caps_attempts() -> Result<()> {
         ))
         .await?;
 
-    // Bump the recovery_attempts to the cap, then set back to PENDING so the
-    // next recover() pushes it over the edge.
-    for _ in 0..100 {
-        provider.bump_recovery_attempts("wf-loop", 100).await?;
+    // Drive recovery_attempts to the cap with repeated claims (each one is
+    // what a recovery sweep would do), so the next recover() pushes the row
+    // over the edge.
+    for i in 0..100 {
+        let claim = provider
+            .claim_for_recovery(&durare::RecoveryClaimRequest {
+                workflow_id: "wf-loop",
+                expected_executor: "",
+                expected_attempts: i,
+                new_executor: "",
+                max_attempts: 100,
+                requeue: false,
+            })
+            .await?;
+        assert!(
+            matches!(claim, durare::RecoveryClaim::Claimed { .. }),
+            "seed claim {i} should land, got {claim:?}"
+        );
     }
-    provider
-        .set_workflow_status("wf-loop", STATUS_PENDING, None, None)
-        .await?;
 
     engine.recover().await?;
     assert_eq!(
@@ -1070,7 +1089,15 @@ async fn renamed_step_on_replay_fails_as_unexpected_step() -> Result<()> {
         ))
         .await?;
     provider
-        .record_step_result("wf-evolved", 0, "first", serde_json::json!(1), None, None)
+        .record_step_result(
+            "wf-evolved",
+            0,
+            "first",
+            serde_json::json!(1),
+            None,
+            None,
+            None,
+        )
         .await?;
 
     let h = engine.resume_workflow::<i64>("wf-evolved").await?;

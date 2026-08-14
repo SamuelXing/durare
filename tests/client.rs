@@ -428,7 +428,7 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
         ))
         .await?;
     provider
-        .record_step_result("w", 0, "s0", serde_json::json!(1), None, None)
+        .record_step_result("w", 0, "s0", serde_json::json!(1), None, None, None)
         .await?;
     let client = Client::new(provider.clone());
     client.cancel_workflow("w").await?;
@@ -738,7 +738,7 @@ async fn client_enqueue_dedup_and_app_version() -> Result<()> {
 /// the same id can be enqueued again afterward.
 #[tokio::test]
 async fn client_dedup_slot_frees_on_completion() -> Result<()> {
-    use durare::{StateProvider, WorkflowHandle, STATUS_SUCCESS};
+    use durare::{StateProvider, WorkflowHandle, STATUS_PENDING, STATUS_SUCCESS};
     let provider = Arc::new(InMemoryProvider::new());
     let client = Client::new(provider.clone());
 
@@ -762,7 +762,12 @@ async fn client_dedup_slot_frees_on_completion() -> Result<()> {
         .await
         .is_err());
 
-    // Completing the holder releases the slot.
+    // Completing the holder releases the slot. A real run claims the row
+    // (ENQUEUED → PENDING) before completing it, and the terminal write is
+    // guarded to PENDING rows — walk the same lifecycle here.
+    provider
+        .set_workflow_status(first.id(), STATUS_PENDING, None, None)
+        .await?;
     provider
         .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
         .await?;
@@ -795,11 +800,13 @@ async fn client_completion_cannot_overwrite_cancelled() -> Result<()> {
         .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
         .await?;
 
-    // A completion racing the cancellation must error, not flip it to SUCCESS.
-    let late = provider
+    // A completion racing the cancellation must not land — the write is
+    // guarded to PENDING rows, so the late writer is told to adopt the
+    // recorded outcome instead of flipping the row to SUCCESS.
+    let landed = provider
         .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
-        .await;
-    assert!(late.is_err(), "completing a cancelled workflow must error");
+        .await?;
+    assert!(!landed, "completing a cancelled workflow must not land");
 
     let row = provider.get_workflow_status(h.id()).await?.unwrap();
     assert_eq!(row.status, STATUS_CANCELLED);

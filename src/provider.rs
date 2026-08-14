@@ -1248,6 +1248,55 @@ impl std::fmt::Debug for ProviderIdentity {
     }
 }
 
+/// One recovery sweep's atomic claim on one `PENDING` workflow row, expressed
+/// as a compare-and-set against the row as the sweep observed it. See
+/// [`StateProvider::claim_for_recovery`].
+#[derive(Clone, Copy, Debug)]
+pub struct RecoveryClaimRequest<'a> {
+    /// The workflow to claim.
+    pub workflow_id: &'a str,
+    /// `executor_id` as observed when the sweep listed the row — the executor
+    /// being declared dead.
+    pub expected_executor: &'a str,
+    /// `recovery_attempts` as observed when the sweep listed the row. Doubles
+    /// as the fencing counter: every claim increments it, so a rival sweep's
+    /// claim (even one recovering the *same* executor id) invalidates this
+    /// request.
+    pub expected_attempts: i32,
+    /// The claiming executor, stamped on the row when the claim succeeds.
+    pub new_executor: &'a str,
+    /// The recovery-attempt cap; a claim that would exceed it parks the row.
+    pub max_attempts: i32,
+    /// `true` for a workflow that was claimed off a queue before the crash:
+    /// release it back to `ENQUEUED` (the queue dispatcher re-runs it under its
+    /// concurrency limits) instead of claiming it for direct re-dispatch.
+    pub requeue: bool,
+}
+
+/// The outcome of [`StateProvider::claim_for_recovery`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryClaim {
+    /// This sweep owns the run: the row is `PENDING` under the claimant's
+    /// executor id at the returned attempt count. Dispatch it.
+    Claimed {
+        /// `recovery_attempts` after the claim's increment.
+        attempts: i32,
+    },
+    /// The row went back to its queue as `ENQUEUED`; the queue's own atomic
+    /// claim will admit exactly one runner. Nothing to dispatch here.
+    Requeued,
+    /// The claim would have exceeded the attempt cap; the row is now parked in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Nothing to dispatch.
+    Parked {
+        /// `recovery_attempts` after the parking increment.
+        attempts: i32,
+    },
+    /// The row no longer matches what the sweep observed — a rival sweep
+    /// claimed it, or it completed, was cancelled, or was resumed. Another
+    /// process is responsible for it now; do nothing.
+    Lost,
+}
+
 /// Postgres implementation and an in-memory one; a DynamoDB / Aurora DSQL
 /// implementation can be added later **without touching the engine**.
 ///
@@ -1337,14 +1386,33 @@ pub trait StateProvider: Send + Sync {
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>>;
 
     /// Transition a workflow to a new status, optionally writing its terminal
-    /// `output` or `error`. Bumps `updated_at`.
+    /// `output` or `error`. Bumps `updated_at`. Returns whether the write
+    /// landed.
+    ///
+    /// Terminal targets are guarded — a run owns its workflow's outcome exactly
+    /// as long as the row says that run is what the workflow is doing:
+    ///
+    /// - `SUCCESS` / `ERROR` apply only to a `PENDING` row. `false` means the
+    ///   row was cancelled, parked past its recovery cap, already terminal,
+    ///   handed to another execution (e.g. `ENQUEUED` by a concurrent resume),
+    ///   or gone entirely — the caller must adopt the recorded outcome instead
+    ///   of reporting its own.
+    /// - `CANCELLED` applies to any row not already `SUCCESS`, `ERROR`, or
+    ///   `CANCELLED` (a completed workflow cannot be retroactively cancelled).
+    /// - `MAX_RECOVERY_ATTEMPTS_EXCEEDED` applies only to a `PENDING` row.
+    ///
+    /// Non-terminal targets are unguarded and return `true` iff the row exists.
+    ///
+    /// (This mirrors the DBOS SDKs' outcome guard; note it does not detect two
+    /// live executions both at `PENDING` — the step-checkpoint conflict in
+    /// [`record_step_result`](Self::record_step_result) covers that window.)
     async fn set_workflow_status(
         &self,
         id: &str,
         status: &str,
         output: Option<&Value>,
         error: Option<&str>,
-    ) -> Result<()>;
+    ) -> Result<bool>;
 
     /// Return a previously checkpointed step — its recorded name plus outcome
     /// (output or recorded failure) — or `None` if the step has not run. The
@@ -1357,21 +1425,38 @@ pub trait StateProvider: Send + Sync {
     /// (stored in the `error` column, output left null). A step records exactly
     /// one of the two.
     ///
-    /// Returns the **canonical** stored outcome: if a concurrent/duplicate
-    /// execution already wrote this step, the previously-stored outcome wins and
-    /// is returned, guaranteeing every caller observes the same result (so a step
-    /// that another execution recorded as failed is observed as failed, and vice
-    /// versa).
+    /// Returns the **canonical** stored outcome. If a row is already recorded
+    /// at this position, what happens depends on how it compares to this write:
+    ///
+    /// - **Identical** (same name, same output/error, same `started_at_ms`):
+    ///   this is a replay or a retry of the same logical write — the stored
+    ///   outcome is returned, so every caller observes the same result.
+    /// - **Different name**: the workflow function is non-deterministic —
+    ///   [`Error::UnexpectedStep`](crate::Error::UnexpectedStep).
+    /// - **Same name, different content or start time**: another *live*
+    ///   execution of this workflow checkpointed the step first —
+    ///   [`Error::WorkflowConflict`](crate::Error::WorkflowConflict). The
+    ///   caller must stop executing and adopt the recorded workflow outcome;
+    ///   continuing would double every remaining step's side effects.
+    ///
+    /// When this call **wins** the checkpoint (its insert lands) and
+    /// `executor_id` is set, the workflow row's `executor_id` is refreshed to
+    /// it, best-effort — checkpointing proves this executor is the one actually
+    /// running the workflow, and the row should report that. The refresh grants
+    /// no exclusivity and never fails the checkpoint.
     ///
     /// `started_at_ms` is when the step's work began (epoch ms); the
     /// implementation stamps `completed_at` itself as the time of the write.
     /// `None` records no start time — used for instantaneous operations (sends,
     /// event sets, sleep markers) that have no duration; such rows are excluded
-    /// from step duration aggregates.
+    /// from step duration aggregates. (With no start time, the conflict
+    /// comparison above falls back to name + content alone: identical
+    /// instantaneous writes converge rather than conflict.)
     ///
     /// Durable sleep is built on this too: the wake instant is recorded as an
     /// ordinary step (`DBOS.sleep`) in `operation_outputs` — there is no
     /// separate timers table.
+    #[allow(clippy::too_many_arguments)] // one argument per checkpoint column
     async fn record_step_result(
         &self,
         workflow_id: &str,
@@ -1380,6 +1465,7 @@ pub trait StateProvider: Send + Sync {
         value: Value,
         error: Option<&str>,
         started_at_ms: Option<i64>,
+        executor_id: Option<&str>,
     ) -> Result<StepOutcome>;
 
     /// Run a transactional step: `body`'s SQL writes and this step's
@@ -1625,10 +1711,37 @@ pub trait StateProvider: Send + Sync {
     /// Errors if the original does not exist.
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()>;
 
-    /// Atomically increment a workflow's `recovery_attempts` and return the new
-    /// value. If it exceeds `max`, the workflow is parked in
-    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` instead of being recovered again.
-    async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32>;
+    /// Atomically claim one `PENDING` workflow for a recovery sweep — or report
+    /// that another process got there first.
+    ///
+    /// The claim is a compare-and-set against the row *as the sweep observed
+    /// it*: it applies only while the row is still `PENDING`, still owned by
+    /// [`expected_executor`](RecoveryClaimRequest::expected_executor), and still
+    /// at [`expected_attempts`](RecoveryClaimRequest::expected_attempts). Any
+    /// interleaved transition — a rival sweep's claim (which bumps the attempt
+    /// count), a completion, a cancellation, a resume — makes the predicate
+    /// miss, and the caller gets [`RecoveryClaim::Lost`]: at most one process
+    /// dispatches each pending workflow, no matter how many recover the same
+    /// dead executor at once.
+    ///
+    /// One caveat: a resume *resets* the attempt counter, so a cancel-then-
+    /// resume can reconstruct the exact triple a sweep observed before either
+    /// happened, and a claim that stayed in flight across both would land on
+    /// the resumed run. The window requires a sweep stalled across two operator
+    /// actions; the terminal-write guard and the step-checkpoint conflict in
+    /// [`record_step_result`](Self::record_step_result) contain the doubled
+    /// execution if it ever occurs.
+    ///
+    /// A successful claim increments `recovery_attempts` and, depending on the
+    /// request, either re-stamps `executor_id` with the claimant
+    /// ([`RecoveryClaim::Claimed`] — the caller re-runs the workflow), or
+    /// releases the row back to its queue as `ENQUEUED`
+    /// ([`RecoveryClaim::Requeued`] — the queue's own atomic
+    /// `ENQUEUED → PENDING` claim admits exactly one runner). A claim that
+    /// would push the attempt count past
+    /// [`max_attempts`](RecoveryClaimRequest::max_attempts) instead parks the
+    /// row in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` ([`RecoveryClaim::Parked`]).
+    async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim>;
 
     /// Idempotently record that `parent_id`'s step `seq` started child workflow
     /// `child_id`. Stored as an `operation_outputs` checkpoint carrying the child

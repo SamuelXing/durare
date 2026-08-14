@@ -1816,7 +1816,7 @@ async fn sqlite_enqueue_dedup_return_existing() -> Result<()> {
 /// the same id can be enqueued again afterward.
 #[tokio::test]
 async fn sqlite_dedup_slot_frees_on_completion() -> Result<()> {
-    use durare::{Client, StateProvider, WorkflowHandle};
+    use durare::{Client, StateProvider, WorkflowHandle, STATUS_PENDING};
     let (url, path) = temp_db_url("dedupfree");
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     provider.init().await?;
@@ -1841,7 +1841,12 @@ async fn sqlite_dedup_slot_frees_on_completion() -> Result<()> {
         .await
         .is_err());
 
-    // Completing d1 nulls its deduplication_id, freeing the slot.
+    // Completing d1 nulls its deduplication_id, freeing the slot. A real run
+    // claims the row (ENQUEUED → PENDING) before completing it, and the
+    // terminal write is guarded to PENDING rows — walk the same lifecycle.
+    provider
+        .set_workflow_status(first.id(), STATUS_PENDING, None, None)
+        .await?;
     provider
         .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
         .await?;
@@ -1879,11 +1884,13 @@ async fn sqlite_completion_cannot_overwrite_cancelled() -> Result<()> {
         .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
         .await?;
 
-    // A completion racing the cancellation must error, not flip it to SUCCESS.
-    let late = provider
+    // A completion racing the cancellation must not land — the write is
+    // guarded to PENDING rows, so the late writer is told to adopt the
+    // recorded outcome instead of flipping the row to SUCCESS.
+    let landed = provider
         .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
-        .await;
-    assert!(late.is_err(), "completing a cancelled workflow must error");
+        .await?;
+    assert!(!landed, "completing a cancelled workflow must not land");
 
     let row = provider.get_workflow_status(h.id()).await?.unwrap();
     assert_eq!(row.status, STATUS_CANCELLED);
