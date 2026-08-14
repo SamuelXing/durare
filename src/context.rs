@@ -951,6 +951,15 @@ impl DurableContext {
                         return Err(Error::app(TX_TERMINATED_MSG));
                     }
                 }
+                // A read-only body writes nothing, so there is nothing for
+                // the witness row to witness — and Postgres rejects any write
+                // inside a read-only transaction. Commit the read; the caller
+                // checkpoints to the system database ordinary-step-style
+                // (at-least-once is harmless for a pure read).
+                if opts.read_only {
+                    ds.commit(tx).await?;
+                    return Ok(DsAttempt::Committed(value));
+                }
                 let encoded = ser.encode(&value)?;
                 if !ds
                     .insert_completion(
@@ -1046,7 +1055,28 @@ impl DurableContext {
                 }
             };
             match outcome {
-                Ok(value) => return Ok(serde_json::from_value(value)?),
+                Ok(value) => {
+                    // The read-only fast path skipped the in-transaction
+                    // checkpoint (a read-only transaction cannot write one);
+                    // record it now, ordinary-step-style — the canonical
+                    // stored outcome wins if a rival got there first.
+                    if opts.read_only {
+                        let stored = self
+                            .provider
+                            .record_step_result(
+                                &self.workflow_id,
+                                seq,
+                                &opts.name,
+                                value,
+                                None,
+                                Some(started),
+                                Some(self.runtime.executor_id()),
+                            )
+                            .await?;
+                        return outcome_value(stored);
+                    }
+                    return Ok(serde_json::from_value(value)?);
+                }
                 Err(e) if opts.should_user_retry(&e, user_attempt) => {
                     let delay = opts.user_retry_backoff(user_attempt);
                     tracing::warn!(
@@ -1102,6 +1132,14 @@ impl DurableContext {
                         let _ = ds.rollback(tx).await;
                         return Err(Error::app(TX_TERMINATED_MSG));
                     }
+                }
+                // A read-only body has no writes to make atomic with the
+                // checkpoint — and Postgres rejects the insert in a read-only
+                // transaction. Commit the read; the caller checkpoints
+                // afterwards, ordinary-step-style.
+                if opts.read_only {
+                    ds.commit(tx).await?;
+                    return Ok(DsAttempt::Committed(value));
                 }
                 let encoded = ser.encode(&value)?;
                 if !ds
