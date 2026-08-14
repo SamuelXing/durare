@@ -1719,10 +1719,18 @@ pub trait StateProvider: Send + Sync {
     /// [`expected_executor`](RecoveryClaimRequest::expected_executor), and still
     /// at [`expected_attempts`](RecoveryClaimRequest::expected_attempts). Any
     /// interleaved transition — a rival sweep's claim (which bumps the attempt
-    /// count), a completion, a cancellation, a resume (which resets attempts) —
-    /// makes the predicate miss, and the caller gets
-    /// [`RecoveryClaim::Lost`]: at most one process dispatches each pending
-    /// workflow, no matter how many recover the same dead executor at once.
+    /// count), a completion, a cancellation, a resume — makes the predicate
+    /// miss, and the caller gets [`RecoveryClaim::Lost`]: at most one process
+    /// dispatches each pending workflow, no matter how many recover the same
+    /// dead executor at once.
+    ///
+    /// One caveat: a resume *resets* the attempt counter, so a cancel-then-
+    /// resume can reconstruct the exact triple a sweep observed before either
+    /// happened, and a claim that stayed in flight across both would land on
+    /// the resumed run. The window requires a sweep stalled across two operator
+    /// actions; the terminal-write guard and the step-checkpoint conflict in
+    /// [`record_step_result`](Self::record_step_result) contain the doubled
+    /// execution if it ever occurs.
     ///
     /// A successful claim increments `recovery_attempts` and, depending on the
     /// request, either re-stamps `executor_id` with the claimant
