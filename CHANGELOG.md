@@ -8,6 +8,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `TransactionOptions::read_only(true)` now works on Postgres. Every
+  transactional path used to insert its durability row inside the read-only
+  transaction, which Postgres rejects (`25006`) — so the option failed
+  unconditionally there while SQLite silently accepted it. A read-only body
+  has no writes to make atomic with a checkpoint, so the read now commits
+  first (releasing its snapshot) and the checkpoint is recorded afterwards,
+  ordinary-step-style: at-least-once execution is harmless for a pure read,
+  and the recorded outcome is durable and replayable. Same semantics on both
+  backends and on all three transactional paths.
+
 - Transactional steps now classify a lost checkpoint race the same way plain
   steps do. Before, a `ctx.transaction` body whose checkpoint insert collided
   with an already-recorded row **committed its writes anyway** — applying the
