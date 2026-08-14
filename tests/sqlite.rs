@@ -2740,6 +2740,14 @@ async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
         assert_eq!(engine.recover().await?, 1, "the PENDING workflow recovers");
+        // The re-dispatched run completes on a background task; wait for it.
+        for _ in 0..250 {
+            let status = provider.get_workflow_status(id).await?.unwrap().status;
+            if status == STATUS_SUCCESS {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     // The body re-executed — a genuine replay, not an OAOO short-circuit...

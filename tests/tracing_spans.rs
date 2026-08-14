@@ -7,8 +7,8 @@
 //! capture sees all spans without touching global state.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
-    WorkflowQueue,
+    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
+    WorkflowOptions, WorkflowQueue,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -337,6 +337,22 @@ async fn recovered_run_marks_replayed_steps() -> Result<()> {
         .recover_pending_for(&["obs-exec-a".to_string()])
         .await?;
     assert_eq!(recovered, vec!["wf-obs-rec".to_string()]);
+    // The re-dispatched run completes on a background task; wait for the
+    // terminal status before asserting on the captured spans.
+    {
+        let probe = SqliteProvider::connect(&url).await?;
+        for _ in 0..250 {
+            let status = probe
+                .get_workflow_status("wf-obs-rec")
+                .await?
+                .unwrap()
+                .status;
+            if status != durare::STATUS_PENDING {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     let firsts: Vec<_> = cap
         .named("step")

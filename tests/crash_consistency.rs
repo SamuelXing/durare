@@ -191,9 +191,18 @@ async fn sweep(backend: Backend) -> Result<()> {
             recovered.contains(&wf_id),
             "{crash:?}: recovery takes over the crashed executor's run"
         );
+        // Recovery dispatches the run to a background task; wait for it to
+        // settle before asserting on its outcome and effect counts.
+        let mut status = probe.get_workflow_status(&wf_id).await?.unwrap().status;
+        for _ in 0..250 {
+            if status != durare::STATUS_PENDING {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            status = probe.get_workflow_status(&wf_id).await?.unwrap().status;
+        }
         assert_eq!(
-            probe.get_workflow_status(&wf_id).await?.unwrap().status,
-            STATUS_SUCCESS,
+            status, STATUS_SUCCESS,
             "{crash:?}: the recovered run completes"
         );
 

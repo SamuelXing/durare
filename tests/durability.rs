@@ -304,20 +304,25 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         "a panicked workflow is left recoverable, not terminally failed"
     );
 
-    // recover() re-runs it; the second attempt does not panic and completes.
+    // recover() re-dispatches it in the background; the second attempt does
+    // not panic and completes. Poll for the terminal status.
     assert!(
         engine.recover().await? >= 1,
         "recovery picks up the panicked run"
     );
-    assert_eq!(
-        provider
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = provider
             .get_workflow_status("wf-panic")
             .await?
             .unwrap()
-            .status,
-        STATUS_SUCCESS,
-        "the recovered run completes"
-    );
+            .status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, STATUS_SUCCESS, "the recovered run completes");
     assert_eq!(
         ATTEMPTS.load(Ordering::SeqCst),
         2,
@@ -453,15 +458,23 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
         "recovery is off, so the workflow stays pending"
     );
 
-    // An explicit recover() still works.
+    // An explicit recover() still works; it dispatches in the background, so
+    // poll for the terminal status.
     assert!(engine.recover().await? >= 1, "manual recovery picks it up");
-    assert_eq!(
-        provider
+    let mut status = String::new();
+    for _ in 0..100 {
+        status = provider
             .get_workflow_status("wf-opt-out")
             .await?
             .unwrap()
-            .status,
-        STATUS_SUCCESS,
+            .status;
+        if status == STATUS_SUCCESS {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        status, STATUS_SUCCESS,
         "the manually recovered run completes"
     );
     Ok(())

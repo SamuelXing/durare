@@ -1548,13 +1548,13 @@ impl DurableEngine {
         }
 
         // Dispatch the recovery snapshot taken above on a background task, so
-        // launch stays prompt — a recovered workflow runs to completion, which
-        // would otherwise block startup for its full duration. Spawned through
-        // the tracker (non-queued recovered runs execute inline within it, on no
-        // tracked task of their own), so `shutdown` waits the whole recovery out;
-        // once shutdown begins, the dispatch loop stops starting workflows it has
-        // not reached yet. (`spawn` is not an await, so holding the dispatcher
-        // lock above across it is fine.)
+        // launch stays prompt. The dispatch loop is tracked, and every
+        // recovered run it starts is spawned through the tracker as its own
+        // task — `shutdown` drains recovered runs like any other, and a run
+        // parked on `recv` or a timer stalls neither its siblings nor the
+        // loop. Once shutdown begins, the loop stops starting workflows it
+        // has not reached yet. (`spawn` is not an await, so holding the
+        // dispatcher lock above across it is fine.)
         if !to_recover.is_empty() {
             let rt = rt.clone();
             let max = self.max_recovery_attempts;
@@ -1904,7 +1904,7 @@ impl DurableEngine {
         // On a dedup collision under `ReturnExisting`, hand back the workflow
         // already holding the slot; retry if it was freed between insert and
         // lookup (the slot's owner just completed).
-        let (canonical, queued, _created) = loop {
+        let (canonical, queued, created) = loop {
             match rt
                 .insert_run(&id, name, input_json.clone(), &opts, None, &auth)
                 .await
@@ -1926,8 +1926,16 @@ impl DurableEngine {
             }
         };
 
-        // Terminal already, or owned by a queue: observe via polling.
-        if queued || is_terminal(&canonical.status) {
+        // Terminal already, owned by a queue, or created by an earlier call
+        // (`created == false`): observe via polling. A live `PENDING` run is
+        // never re-executed here — the workflow id is the idempotency key and
+        // its one execution belongs to whoever created it (or to `recover`,
+        // if that owner crashed). Spawning a second execution would race the
+        // first step by step, and two attempts at the same in-progress step
+        // is a doubled effect before either records. The scheduler's tick
+        // path has always applied this exact guard; the direct path now does
+        // too.
+        if queued || !created || is_terminal(&canonical.status) {
             return Ok(WorkflowHandle::polling(id, self.provider.clone()));
         }
 
@@ -2400,19 +2408,23 @@ impl DurableEngine {
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
     }
 
-    /// Re-run every incomplete workflow of this engine's application version,
-    /// resuming each from its checkpoints. Workflows of a different version are
-    /// left alone (version-gated recovery), and a workflow recovered more than
-    /// `max_recovery_attempts` times is parked in
-    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Queued workflows are returned to their
-    /// queue for re-dispatch; the rest are re-run inline.
+    /// Re-dispatch every incomplete workflow of this engine's application
+    /// version, resuming each from its checkpoints **on its own background
+    /// task**. Recovery returns as soon as the runs are dispatched — the way
+    /// the DBOS SDKs hand back handles — so a recovered run parked on `recv`
+    /// or a durable timer never stalls the caller or the runs behind it.
+    /// Workflows of a different version are left alone (version-gated
+    /// recovery), and a workflow recovered more than `max_recovery_attempts`
+    /// times is parked in `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Queued workflows
+    /// are returned to their queue for re-dispatch.
     ///
     /// This is the primary recovery entry point: call it on startup (or on
     /// demand) to resume unfinished work. [`launch`](Self::launch) can do this
     /// for you when you enable
     /// [`recover_on_launch`](EngineConfig::recover_on_launch).
     ///
-    /// Returns the number of workflows that were recovered.
+    /// Returns the number of workflows re-dispatched; their in-flight runs
+    /// drain on [`shutdown`](Self::shutdown) like any other run.
     pub async fn recover(&self) -> Result<usize> {
         Ok(self.recover_pending_for(&[]).await?.len())
     }
@@ -2440,8 +2452,9 @@ impl DurableEngine {
 /// Recover this app version's `PENDING` workflows owned by the given executors
 /// (empty = any), returning the id of each one recovered. Backs
 /// [`DurableEngine::recover_pending_for`] and the background recovery that
-/// [`DurableEngine::launch`] spawns. Runs each recovered workflow to completion;
-/// a workflow that was claimed off a queue goes back on its queue instead.
+/// [`DurableEngine::launch`] spawns. Each recovered workflow resumes on its
+/// own task spawned through the runtime's tracker; a workflow that was claimed
+/// off a queue goes back on its queue instead.
 ///
 /// Split out as a free function so `launch` can spawn it onto a background task
 /// (the engine itself is not `Clone`, but the [`Runtime`] behind it is `Arc`).
@@ -2474,7 +2487,9 @@ pub(crate) async fn list_pending_workflows(
 
 /// Re-dispatch a snapshot of pending workflows: each is bumped past the recovery
 /// cap (parking it if exceeded), re-queued if it was claimed off a queue, or
-/// otherwise re-run to completion.
+/// otherwise resumed **on its own task spawned through the runtime's tracker**
+/// — so recovered runs drain on shutdown like any other run, and one parked on
+/// `recv` or a timer stalls neither its siblings nor the caller.
 ///
 /// Once cancellation is observed, no further workflows are started; the
 /// remainder stays `PENDING` for a later recovery. Only shutdown stops the loop
@@ -2533,21 +2548,23 @@ pub(crate) async fn dispatch_pending_workflows(
             .get(&registry_key(&record.name, record.config_name.as_deref()))
             .cloned()
         {
-            // Best-effort: a workflow that fails again is marked ERROR by
-            // `run_to_completion`; we keep going with the rest.
+            // Each recovered run gets its own tracked task, exactly like a
+            // freshly started one. Running them inline here had two failure
+            // modes the DBOS SDKs don't share: a run parked on `recv` or a
+            // timer stalled every pending workflow behind it in this loop —
+            // and stalled the caller of `recover` for its whole wait — and
+            // shutdown could never drain a recovery that contained one.
+            // Best-effort as before: a workflow that fails again is marked
+            // ERROR by `run_to_completion`.
             let auth = AuthContext::from_status(&record);
             let span = rt.workflow_span(&record.id, &record.name, None, &auth);
-            let _ = run_to_completion(
-                rt.clone(),
-                handler,
-                record.name.clone(),
-                record.id.clone(),
-                record.input.clone(),
-                record.deadline_ms,
-                auth,
-                span,
-            )
-            .await;
+            let task_rt = rt.clone();
+            let (name, id) = (record.name.clone(), record.id.clone());
+            let (input, deadline) = (record.input.clone(), record.deadline_ms);
+            rt.tasks.spawn(async move {
+                let _ = run_to_completion(task_rt, handler, name, id, input, deadline, auth, span)
+                    .await;
+            });
             rt.counters
                 .workflows_recovered
                 .fetch_add(1, Ordering::Relaxed);
