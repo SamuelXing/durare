@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Transactional steps now classify a lost checkpoint race the same way plain
+  steps do. Before, a `ctx.transaction` body whose checkpoint insert collided
+  with an already-recorded row **committed its writes anyway** — applying the
+  body a second time — and the datasource paths silently replayed the stored
+  outcome and kept executing, doubling every later step's side effects. Now
+  the losing transaction rolls back and the stored row is classified: an
+  identical write (same name, content, and start instant) converges as a
+  replay/retry; a different name is `Error::UnexpectedStep`; anything else is
+  `Error::WorkflowConflict` — the losing execution stops and returns the
+  recorded workflow outcome instead of its own. Applies to `ctx.transaction`
+  on both SQL backends and to `transaction_on`'s single-commit and two-commit
+  paths.
+
 ## [0.4.1] - 2026-08-13
 
 Durable transactions land end to end: run a step's SQL against your own
