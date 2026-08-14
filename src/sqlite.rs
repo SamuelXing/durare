@@ -3,11 +3,11 @@ use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest,
     ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert, RecordedStep,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_INT_COLS,
-    EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL,
+    RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery,
+    StepInfo, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -218,14 +218,19 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<(WorkflowStatus, bool)> {
+        // `owner_xid` is a write-once creation token (the DBOS SDKs mint one
+        // per insert and never update it); it is stamped for cross-SDK schema
+        // parity but plays no part in this SDK's arbitration — the returned
+        // `created` flag is the equivalent "did this call create the row" test.
         let created = sqlx::query(
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at, attributes)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  serialization, created_at, updated_at, attributes, owner_xid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                     lower(hex(randomblob(16))))
              ON CONFLICT (workflow_uuid) DO NOTHING",
         )
         .bind(&s.id)
@@ -299,7 +304,7 @@ impl StateProvider for SqliteProvider {
         status: &str,
         output: Option<&Value>,
         error: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let output_str = output.map(|v| self.serializer.encode(v)).transpose()?;
         // The error column is stored verbatim: the engine has already encoded a
         // failed workflow's error (as the portable envelope when portable), since
@@ -308,12 +313,20 @@ impl StateProvider for SqliteProvider {
         let now = Utc::now().timestamp_millis();
         let terminal = is_terminal(status);
         let completed = terminal.then_some(now);
-        // A workflow cancelled during its final step must stay cancelled: a
-        // SUCCESS/ERROR completion is not allowed to overwrite a CANCELLED row.
-        let is_completion = status == STATUS_SUCCESS || status == STATUS_ERROR;
+        // Terminal writes are guarded (see the trait doc): an outcome or a
+        // recovery parking lands only on a PENDING row, and a cancellation
+        // never overwrites a completed one. The guard is expressed as the set
+        // of prior states the target status may transition from.
+        let guard = match status {
+            STATUS_SUCCESS | STATUS_ERROR | STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
+                " AND status = 'PENDING'"
+            }
+            STATUS_CANCELLED => " AND status NOT IN ('SUCCESS', 'ERROR', 'CANCELLED')",
+            _ => "",
+        };
         // Reaching a terminal state frees the queue-scoped deduplication slot so
         // the same deduplication id can be enqueued again.
-        let res = sqlx::query(
+        let res = sqlx::query(&format!(
             "UPDATE workflow_status
              SET status = ?,
                  output = COALESCE(?, output),
@@ -321,8 +334,8 @@ impl StateProvider for SqliteProvider {
                  completed_at = COALESCE(?, completed_at),
                  deduplication_id = CASE WHEN ? THEN NULL ELSE deduplication_id END,
                  updated_at = ?
-             WHERE workflow_uuid = ? AND NOT (status = ? AND ?)",
-        )
+             WHERE workflow_uuid = ?{guard}",
+        ))
         .bind(status)
         .bind(output_str)
         .bind(error)
@@ -330,20 +343,9 @@ impl StateProvider for SqliteProvider {
         .bind(terminal)
         .bind(now)
         .bind(id)
-        .bind(STATUS_CANCELLED)
-        .bind(is_completion)
         .execute(&self.pool)
         .await?;
-        // If the completion was blocked because the workflow was already
-        // cancelled, surface the cancellation rather than reporting success.
-        if is_completion && res.rows_affected() == 0 {
-            if let Some(w) = self.get_workflow_status(id).await? {
-                if w.status == STATUS_CANCELLED {
-                    return Err(Error::Cancelled(id.to_string()));
-                }
-            }
-        }
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
@@ -370,6 +372,7 @@ impl StateProvider for SqliteProvider {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // one argument per checkpoint column
     async fn record_step_result(
         &self,
         workflow_id: &str,
@@ -378,6 +381,7 @@ impl StateProvider for SqliteProvider {
         value: Value,
         error: Option<&str>,
         started_at_ms: Option<i64>,
+        executor_id: Option<&str>,
     ) -> Result<StepOutcome> {
         // A failure records its (already-encoded) error with a null output; a
         // success records the encoded output with a null error.
@@ -385,7 +389,7 @@ impl StateProvider for SqliteProvider {
             Some(e) => (None, Some(e.to_string())),
             None => (Some(self.serializer.encode(&value)?), None),
         };
-        sqlx::query(
+        let won = sqlx::query(
             "INSERT INTO operation_outputs
                  (workflow_uuid, function_id, function_name, output, error, serialization,
                   started_at_epoch_ms, completed_at_epoch_ms)
@@ -395,22 +399,65 @@ impl StateProvider for SqliteProvider {
         .bind(workflow_id)
         .bind(seq)
         .bind(name)
-        .bind(output_col)
-        .bind(error_col)
+        .bind(&output_col)
+        .bind(&error_col)
         .bind(self.serializer.name())
         .bind(started_at_ms)
         .bind(Utc::now().timestamp_millis())
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected()
+            > 0;
+
+        // Winning the checkpoint proves this executor is the one actually
+        // running the workflow; refresh the row's executor_id so it reports
+        // that. Best-effort — a failure never fails the checkpoint itself.
+        if won {
+            if let Some(executor) = executor_id {
+                if let Err(e) = sqlx::query(
+                    "UPDATE workflow_status SET executor_id = ?
+                     WHERE workflow_uuid = ? AND (executor_id IS NULL OR executor_id <> ?)",
+                )
+                .bind(executor)
+                .bind(workflow_id)
+                .bind(executor)
+                .execute(&self.pool)
+                .await
+                {
+                    tracing::warn!(
+                        workflow = %workflow_id,
+                        error = %e,
+                        "failed to refresh workflow executor id after step checkpoint"
+                    );
+                }
+            }
+        }
 
         let row = sqlx::query(
-            "SELECT output, error, serialization FROM operation_outputs
+            "SELECT function_name, output, error, serialization, started_at_epoch_ms
+             FROM operation_outputs
              WHERE workflow_uuid = ? AND function_id = ?",
         )
         .bind(workflow_id)
         .bind(seq)
         .fetch_one(&self.pool)
         .await?;
+        if !won {
+            // Someone else's row is already at this position. Identical content
+            // and start instant means a replay or a retry of this same logical
+            // write — adopt it. Anything else is a live rival execution (or a
+            // non-deterministic function, when the name differs).
+            let stored_name: String = row.get("function_name");
+            if stored_name != name {
+                return Err(Error::unexpected_step(workflow_id, seq, name, stored_name));
+            }
+            let same_write = row.get::<Option<String>, _>("output") == output_col
+                && row.get::<Option<String>, _>("error") == error_col
+                && row.get::<Option<i64>, _>("started_at_epoch_ms") == started_at_ms;
+            if !same_write {
+                return Err(Error::WorkflowConflict(workflow_id.to_string()));
+            }
+        }
         Ok(step_outcome_from(
             &self.serializer,
             row.get::<Option<String>, _>("serialization").as_deref(),
@@ -1294,29 +1341,52 @@ impl StateProvider for SqliteProvider {
         Ok(())
     }
 
-    async fn bump_recovery_attempts(&self, id: &str, max: i32) -> Result<i32> {
-        let mut tx = self.pool.begin().await?;
-        let attempts: Option<i64> = sqlx::query_scalar(
-            "UPDATE workflow_status SET recovery_attempts = recovery_attempts + 1, updated_at = ?
-             WHERE workflow_uuid = ? RETURNING recovery_attempts",
-        )
-        .bind(Utc::now().timestamp_millis())
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let attempts = attempts.unwrap_or(0) as i32;
-        if attempts > max {
-            sqlx::query(
-                "UPDATE workflow_status SET status = ?, deduplication_id = NULL \
-                 WHERE workflow_uuid = ?",
-            )
-            .bind(STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+    async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim> {
+        let now = Utc::now().timestamp_millis();
+        let attempts = req.expected_attempts + 1;
+        // Every arm carries the same compare-and-set predicate: the row is
+        // still PENDING, still owned by the executor the sweep observed, and
+        // still at the attempt count it observed. One UPDATE per claim — the
+        // predicate, not a transaction, is the arbiter.
+        let cas = "WHERE workflow_uuid = ? AND status = ? AND executor_id = ? \
+                   AND recovery_attempts = ?";
+
+        let set = if attempts > req.max_attempts {
+            // This dispatch would exceed the cap: park the row instead.
+            "status = 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', recovery_attempts = recovery_attempts + 1,
+             deduplication_id = NULL, updated_at = ?"
+        } else if req.requeue {
+            // Give the row back to its queue; the dispatcher's own atomic
+            // ENQUEUED → PENDING claim admits exactly one runner.
+            "status = 'ENQUEUED', recovery_attempts = recovery_attempts + 1,
+             started_at_epoch_ms = NULL, updated_at = ?"
+        } else {
+            // Claim it for direct re-dispatch by this executor.
+            "recovery_attempts = recovery_attempts + 1, executor_id = ?, updated_at = ?"
+        };
+        let sql = format!("UPDATE workflow_status SET {set} {cas}");
+        let mut q = sqlx::query(&sql);
+        if attempts <= req.max_attempts && !req.requeue {
+            q = q.bind(req.new_executor);
         }
-        tx.commit().await?;
-        Ok(attempts)
+        let res = q
+            .bind(now)
+            .bind(req.workflow_id)
+            .bind(STATUS_PENDING)
+            .bind(req.expected_executor)
+            .bind(req.expected_attempts)
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Ok(RecoveryClaim::Lost);
+        }
+        Ok(if attempts > req.max_attempts {
+            RecoveryClaim::Parked { attempts }
+        } else if req.requeue {
+            RecoveryClaim::Requeued
+        } else {
+            RecoveryClaim::Claimed { attempts }
+        })
     }
 
     async fn record_child_workflow(

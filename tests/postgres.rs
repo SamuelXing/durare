@@ -399,7 +399,15 @@ async fn pg_patch() -> Result<()> {
         ))
         .await?;
     provider2
-        .record_step_result(&old, 0, "legacy_step", serde_json::json!(1), None, None)
+        .record_step_result(
+            &old,
+            0,
+            "legacy_step",
+            serde_json::json!(1),
+            None,
+            None,
+            None,
+        )
         .await?;
     // The seeded row is PENDING with no live owner: recovery re-executes it
     // (same-id start of a non-terminal run returns a handle without spawning
@@ -1826,7 +1834,12 @@ async fn pg_dedup_slot_frees_on_completion() -> Result<()> {
         .await
         .is_err());
 
-    // Completing d1 nulls its deduplication_id, freeing the slot.
+    // Completing d1 nulls its deduplication_id, freeing the slot. A real run
+    // claims the row (ENQUEUED → PENDING) before completing it, and the
+    // terminal write is guarded to PENDING rows — walk the same lifecycle.
+    provider
+        .set_workflow_status(first.id(), STATUS_PENDING, None, None)
+        .await?;
     provider
         .set_workflow_status(first.id(), STATUS_SUCCESS, None, None)
         .await?;
@@ -1871,11 +1884,13 @@ async fn pg_completion_cannot_overwrite_cancelled() -> Result<()> {
         .set_workflow_status(h.id(), STATUS_CANCELLED, None, Some("cancelled"))
         .await?;
 
-    // A completion racing the cancellation must error, not flip it to SUCCESS.
-    let late = provider
+    // A completion racing the cancellation must not land — the write is
+    // guarded to PENDING rows, so the late writer is told to adopt the
+    // recorded outcome instead of flipping the row to SUCCESS.
+    let landed = provider
         .set_workflow_status(h.id(), STATUS_SUCCESS, None, None)
-        .await;
-    assert!(late.is_err(), "completing a cancelled workflow must error");
+        .await?;
+    assert!(!landed, "completing a cancelled workflow must not land");
 
     let row = provider.get_workflow_status(h.id()).await?.unwrap();
     assert_eq!(row.status, STATUS_CANCELLED);
@@ -3028,7 +3043,7 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
         ))
         .await?;
     provider
-        .record_step_result(&id, 0, "first", serde_json::json!(1), None, None)
+        .record_step_result(&id, 0, "first", serde_json::json!(1), None, None, None)
         .await?;
 
     let h = engine.resume_workflow::<i64>(&id).await?;

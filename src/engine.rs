@@ -2,10 +2,10 @@ use crate::context::{AuthContext, DurableContext};
 use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, ForkParams, ListFilter, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_PENDING, STATUS_SUCCESS,
+    is_terminal, DequeueRequest, ForkParams, ListFilter, RecoveryClaim, RecoveryClaimRequest,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
+    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use crate::schedule::{
@@ -2516,65 +2516,98 @@ pub(crate) async fn dispatch_pending_workflows(
             );
             break;
         }
-        let attempts = rt
-            .provider
-            .bump_recovery_attempts(&record.id, max_recovery_attempts)
-            .await?;
-        if attempts > max_recovery_attempts {
-            rt.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                id = %record.id,
-                attempts,
-                "workflow parked: exceeded max recovery attempts"
-            );
-            continue;
-        }
-
-        // A workflow claimed off a queue before the crash goes back to the
-        // queue so the dispatcher (and its concurrency limits) re-runs it.
-        if record.queue_name.is_some() {
-            rt.provider
-                .set_workflow_status(&record.id, STATUS_ENQUEUED, None, None)
-                .await?;
-            rt.counters
-                .workflows_recovered
-                .fetch_add(1, Ordering::Relaxed);
-            recovered.push(record.id);
-            continue;
-        }
-
-        if let Some(handler) = rt
-            .workflows
-            .get(&registry_key(&record.name, record.config_name.as_deref()))
-            .cloned()
-        {
-            // Each recovered run gets its own tracked task, exactly like a
-            // freshly started one. Running them inline here had two failure
-            // modes the DBOS SDKs don't share: a run parked on `recv` or a
-            // timer stalled every pending workflow behind it in this loop —
-            // and stalled the caller of `recover` for its whole wait — and
-            // shutdown could never drain a recovery that contained one.
-            // Best-effort as before: a workflow that fails again is marked
-            // ERROR by `run_to_completion`.
-            let auth = AuthContext::from_status(&record);
-            let span = rt.workflow_span(&record.id, &record.name, None, &auth);
-            let task_rt = rt.clone();
-            let (name, id) = (record.name.clone(), record.id.clone());
-            let (input, deadline) = (record.input.clone(), record.deadline_ms);
-            rt.tasks.spawn(async move {
-                let _ = run_to_completion(task_rt, handler, name, id, input, deadline, auth, span)
-                    .await;
-            });
-            rt.counters
-                .workflows_recovered
-                .fetch_add(1, Ordering::Relaxed);
-            recovered.push(record.id);
+        // A workflow this process cannot run is left unclaimed — claiming is a
+        // real state transition (it burns a recovery attempt), and an executor
+        // that does have the handler should get an unspent row. Queued rows
+        // skip the lookup: they go back to their queue, and the dispatcher
+        // gates on registration at dequeue time.
+        let requeue = record.queue_name.is_some();
+        let handler = if requeue {
+            None
         } else {
-            tracing::warn!(
-                workflow = %record.name,
-                id = %record.id,
-                "skipping recovery: no handler registered for this workflow name"
-            );
+            match rt
+                .workflows
+                .get(&registry_key(&record.name, record.config_name.as_deref()))
+                .cloned()
+            {
+                Some(h) => Some(h),
+                None => {
+                    tracing::warn!(
+                        workflow = %record.name,
+                        id = %record.id,
+                        "skipping recovery: no handler registered for this workflow name"
+                    );
+                    continue;
+                }
+            }
+        };
+
+        // The claim is a compare-and-set against the row as this sweep listed
+        // it: concurrent sweeps recovering the same executor each observe the
+        // same (executor, attempts) pair, exactly one lands the increment, and
+        // the rest lose — at most one process dispatches each pending
+        // workflow. Losing is normal, not an error: someone else owns the run.
+        let claim = rt
+            .provider
+            .claim_for_recovery(&RecoveryClaimRequest {
+                workflow_id: &record.id,
+                expected_executor: &record.executor_id,
+                expected_attempts: record.recovery_attempts,
+                new_executor: &rt.executor_id,
+                max_attempts: max_recovery_attempts,
+                requeue,
+            })
+            .await?;
+        match claim {
+            RecoveryClaim::Lost => {
+                tracing::debug!(
+                    id = %record.id,
+                    "recovery claim lost: another process moved this workflow first"
+                );
+            }
+            RecoveryClaim::Parked { attempts } => {
+                rt.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    id = %record.id,
+                    attempts,
+                    "workflow parked: exceeded max recovery attempts"
+                );
+            }
+            // Back on its queue: the dispatcher (and its concurrency limits)
+            // re-runs it, admitting exactly one runner via its own atomic
+            // ENQUEUED → PENDING claim.
+            RecoveryClaim::Requeued => {
+                rt.counters
+                    .workflows_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+                recovered.push(record.id);
+            }
+            RecoveryClaim::Claimed { .. } => {
+                let handler =
+                    handler.expect("only non-queued rows are claimed for direct dispatch");
+                // Each recovered run gets its own tracked task, exactly like a
+                // freshly started one. Running them inline here had two failure
+                // modes the DBOS SDKs don't share: a run parked on `recv` or a
+                // timer stalled every pending workflow behind it in this loop —
+                // and stalled the caller of `recover` for its whole wait — and
+                // shutdown could never drain a recovery that contained one.
+                // Best-effort as before: a workflow that fails again is marked
+                // ERROR by `run_to_completion`.
+                let auth = AuthContext::from_status(&record);
+                let span = rt.workflow_span(&record.id, &record.name, None, &auth);
+                let task_rt = rt.clone();
+                let (name, id) = (record.name.clone(), record.id.clone());
+                let (input, deadline) = (record.input.clone(), record.deadline_ms);
+                rt.tasks.spawn(async move {
+                    let _ =
+                        run_to_completion(task_rt, handler, name, id, input, deadline, auth, span)
+                            .await;
+                });
+                rt.counters
+                    .workflows_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+                recovered.push(record.id);
+            }
         }
     }
     Ok(recovered)
@@ -2613,6 +2646,12 @@ pub(crate) struct EngineCounters {
 impl Runtime {
     pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
         &self.provider
+    }
+
+    /// This process's executor id, stamped on rows it claims and refreshed on
+    /// step checkpoints it wins.
+    pub(crate) fn executor_id(&self) -> &str {
+        &self.executor_id
     }
 
     /// The span covering one workflow execution, carrying the DBOS trace
@@ -3100,9 +3139,14 @@ async fn run_to_completion(
             match tokio::time::timeout(Duration::from_millis(remaining), run).await {
                 Ok(caught) => caught,
                 Err(_elapsed) => {
-                    provider
+                    let landed = provider
                         .set_workflow_status(&id, STATUS_CANCELLED, None, Some("deadline exceeded"))
                         .await?;
+                    if !landed {
+                        // The row completed (or was moved) before the deadline
+                        // write landed; the recorded outcome wins.
+                        return adopt_recorded_outcome(&provider, &id, &recorder).await;
+                    }
                     recorder.record("dbos.workflow.status", STATUS_CANCELLED);
                     recorder.record("otel.status_code", "ERROR");
                     return Err(Error::Timeout);
@@ -3133,19 +3177,32 @@ async fn run_to_completion(
 
     match result {
         Ok(output) => {
-            provider
+            let landed = provider
                 .set_workflow_status(&id, STATUS_SUCCESS, Some(&output), None)
                 .await?;
+            if !landed {
+                return adopt_recorded_outcome(&provider, &id, &recorder).await;
+            }
             recorder.record("dbos.workflow.status", STATUS_SUCCESS);
             recorder.record("otel.status_code", "OK");
             Ok(output)
         }
+        // Lost a step-checkpoint race: another live execution owns this
+        // workflow's checkpoints. This run's computed state diverged from the
+        // durable truth the moment it lost, so it records nothing — not even
+        // an error — and waits for the winner's outcome.
+        Err(Error::WorkflowConflict(_)) => {
+            adopt_recorded_outcome(&provider, &id, &recorder).await
+        }
         Err(Error::Cancelled(_)) => {
             // The workflow stopped because it was cancelled; reflect that
             // terminal state rather than ERROR.
-            provider
+            let landed = provider
                 .set_workflow_status(&id, STATUS_CANCELLED, None, Some("cancelled"))
                 .await?;
+            if !landed {
+                return adopt_recorded_outcome(&provider, &id, &recorder).await;
+            }
             recorder.record("dbos.workflow.status", STATUS_CANCELLED);
             recorder.record("otel.status_code", "ERROR");
             Err(Error::Cancelled(id))
@@ -3155,9 +3212,12 @@ async fn run_to_completion(
             // stores the cross-language envelope (carrying a structured
             // `Error::Portable`'s name/code/data), others store the bare message.
             let stored = crate::serialize::encode_error(&provider.serializer(), &e);
-            provider
+            let landed = provider
                 .set_workflow_status(&id, STATUS_ERROR, None, Some(&stored))
                 .await?;
+            if !landed {
+                return adopt_recorded_outcome(&provider, &id, &recorder).await;
+            }
             recorder.record("dbos.workflow.status", STATUS_ERROR);
             recorder.record("otel.status_code", "ERROR");
             Err(e)
@@ -3166,6 +3226,59 @@ async fn run_to_completion(
     }
     .instrument(span)
     .await
+}
+
+/// Park a losing execution on the recorded outcome: poll the status row until
+/// it is terminal and return *that* result — never this execution's own.
+///
+/// Reached when a run no longer owns its workflow — its terminal write was
+/// guarded off (the row was cancelled, parked past the recovery cap, handed
+/// back to a queue by a resume, or completed by a rival execution first), or
+/// it lost a step-checkpoint race outright. The DBOS SDKs park exactly here;
+/// parking is unbounded and relies on the outcome being eventually settled. A
+/// missing row fails fast instead: this run once observed the row, so a
+/// vanished one was deleted, and no outcome is coming.
+async fn adopt_recorded_outcome(
+    provider: &Arc<dyn StateProvider>,
+    id: &str,
+    recorder: &tracing::Span,
+) -> Result<Value> {
+    tracing::warn!(
+        id = %id,
+        "workflow outcome was not recorded: this execution no longer owns the workflow; waiting for the recorded outcome"
+    );
+    loop {
+        let Some(status) = provider.get_workflow_status(id).await? else {
+            return Err(Error::NonExistentWorkflow(id.to_string()));
+        };
+        if is_terminal(&status.status) {
+            recorder.record("dbos.workflow.status", status.status.as_str());
+            recorder.record(
+                "otel.status_code",
+                if status.status == STATUS_SUCCESS {
+                    "OK"
+                } else {
+                    "ERROR"
+                },
+            );
+            return match status.status.as_str() {
+                STATUS_SUCCESS => Ok(status.output.unwrap_or(Value::Null)),
+                STATUS_CANCELLED => Err(Error::Cancelled(id.to_string())),
+                STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
+                    Err(Error::MaxRecoveryAttemptsExceeded(id.to_string()))
+                }
+                _ => Err(match status.error_info {
+                    Some(info) => Error::Portable(Box::new(info)),
+                    None => Error::app(
+                        status
+                            .error
+                            .unwrap_or_else(|| "workflow failed".to_string()),
+                    ),
+                }),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// A firing loop the reconciler has installed for one schedule.
