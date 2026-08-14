@@ -3295,3 +3295,96 @@ async fn pg_system_queries_survive_search_path_change() -> Result<()> {
         .map_err(Error::from)?;
     Ok(())
 }
+
+/// A transactional step that loses its checkpoint race to a divergent rival
+/// row rolls back the body's writes and surfaces
+/// [`durare::Error::WorkflowConflict`] — never committing the body a second
+/// time. The rival is planted from inside the body over the provider's own
+/// pool (a different connection), landing in the window between the body's
+/// writes and this attempt's checkpoint insert.
+#[tokio::test]
+async fn pg_transaction_checkpoint_race_is_a_conflict() -> Result<()> {
+    use durare::params;
+    use durare::TransactionOptions;
+    use serde_json::json;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_transaction_checkpoint_race_is_a_conflict: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("txr_{tag}");
+    let id = format!("wf-txr-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+    provider.init().await?;
+    provider
+        .insert_workflow_status(durare::WorkflowStatus::new(
+            &id,
+            "t",
+            json!(null),
+            "PENDING",
+            "e1",
+            "v1",
+        ))
+        .await?;
+    sqlx::query(&format!("CREATE TABLE {schema}.app_t (x TEXT NOT NULL)"))
+        .execute(provider.pool())
+        .await
+        .map_err(Error::from)?;
+
+    let ser = provider.serializer();
+    let planted = ser.encode(&json!("rival"))?;
+    let fmt = ser.name().to_string();
+    let (rival, rival_schema, rival_id) = (provider.pool().clone(), schema.clone(), id.clone());
+    let res = provider
+        .run_transaction_step(
+            &id,
+            0,
+            1_000,
+            &TransactionOptions::new("racy"),
+            Box::new(move |tx| {
+                let (rival, planted, fmt, schema, id) = (
+                    rival.clone(),
+                    planted.clone(),
+                    fmt.clone(),
+                    rival_schema.clone(),
+                    rival_id.clone(),
+                );
+                Box::pin(async move {
+                    // The rival's checkpoint commits on another connection
+                    // while this transaction is open.
+                    sqlx::query(&format!(
+                        "INSERT INTO {schema}.operation_outputs
+                             (workflow_uuid, function_id, function_name, output, serialization,
+                              started_at_epoch_ms, completed_at_epoch_ms)
+                         VALUES ($1, 0, 'racy', $2, $3, 2000, 2000)"
+                    ))
+                    .bind(&id)
+                    .bind(&planted)
+                    .bind(&fmt)
+                    .execute(&rival)
+                    .await
+                    .map_err(durare::Error::from)?;
+                    tx.execute("INSERT INTO app_t (x) VALUES ('mine')", &params![])
+                        .await?;
+                    Ok(json!(42))
+                })
+            }),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(durare::Error::WorkflowConflict(ref w)) if *w == id),
+        "a divergent rival write must be a conflict, got {res:?}"
+    );
+    let committed: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.app_t"))
+        .fetch_one(provider.pool())
+        .await
+        .map_err(Error::from)?;
+    assert_eq!(committed, 0, "the losing body's writes must roll back");
+
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(provider.pool())
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
