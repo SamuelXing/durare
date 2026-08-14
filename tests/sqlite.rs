@@ -3364,3 +3364,56 @@ async fn sqlite_send_bulk_atomic_fan_out() -> Result<()> {
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
+
+/// `read_only(true)` on SQLite is advisory at the database level, but the
+/// checkpointing semantics match Postgres: the read commits first and the
+/// checkpoint is recorded afterwards — durable and replayable.
+#[tokio::test]
+async fn sqlite_read_only_transaction_records_checkpoint() -> Result<()> {
+    use durare::{params, StateProvider, TransactionOptions};
+    let (url, path) = temp_db_url("readonly");
+    let provider = Arc::new(SqliteProvider::connect(&url).await?);
+    provider.init().await?;
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let wf_runs = runs.clone();
+    engine.register("ro", move |ctx: DurableContext, (): ()| {
+        let runs = wf_runs.clone();
+        async move {
+            let opts = TransactionOptions::new("snapshot-read").read_only(true);
+            ctx.transaction_with::<i64, _>(opts, move |tx| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let row = tx.query_one("SELECT 42 AS v", &params![]).await?;
+                    Ok(row.get::<i64>("v"))
+                })
+            })
+            .await
+        }
+    });
+
+    let n: i64 = engine
+        .start::<(), i64>("ro", (), WorkflowOptions::with_id("wf-ro"))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(n, 42);
+    let steps = provider.get_workflow_steps("wf-ro").await?;
+    assert!(steps.iter().any(|s| s.name == "snapshot-read"));
+    let again: i64 = engine
+        .start::<(), i64>("ro", (), WorkflowOptions::with_id("wf-ro"))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(again, 42);
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "replay must not re-run the read"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
