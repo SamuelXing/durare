@@ -589,6 +589,27 @@ impl StateProvider for SqliteProvider {
                         body(&mut h).await
                     };
                     match body_result {
+                        // Success. SQLite treats `read_only` as advisory, but
+                        // the semantics must match Postgres (which rejects any
+                        // write in a read-only transaction): commit the read,
+                        // then checkpoint ordinary-step-style — at-least-once
+                        // is harmless for a pure read, and
+                        // `record_step_result` classifies any rival row.
+                        Ok(value) if opts.read_only => {
+                            tx.commit().await?;
+                            let outcome = self
+                                .record_step_result(
+                                    workflow_id,
+                                    seq,
+                                    name,
+                                    value,
+                                    None,
+                                    Some(started_at_ms),
+                                    None,
+                                )
+                                .await?;
+                            outcome.into_value_result()
+                        }
                         // Success: checkpoint the output in the same transaction, so
                         // the body's writes and the checkpoint commit atomically.
                         Ok(value) => {

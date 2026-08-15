@@ -3388,3 +3388,134 @@ async fn pg_transaction_checkpoint_race_is_a_conflict() -> Result<()> {
         .map_err(Error::from)?;
     Ok(())
 }
+
+/// `read_only(true)` used to fail unconditionally on Postgres: every
+/// transactional path inserted its durability row inside the read-only
+/// transaction, which Postgres rejects (25006). A read-only body now commits
+/// its read first and checkpoints afterwards, ordinary-step-style — durable,
+/// replayable, and running the body exactly once per recorded outcome.
+#[tokio::test]
+async fn pg_read_only_transaction_checkpoints_after_commit() -> Result<()> {
+    use durare::{params, TransactionOptions};
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_read_only_transaction_checkpoints_after_commit: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("ro_{tag}");
+    let id = format!("wf-ro-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let wf_runs = runs.clone();
+    engine.register("ro", move |ctx: DurableContext, (): ()| {
+        let runs = wf_runs.clone();
+        async move {
+            let opts = TransactionOptions::new("snapshot-read").read_only(true);
+            ctx.transaction_with::<i64, _>(opts, move |tx| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let row = tx.query_one("SELECT 42::bigint AS v", &params![]).await?;
+                    Ok(row.get::<i64>("v"))
+                })
+            })
+            .await
+        }
+    });
+
+    let n: i64 = engine
+        .start::<(), i64>("ro", (), WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(n, 42);
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The checkpoint is durable: the step is recorded, and a same-id start
+    // replays without re-running the body.
+    let steps = provider.get_workflow_steps(&id).await?;
+    assert!(steps.iter().any(|s| s.name == "snapshot-read"));
+    let again: i64 = engine
+        .start::<(), i64>("ro", (), WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(again, 42);
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "replay must not re-run the read"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(provider.pool())
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
+
+/// The system-datasource fast path under `read_only(true)`: the checkpoint
+/// cannot be written inside the read-only transaction, so it is recorded
+/// after the commit — and the step still replays instead of re-running.
+#[tokio::test]
+async fn pg_read_only_fast_path_checkpoints_after_commit() -> Result<()> {
+    use durare::TransactionOptions;
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_read_only_fast_path_checkpoints_after_commit: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("rof_{tag}");
+    let id = format!("wf-rof-{tag}");
+
+    let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+    let ds = provider.system_datasource();
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let (wf_runs, wf_ds) = (runs.clone(), ds.clone());
+    engine.register("rof", move |ctx: DurableContext, (): ()| {
+        let (runs, ds) = (wf_runs.clone(), wf_ds.clone());
+        async move {
+            let opts = TransactionOptions::new("fast-read").read_only(true);
+            ctx.transaction_on_with::<_, i64, _>(&ds, opts, move |conn| {
+                let runs = runs.clone();
+                Box::pin(async move {
+                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let v: i64 = sqlx::query_scalar("SELECT 7::bigint")
+                        .fetch_one(&mut *conn)
+                        .await?;
+                    Ok(v)
+                })
+            })
+            .await
+        }
+    });
+
+    let n: i64 = engine
+        .start::<(), i64>("rof", (), WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(n, 7);
+    let again: i64 = engine
+        .start::<(), i64>("rof", (), WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(again, 7);
+    assert_eq!(
+        runs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "replay must not re-run the read"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(provider.pool())
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}

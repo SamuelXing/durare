@@ -1017,6 +1017,28 @@ impl StateProvider for PostgresProvider {
                         body(&mut h).await
                     };
                     match body_result {
+                        // Success. A read-only body has nothing to make atomic
+                        // with its checkpoint — Postgres would reject the
+                        // in-transaction insert outright (25006). Commit the
+                        // read (releasing its snapshot), then checkpoint
+                        // ordinary-step-style: at-least-once is harmless for a
+                        // pure read, and `record_step_result` classifies any
+                        // rival row exactly like a plain step's.
+                        Ok(value) if opts.read_only => {
+                            tx.commit().await?;
+                            let outcome = self
+                                .record_step_result(
+                                    workflow_id,
+                                    seq,
+                                    name,
+                                    value,
+                                    None,
+                                    Some(started_at_ms),
+                                    None,
+                                )
+                                .await?;
+                            outcome.into_value_result()
+                        }
                         // Success: checkpoint the output in the same transaction, so
                         // the body's writes and the checkpoint commit atomically.
                         Ok(value) => {
