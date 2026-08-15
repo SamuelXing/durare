@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `PostgresProvider::from_pool_with_schema(pool, schema)`: a caller-owned
+  pool with the system tables pinned to an explicit schema — created on
+  `init`, every system query schema-qualified — closing the hole where
+  `from_pool` providers depended entirely on the pool's `search_path`
+  configuration for where durable state lives. The caller's pool is left
+  untouched: a transactional step's user SQL still resolves unqualified
+  names per the pool's own configuration.
+
 ### Fixed
 
 - Workflow ownership is fenced across processes. Recovery now *claims* each

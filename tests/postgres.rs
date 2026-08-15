@@ -3549,3 +3549,57 @@ async fn pg_reserved_keyword_schema_rejected_up_front() -> Result<()> {
     );
     Ok(())
 }
+
+/// `from_pool_with_schema`: a caller-owned pool, but system tables pinned to
+/// an explicit schema — created on `init`, all system queries qualified — so
+/// nothing about the pool's `search_path` configuration decides where durable
+/// state lives.
+#[tokio::test]
+async fn pg_from_pool_with_schema_pins_system_tables() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping pg_from_pool_with_schema_pins_system_tables: DATABASE_URL unset");
+        return Ok(());
+    };
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("fps_{tag}");
+    let id = format!("wf-fps-{tag}");
+
+    // A plain caller-owned pool: no search_path configuration at all.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .map_err(Error::from)?;
+    let provider = Arc::new(PostgresProvider::from_pool_with_schema(pool, &schema)?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("hello", |_ctx: DurableContext, n: i64| async move {
+        Ok::<_, Error>(n + 1)
+    });
+    let n: i64 = engine
+        .start::<i64, i64>("hello", 41, WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(n, 42);
+
+    // The row lives in the pinned schema, reachable by qualified name.
+    let found: i64 = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM {schema}.workflow_status WHERE workflow_uuid = $1"
+    ))
+    .bind(&id)
+    .fetch_one(provider.pool())
+    .await
+    .map_err(Error::from)?;
+    assert_eq!(found, 1, "durable state lives in the configured schema");
+
+    // Reserved keywords are rejected here too.
+    let pool2 = provider.pool().clone();
+    assert!(PostgresProvider::from_pool_with_schema(pool2, "user").is_err());
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(provider.pool())
+        .await
+        .map_err(Error::from)?;
+    Ok(())
+}
