@@ -307,3 +307,172 @@ async fn queued_row_recovery_requeues_exactly_once() {
 
     let _ = std::fs::remove_file(&db);
 }
+
+/// A transactional step that loses its checkpoint race must roll back the
+/// body's writes and classify the stored row: an identical write (same name,
+/// content, start instant) converges, a divergent one is
+/// [`durare::Error::WorkflowConflict`], and a renamed step stays
+/// non-determinism. Before this classification existed the losing transaction
+/// *committed* — applying the body's writes a second time.
+#[tokio::test(flavor = "multi_thread")]
+async fn losing_a_transaction_checkpoint_race_is_a_conflict() {
+    use durare::TransactionOptions;
+    use serde_json::json;
+
+    let (db, url) = unique_db("txn-conflict");
+    let provider = Arc::new(SqliteProvider::connect(&url).await.expect("connect"));
+    provider.init().await.expect("init");
+    // The rival executor: a separate pool over the same database file.
+    let rival = sqlx::sqlite::SqlitePool::connect(&url)
+        .await
+        .expect("rival pool");
+    sqlx::query("CREATE TABLE app_t (x TEXT NOT NULL)")
+        .execute(&rival)
+        .await
+        .expect("create app table");
+    provider
+        .insert_workflow_status(durare::WorkflowStatus::new(
+            "wf-txr",
+            "t",
+            json!(null),
+            "PENDING",
+            "e1",
+            "v1",
+        ))
+        .await
+        .expect("insert");
+    let ser = provider.serializer();
+    let app_rows = |pool: sqlx::SqlitePool| async move {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM app_t")
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+    };
+
+    // Divergent rival at seq 0, planted from inside the body before this
+    // transaction takes SQLite's write lock — indistinguishable from a rival
+    // committing in the race window.
+    let fmt = ser.name().to_string();
+    let (rp, planted, fmtc) = (
+        rival.clone(),
+        ser.encode(&json!("rival")).expect("enc"),
+        fmt.clone(),
+    );
+    let res = provider
+        .run_transaction_step(
+            "wf-txr",
+            0,
+            1_000,
+            &TransactionOptions::new("racy"),
+            Box::new(move |tx| {
+                let (rp, planted, fmt) = (rp.clone(), planted.clone(), fmtc.clone());
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
+                             (workflow_uuid, function_id, function_name, output, serialization,
+                              started_at_epoch_ms, completed_at_epoch_ms)
+                         VALUES ('wf-txr', 0, 'racy', ?, ?, 2000, 2000)",
+                    )
+                    .bind(&planted)
+                    .bind(&fmt)
+                    .execute(&rp)
+                    .await
+                    .map_err(durare::Error::from)?;
+                    tx.execute("INSERT INTO app_t (x) VALUES ('mine')", &durare::params![])
+                        .await?;
+                    Ok(json!(42))
+                })
+            }),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(durare::Error::WorkflowConflict(ref id)) if id == "wf-txr"),
+        "a divergent rival write must be a conflict, got {res:?}"
+    );
+    assert_eq!(
+        app_rows(rival.clone()).await,
+        0,
+        "the losing body's writes must roll back, not commit"
+    );
+
+    // Identical write at seq 1 (same name, content, and start instant): a
+    // replay/retry of the same logical write — converges, no conflict. The
+    // rolled-back attempt's own app write still must not commit.
+    let (rp, planted, fmtc) = (
+        rival.clone(),
+        ser.encode(&json!(7)).expect("enc"),
+        fmt.clone(),
+    );
+    let res = provider
+        .run_transaction_step(
+            "wf-txr",
+            1,
+            5_000,
+            &TransactionOptions::new("same"),
+            Box::new(move |tx| {
+                let (rp, planted, fmt) = (rp.clone(), planted.clone(), fmtc.clone());
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
+                             (workflow_uuid, function_id, function_name, output, serialization,
+                              started_at_epoch_ms, completed_at_epoch_ms)
+                         VALUES ('wf-txr', 1, 'same', ?, ?, 5000, 5000)",
+                    )
+                    .bind(&planted)
+                    .bind(&fmt)
+                    .execute(&rp)
+                    .await
+                    .map_err(durare::Error::from)?;
+                    tx.execute("INSERT INTO app_t (x) VALUES ('mine2')", &durare::params![])
+                        .await?;
+                    Ok(json!(7))
+                })
+            }),
+        )
+        .await;
+    assert!(
+        matches!(res, Ok(ref v) if *v == json!(7)),
+        "an identical write converges on the stored outcome, got {res:?}"
+    );
+    assert_eq!(
+        app_rows(rival.clone()).await,
+        0,
+        "the converged attempt's writes still roll back"
+    );
+
+    // A different step name at the position stays non-determinism.
+    let rp = rival.clone();
+    let planted = ser.encode(&json!(1)).expect("enc");
+    let fmtc = fmt.clone();
+    let res = provider
+        .run_transaction_step(
+            "wf-txr",
+            2,
+            9_000,
+            &TransactionOptions::new("renamed"),
+            Box::new(move |_tx| {
+                let (rp, planted, fmt) = (rp.clone(), planted.clone(), fmtc.clone());
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
+                             (workflow_uuid, function_id, function_name, output, serialization,
+                              started_at_epoch_ms, completed_at_epoch_ms)
+                         VALUES ('wf-txr', 2, 'original', ?, ?, 9000, 9000)",
+                    )
+                    .bind(&planted)
+                    .bind(&fmt)
+                    .execute(&rp)
+                    .await
+                    .map_err(durare::Error::from)?;
+                    Ok(json!(1))
+                })
+            }),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(durare::Error::UnexpectedStep { .. })),
+        "a renamed step at a recorded position is non-determinism, got {res:?}"
+    );
+
+    let _ = std::fs::remove_file(&db);
+}
