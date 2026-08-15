@@ -8,16 +8,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- `TransactionOptions::read_only(true)` now works on Postgres. Every
-  transactional path used to insert its durability row inside the read-only
-  transaction, which Postgres rejects (`25006`) — so the option failed
-  unconditionally there while SQLite silently accepted it. A read-only body
-  has no writes to make atomic with a checkpoint, so the read now commits
-  first (releasing its snapshot) and the checkpoint is recorded afterwards,
-  ordinary-step-style: at-least-once execution is harmless for a pure read,
-  and the recorded outcome is durable and replayable. Same semantics on both
-  backends and on all three transactional paths.
-
+- Workflow ownership is fenced across processes. Recovery now *claims* each
+  pending row through an atomic compare-and-set on
+  `(PENDING, executor_id, recovery_attempts)` — any number of concurrent
+  recoverers admit exactly one dispatch, where before two sweeps racing the
+  same dead executor both re-ran every workflow. A workflow's terminal
+  outcome (`SUCCESS`/`ERROR`/parking) lands only on a `PENDING` row and
+  `CANCELLED` never overwrites a completed one; an execution whose terminal
+  write is refused adopts the recorded outcome instead of reporting its own.
+  A step checkpoint that loses its insert race is classified: an identical
+  write (same name, content, start instant) converges as a replay/retry, a
+  divergent one is the new `Error::WorkflowConflict` and the losing
+  execution stops rather than doubling every remaining step's side effects.
+  Winning a checkpoint also refreshes the row's `executor_id`, and
+  `owner_xid` is stamped at insert for cross-SDK schema parity. Breaking for
+  custom `StateProvider`s: `set_workflow_status` returns `Result<bool>`,
+  `bump_recovery_attempts` is replaced by `claim_for_recovery`, and
+  `record_step_result` gains an `executor_id` parameter.
+- `recover()` no longer runs recovered workflows inline to completion: each
+  re-dispatches onto its own tracked task (queued rows go back to their
+  queue), so a run parked on `recv` or a durable timer stalls neither the
+  caller of `recover()` nor the pending runs behind it — an embedder that
+  makes recovery part of engine construction previously deadlocked outright.
+  And a same-id `start()` of a live `PENDING` run now returns a polling
+  handle to the existing run instead of spawning a concurrent duplicate
+  execution: the workflow id is an idempotency key on every path, not just
+  for queued and terminal runs.
 - Transactional steps now classify a lost checkpoint race the same way plain
   steps do. Before, a `ctx.transaction` body whose checkpoint insert collided
   with an already-recorded row **committed its writes anyway** — applying the
@@ -30,6 +46,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   recorded workflow outcome instead of its own. Applies to `ctx.transaction`
   on both SQL backends and to `transaction_on`'s single-commit and two-commit
   paths.
+- `TransactionOptions::read_only(true)` now works on Postgres. Every
+  transactional path used to insert its durability row inside the read-only
+  transaction, which Postgres rejects (`25006`) — so the option failed
+  unconditionally there while SQLite silently accepted it. A read-only body
+  has no writes to make atomic with a checkpoint, so the read now commits
+  first (releasing its snapshot) and the checkpoint is recorded afterwards,
+  ordinary-step-style: at-least-once execution is harmless for a pure read,
+  and the recorded outcome is durable and replayable. Same semantics on both
+  backends and on all three transactional paths.
 
 ## [0.4.1] - 2026-08-13
 
