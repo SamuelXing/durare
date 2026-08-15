@@ -56,6 +56,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and the recorded outcome is durable and replayable. Same semantics on both
   backends and on all three transactional paths.
 
+- `connect_with_schema` rejects reserved SQL keywords (`user`, `select`, …)
+  up front with a clear error. Such names passed shape validation, then
+  failed `CREATE SCHEMA` at `init` with a bare syntax error that said
+  nothing about the cause. Quoted-identifier paths are unaffected — quoting
+  makes any name legal.
+
 ## [0.4.1] - 2026-08-13
 
 Durable transactions land end to end: run a step's SQL against your own
