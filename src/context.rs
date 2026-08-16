@@ -549,9 +549,14 @@ impl DurableContext {
     /// table.
     ///
     /// The body receives a [`Tx`] and returns a boxed future — `Box::pin(async
-    /// move { … })`, mirroring sqlx's own transaction closures. SQL is written
-    /// with `?` placeholders (rewritten to `$1, $2, …` for Postgres) and bound
-    /// via [`params!`](crate::params):
+    /// move { … })`, mirroring sqlx's own transaction closures. (Its sibling
+    /// [`transaction_on`](Self::transaction_on) takes a plain `async |conn|`
+    /// closure instead; this path cannot, because it hands the body to the
+    /// provider through a `dyn` boundary, and stable Rust has no way to require
+    /// that an async closure's future is `Send`. Use
+    /// [`#[transaction]`](macro@crate::transaction) to skip the scaffolding.)
+    /// SQL is written with `?` placeholders (rewritten to `$1, $2, …` for
+    /// Postgres) and bound via [`params!`](crate::params):
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, params};
@@ -651,10 +656,15 @@ impl DurableContext {
     /// existing queries, `sqlx` macros, and data-access helpers work
     /// unchanged. durare owns the transaction: there is no commit method on a
     /// plain connection, and on Postgres a raw `COMMIT`/`ROLLBACK` statement
-    /// smuggled through SQL is detected and fails the step. Like
-    /// [`transaction`](Self::transaction), the body must be re-runnable
-    /// (`Fn`): a serialization conflict or deadlock restarts it on a fresh
-    /// transaction.
+    /// smuggled through SQL is detected and fails the step.
+    ///
+    /// The body is an **async closure** — `async |conn| { … }`, with no
+    /// `Box::pin` scaffolding (unlike [`transaction`](Self::transaction),
+    /// which hands its body through a `dyn` boundary that stable Rust cannot
+    /// combine with async closures). It must be re-runnable (`AsyncFn`, not
+    /// `AsyncFnOnce`): a serialization conflict or deadlock restarts it on a
+    /// fresh transaction, so write `async move |conn|` and clone anything the
+    /// body consumes rather than moving it out of a capture.
     ///
     /// If your application tables live **in the system database**, get the
     /// data source from the provider instead —
@@ -691,7 +701,7 @@ impl DurableContext {
     /// # use durare::{DurableContext, PgDataSource, Result};
     /// # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
     /// let total: i64 = ctx
-    ///     .transaction_on(&ds, "record-order", |conn| Box::pin(async move {
+    ///     .transaction_on(&ds, "record-order", async |conn| {
     ///         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
     ///             .bind("widget")
     ///             .execute(&mut *conn)
@@ -700,7 +710,7 @@ impl DurableContext {
     ///             .fetch_one(&mut *conn)
     ///             .await?;
     ///         Ok(n)
-    ///     }))
+    ///     })
     ///     .await?;
     /// # let _ = total;
     /// # Ok(()) }
@@ -710,10 +720,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
-            + Send
-            + Sync
-            + 'static,
+        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         self.transaction_on_with(ds, TransactionOptions::new(name), f)
             .await
@@ -736,10 +743,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
-            + Send
-            + Sync
-            + 'static,
+        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         let _guard = self.begin_transaction()?;
 
@@ -767,10 +771,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
-            + Send
-            + Sync
-            + 'static,
+        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         // Layer 1: the system-database checkpoint — a completed run.
         if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
@@ -932,10 +933,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
-            + Send
-            + Sync
-            + 'static,
+        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
@@ -1004,10 +1002,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
-            + Send
-            + Sync
-            + 'static,
+        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         let mut user_attempt: u32 = 0;
         let body_err = loop {
@@ -1115,10 +1110,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: for<'c> Fn(&'c mut DS::Conn) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
-            + Send
-            + Sync
-            + 'static,
+        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
