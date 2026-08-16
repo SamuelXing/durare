@@ -120,13 +120,13 @@
 //! # use durare::{DurableContext, PgDataSource, Result};
 //! # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
 //! let n: i64 = ctx
-//!     .transaction_on(&ds, "record-order", |conn| Box::pin(async move {
+//!     .transaction_on(&ds, "record-order", async |conn| {
 //!         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
 //!             .bind("widget")
 //!             .execute(&mut *conn)
 //!             .await?;
 //!         Ok(1)
-//!     }))
+//!     })
 //!     .await?;
 //! # let _ = n;
 //! # Ok(()) }
@@ -153,7 +153,7 @@
 //! let ds = provider.system_datasource(); // provider's own pool — no guessing
 //! let engine = DurableEngine::new(Arc::new(provider)).await?;
 //!
-//! ctx.transaction_on(&ds, "audit", |conn| Box::pin(async move {
+//! ctx.transaction_on(&ds, "audit", async |conn| {
 //!     // Qualify table names in fast-path bodies: this pool's search_path
 //!     // points at the system schema.
 //!     sqlx::query("INSERT INTO public.audit_log(entry) VALUES ($1)")
@@ -161,7 +161,7 @@
 //!         .execute(&mut *conn)
 //!         .await?;
 //!     Ok(())
-//! }))
+//! })
 //! .await?;
 //! # let _ = engine;
 //! # Ok(()) }
@@ -195,15 +195,23 @@
 //!
 //! # Which transaction API?
 //!
-//! | Your situation | Use | Body receives | Commits |
-//! |---|---|---|---|
-//! | Simple types, tables in the system database | [`transaction`] | [`Tx`] — portable `?` SQL | 1 |
-//! | Rich types or existing sqlx code, tables in the system database | [`transaction_on`] + `system_datasource()` | native connection | 1 |
-//! | Tables in a separate database | [`transaction_on`] + [`PgDataSource`] | native connection | 2 |
+//! | Your situation | Use | Body receives | Body written as | Commits |
+//! |---|---|---|---|---|
+//! | Simple types, tables in the system database | [`transaction`] | [`Tx`] — portable `?` SQL | `\|tx\| Box::pin(async move { … })` | 1 |
+//! | Rich types or existing sqlx code, tables in the system database | [`transaction_on`] + `system_datasource()` | native connection | `async \|conn\| { … }` | 1 |
+//! | Tables in a separate database | [`transaction_on`] + [`PgDataSource`] | native connection | `async \|conn\| { … }` | 2 |
 //!
 //! Rule of thumb: start with [`transaction`] — it keeps the body portable
 //! across backends. Switch a step to [`transaction_on`] when its types
 //! outgrow [`Param`] or it should reuse sqlx-typed helpers.
+//!
+//! The closure styles differ because [`transaction`] passes its body to the
+//! provider through a `dyn` boundary, and stable Rust cannot require that an
+//! async closure's future is `Send` (the `async_fn_traits` associated types
+//! are unstable). [`transaction_on`] calls the body directly on a generic
+//! data source, so it takes a plain async closure. Reach for
+//! [`#[transaction]`](macro@crate::transaction) if the `Box::pin` scaffolding
+//! bothers you — it writes that shape for you.
 //!
 //! [`transaction`]: crate::DurableContext::transaction
 //! [`transaction_on`]: crate::DurableContext::transaction_on

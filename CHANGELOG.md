@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `ctx.transaction_on` / `transaction_on_with` take an async
+  closure — `async |conn| { … }` — instead of a closure returning a boxed
+  future. The `Box::pin(async move { … })` scaffolding, and the per-call
+  `let x = x.clone()` shuffling it forced, are both gone; the connection type
+  now infers, so `conn` needs no annotation. Bodies stay re-runnable
+  (`AsyncFn`, not `AsyncFnOnce`), since a serialization conflict restarts them
+  on a fresh transaction — write `async move |conn|` and clone anything the
+  body consumes. Existing `|conn| Box::pin(…)` bodies still satisfy the new
+  bound (a closure returning a future implements `AsyncFn`), but ones that
+  relied on the old bound to infer the connection type now need an explicit
+  `|conn: &mut sqlx::PgConnection|`; converting to `async |conn|` is the fix.
+
+  `ctx.transaction` / `transaction_with` are **unchanged** and still take
+  `|tx| Box::pin(async move { … })`. They pass the body to the provider
+  through a `dyn` boundary, and stable Rust cannot require that an async
+  closure's returned future is `Send` — the `async_fn_traits` associated
+  types are unstable. `transaction_on` calls its body directly on a generic
+  data source, so it has no such boundary. The asymmetry is documented in the
+  `transactions` guide's "Which transaction API?" table; use
+  `#[durare::transaction]` to skip the scaffolding on the `Tx` path.
+
 ### Added
 
 - `PostgresProvider::from_pool_with_schema(pool, schema)`: a caller-owned

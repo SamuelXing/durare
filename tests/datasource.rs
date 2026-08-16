@@ -52,19 +52,16 @@ async fn commits_writes_with_witness_row_exactly_once() -> Result<()> {
     engine.register("order", move |ctx: DurableContext, item: String| {
         let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
         async move {
-            ctx.transaction_on(&ds, "record-order", move |conn| {
-                let (item, runs) = (item.clone(), runs.clone());
-                Box::pin(async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    sqlx::query("INSERT INTO orders(item) VALUES (?)")
-                        .bind(&item)
-                        .execute(&mut *conn)
-                        .await?;
-                    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
-                        .fetch_one(&mut *conn)
-                        .await?;
-                    Ok(n)
-                })
+            ctx.transaction_on(&ds, "record-order", async move |conn| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("INSERT INTO orders(item) VALUES (?)")
+                    .bind(&item)
+                    .execute(&mut *conn)
+                    .await?;
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                Ok(n)
             })
             .await
         }
@@ -136,15 +133,12 @@ async fn completion_row_replays_without_rerunning_the_body() -> Result<()> {
         let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
         async move {
             let n: i64 = ctx
-                .transaction_on(&ds, "record-order", move |conn| {
-                    let runs = runs.clone();
-                    Box::pin(async move {
-                        runs.fetch_add(1, Ordering::SeqCst);
-                        sqlx::query("INSERT INTO orders(item) VALUES ('should-not-run')")
-                            .execute(&mut *conn)
-                            .await?;
-                        Ok(0)
-                    })
+                .transaction_on(&ds, "record-order", async move |conn| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    sqlx::query("INSERT INTO orders(item) VALUES ('should-not-run')")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(0)
                 })
                 .await?;
             Ok::<_, Error>(n)
@@ -175,15 +169,12 @@ async fn failure_rolls_back_mirrors_and_replays() -> Result<()> {
     engine.register("doomed", move |ctx: DurableContext, (): ()| {
         let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
         async move {
-            ctx.transaction_on(&ds, "doomed-tx", move |conn| {
-                let runs = runs.clone();
-                Box::pin(async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    sqlx::query("INSERT INTO orders(item) VALUES ('rolled-back')")
-                        .execute(&mut *conn)
-                        .await?;
-                    Err::<i64, _>(Error::app("boom"))
-                })
+            ctx.transaction_on(&ds, "doomed-tx", async move |conn| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("INSERT INTO orders(item) VALUES ('rolled-back')")
+                    .execute(&mut *conn)
+                    .await?;
+                Err::<i64, _>(Error::app("boom"))
             })
             .await
         }
@@ -246,18 +237,15 @@ async fn retry_policy_reruns_on_fresh_transactions() -> Result<()> {
             let opts = TransactionOptions::new("flaky-tx")
                 .max_retries(3)
                 .base_interval(std::time::Duration::from_millis(1));
-            ctx.transaction_on_with(&ds, opts, move |conn| {
-                let attempts = attempts.clone();
-                Box::pin(async move {
-                    let n = attempts.fetch_add(1, Ordering::SeqCst);
-                    sqlx::query("INSERT INTO orders(item) VALUES ('attempt')")
-                        .execute(&mut *conn)
-                        .await?;
-                    if n < 2 {
-                        return Err(Error::app("transient"));
-                    }
-                    Ok(())
-                })
+            ctx.transaction_on_with(&ds, opts, async move |conn| {
+                let n = attempts.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("INSERT INTO orders(item) VALUES ('attempt')")
+                    .execute(&mut *conn)
+                    .await?;
+                if n < 2 {
+                    return Err(Error::app("transient"));
+                }
+                Ok(())
             })
             .await
         }
@@ -293,12 +281,10 @@ async fn nested_transaction_is_rejected() -> Result<()> {
         async move {
             let inner_ctx = ctx.clone();
             let inner_ds = ds.clone();
-            ctx.transaction_on(&ds, "outer", move |_conn| {
-                let (ctx, ds) = (inner_ctx.clone(), inner_ds.clone());
-                Box::pin(async move {
-                    ctx.transaction_on(&ds, "inner", |_conn| Box::pin(async move { Ok(()) }))
-                        .await
-                })
+            ctx.transaction_on(&ds, "outer", async move |_conn| {
+                inner_ctx
+                    .transaction_on(&inner_ds, "inner", async |_conn| Ok(()))
+                    .await
             })
             .await
         }
@@ -348,17 +334,15 @@ async fn pg_datasource_end_to_end() -> Result<()> {
     engine.register("order", move |ctx: DurableContext, (): ()| {
         let ds = wf_ds.clone();
         async move {
-            ctx.transaction_on(&ds, "record-order", |conn| {
-                Box::pin(async move {
-                    sqlx::query("INSERT INTO orders(item) VALUES ($1)")
-                        .bind("widget")
-                        .execute(&mut *conn)
-                        .await?;
-                    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
-                        .fetch_one(&mut *conn)
-                        .await?;
-                    Ok(n)
-                })
+            ctx.transaction_on(&ds, "record-order", async |conn| {
+                sqlx::query("INSERT INTO orders(item) VALUES ($1)")
+                    .bind("widget")
+                    .execute(&mut *conn)
+                    .await?;
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                Ok(n)
             })
             .await
         }
@@ -367,12 +351,10 @@ async fn pg_datasource_end_to_end() -> Result<()> {
     engine.register("escape", move |ctx: DurableContext, (): ()| {
         let ds = guard_ds.clone();
         async move {
-            ctx.transaction_on(&ds, "escape-tx", |conn| {
-                Box::pin(async move {
-                    // A body must not end durare's transaction; this one does.
-                    sqlx::query("COMMIT").execute(&mut *conn).await?;
-                    Ok(0i64)
-                })
+            ctx.transaction_on(&ds, "escape-tx", async |conn| {
+                // A body must not end durare's transaction; this one does.
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(0i64)
             })
             .await
         }
@@ -435,18 +417,15 @@ async fn system_datasource_single_commit_without_witness_table() -> Result<()> {
     engine.register("sys-order", move |ctx: DurableContext, (): ()| {
         let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
         async move {
-            ctx.transaction_on(&ds, "sys-tx", move |conn| {
-                let runs = runs.clone();
-                Box::pin(async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('gear')")
-                        .execute(&mut *conn)
-                        .await?;
-                    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sys_orders")
-                        .fetch_one(&mut *conn)
-                        .await?;
-                    Ok(n)
-                })
+            ctx.transaction_on(&ds, "sys-tx", async move |conn| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("INSERT INTO sys_orders(item) VALUES ('gear')")
+                    .execute(&mut *conn)
+                    .await?;
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sys_orders")
+                    .fetch_one(&mut *conn)
+                    .await?;
+                Ok(n)
             })
             .await
         }
@@ -513,15 +492,12 @@ async fn system_datasource_failure_rolls_back_and_replays() -> Result<()> {
     engine.register("sys-doomed", move |ctx: DurableContext, (): ()| {
         let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
         async move {
-            ctx.transaction_on(&ds, "sys-doomed-tx", move |conn| {
-                let runs = runs.clone();
-                Box::pin(async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('rolled-back')")
-                        .execute(&mut *conn)
-                        .await?;
-                    Err::<i64, _>(Error::app("sys-boom"))
-                })
+            ctx.transaction_on(&ds, "sys-doomed-tx", async move |conn| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("INSERT INTO sys_orders(item) VALUES ('rolled-back')")
+                    .execute(&mut *conn)
+                    .await?;
+                Err::<i64, _>(Error::app("sys-boom"))
             })
             .await
         }
@@ -577,28 +553,26 @@ async fn pg_system_datasource_rich_types_single_commit() -> Result<()> {
     engine.register("sys-rich", move |ctx: DurableContext, (): ()| {
         let ds = wf_ds.clone();
         async move {
-            ctx.transaction_on(&ds, "sys-rich-tx", |conn| {
-                Box::pin(async move {
-                    // Types Param cannot express, bound natively.
-                    sqlx::query("INSERT INTO sys_orders(meta, tags) VALUES ($1, $2)")
-                        .bind(serde_json::json!({"reason": "fee", "amount": 42}))
-                        .bind(vec![7i64, 11, 13])
-                        .execute(&mut *conn)
+            ctx.transaction_on(&ds, "sys-rich-tx", async |conn| {
+                // Types Param cannot express, bound natively.
+                sqlx::query("INSERT INTO sys_orders(meta, tags) VALUES ($1, $2)")
+                    .bind(serde_json::json!({"reason": "fee", "amount": 42}))
+                    .bind(vec![7i64, 11, 13])
+                    .execute(&mut *conn)
+                    .await?;
+                let amount: i64 =
+                    sqlx::query_scalar("SELECT (meta->>'amount')::bigint FROM sys_orders")
+                        .fetch_one(&mut *conn)
                         .await?;
-                    let amount: i64 =
-                        sqlx::query_scalar("SELECT (meta->>'amount')::bigint FROM sys_orders")
-                            .fetch_one(&mut *conn)
-                            .await?;
-                    // A body that redirects search_path must not redirect the
-                    // checkpoint: the fast-path insert (which runs after the
-                    // body, inside this same transaction) is schema-qualified.
-                    // LOCAL so the redirect dies with the transaction instead
-                    // of poisoning the pooled connection for later users.
-                    sqlx::query("SET LOCAL search_path TO public")
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(amount)
-                })
+                // A body that redirects search_path must not redirect the
+                // checkpoint: the fast-path insert (which runs after the
+                // body, inside this same transaction) is schema-qualified.
+                // LOCAL so the redirect dies with the transaction instead
+                // of poisoning the pooled connection for later users.
+                sqlx::query("SET LOCAL search_path TO public")
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(amount)
             })
             .await
         }
@@ -669,13 +643,10 @@ async fn foreign_system_datasource_is_rejected() -> Result<()> {
     engine_b.register("misrouted", move |ctx: DurableContext, (): ()| {
         let (ds, runs) = (wf_ds.clone(), wf_runs.clone());
         async move {
-            ctx.transaction_on(&ds, "misrouted-tx", move |conn| {
-                let runs = runs.clone();
-                Box::pin(async move {
-                    runs.fetch_add(1, Ordering::SeqCst);
-                    sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
-                    Ok(())
-                })
+            ctx.transaction_on(&ds, "misrouted-tx", async move |conn| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                sqlx::query("SELECT 1").fetch_one(&mut *conn).await?;
+                Ok(())
             })
             .await
         }
@@ -728,44 +699,31 @@ async fn duplicate_fast_path_divergent_checkpoint_stops_the_loser() -> Result<()
         let wf_id = ctx.workflow_id().to_string();
         async move {
             let n: i64 = ctx
-                .transaction_on(&ds, "dup-tx", move |conn| {
-                    let (runs, rival_pool, rival_provider, wf_id) = (
-                        runs.clone(),
-                        rival_pool.clone(),
-                        rival_provider.clone(),
-                        wf_id.clone(),
-                    );
-                    Box::pin(async move {
-                        runs.fetch_add(1, Ordering::SeqCst);
-                        // The "other executor" commits a divergent checkpoint
-                        // for this step on a separate connection, right in the
-                        // race window — and then finishes the whole workflow.
-                        let ser = Serializer::Json;
-                        sqlx::query(
-                            "INSERT INTO operation_outputs
+                .transaction_on(&ds, "dup-tx", async move |conn| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    // The "other executor" commits a divergent checkpoint
+                    // for this step on a separate connection, right in the
+                    // race window — and then finishes the whole workflow.
+                    let ser = Serializer::Json;
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
                                  (workflow_uuid, function_id, function_name, output, serialization,
                                   started_at_epoch_ms, completed_at_epoch_ms)
                              VALUES (?, 0, 'dup-tx', ?, ?, 0, 0)",
-                        )
-                        .bind(&wf_id)
-                        .bind(ser.encode(&serde_json::json!(99))?)
-                        .bind(ser.name())
-                        .execute(&rival_pool)
+                    )
+                    .bind(&wf_id)
+                    .bind(ser.encode(&serde_json::json!(99))?)
+                    .bind(ser.name())
+                    .execute(&rival_pool)
+                    .await?;
+                    rival_provider
+                        .set_workflow_status(&wf_id, "SUCCESS", Some(&serde_json::json!(50)), None)
                         .await?;
-                        rival_provider
-                            .set_workflow_status(
-                                &wf_id,
-                                "SUCCESS",
-                                Some(&serde_json::json!(50)),
-                                None,
-                            )
-                            .await?;
-                        // This attempt's own write — must be rolled back.
-                        sqlx::query("INSERT INTO sys_orders(item) VALUES ('duplicate')")
-                            .execute(&mut *conn)
-                            .await?;
-                        Ok(1i64)
-                    })
+                    // This attempt's own write — must be rolled back.
+                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('duplicate')")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(1i64)
                 })
                 .await?;
             // The loser must never get here: continuing would double every
@@ -822,28 +780,25 @@ async fn duplicate_fast_path_identical_checkpoint_converges() -> Result<()> {
         let wf_id = ctx.workflow_id().to_string();
         async move {
             let n: i64 = ctx
-                .transaction_on(&ds, "conv-tx", move |conn| {
-                    let (rival_pool, wf_id) = (rival_pool.clone(), wf_id.clone());
-                    Box::pin(async move {
-                        // The rival's row records exactly what this body
-                        // returns: an ack-lost retry, not a divergence.
-                        let ser = Serializer::Json;
-                        sqlx::query(
-                            "INSERT INTO operation_outputs
+                .transaction_on(&ds, "conv-tx", async move |conn| {
+                    // The rival's row records exactly what this body
+                    // returns: an ack-lost retry, not a divergence.
+                    let ser = Serializer::Json;
+                    sqlx::query(
+                        "INSERT INTO operation_outputs
                                  (workflow_uuid, function_id, function_name, output, serialization,
                                   started_at_epoch_ms, completed_at_epoch_ms)
                              VALUES (?, 0, 'conv-tx', ?, ?, 0, 0)",
-                        )
-                        .bind(&wf_id)
-                        .bind(ser.encode(&serde_json::json!(1))?)
-                        .bind(ser.name())
-                        .execute(&rival_pool)
+                    )
+                    .bind(&wf_id)
+                    .bind(ser.encode(&serde_json::json!(1))?)
+                    .bind(ser.name())
+                    .execute(&rival_pool)
+                    .await?;
+                    sqlx::query("INSERT INTO sys_orders(item) VALUES ('converge')")
+                        .execute(&mut *conn)
                         .await?;
-                        sqlx::query("INSERT INTO sys_orders(item) VALUES ('converge')")
-                            .execute(&mut *conn)
-                            .await?;
-                        Ok(1i64)
-                    })
+                    Ok(1i64)
                 })
                 .await?;
             after.fetch_add(1, Ordering::SeqCst);
@@ -901,38 +856,29 @@ async fn duplicate_external_divergent_witness_stops_the_loser() -> Result<()> {
         let wf_id = ctx.workflow_id().to_string();
         async move {
             let n: i64 = ctx
-                .transaction_on(&ds, "ext-tx", move |conn| {
-                    let (rival_pool, rival_provider, wf_id) =
-                        (rival_pool.clone(), rival_provider.clone(), wf_id.clone());
-                    Box::pin(async move {
-                        // The rival commits a divergent witness row in the
-                        // application database, then finishes the workflow in
-                        // the system database.
-                        let ser = Serializer::Json;
-                        sqlx::query(
-                            "INSERT INTO transaction_completion
+                .transaction_on(&ds, "ext-tx", async move |conn| {
+                    // The rival commits a divergent witness row in the
+                    // application database, then finishes the workflow in
+                    // the system database.
+                    let ser = Serializer::Json;
+                    sqlx::query(
+                        "INSERT INTO transaction_completion
                                  (workflow_id, step_id, output, error, serialization, created_at)
                              VALUES (?, 0, ?, NULL, ?, 0)",
-                        )
-                        .bind(&wf_id)
-                        .bind(ser.encode(&serde_json::json!(99))?)
-                        .bind(ser.name())
-                        .execute(&rival_pool)
+                    )
+                    .bind(&wf_id)
+                    .bind(ser.encode(&serde_json::json!(99))?)
+                    .bind(ser.name())
+                    .execute(&rival_pool)
+                    .await?;
+                    rival_provider
+                        .set_workflow_status(&wf_id, "SUCCESS", Some(&serde_json::json!(50)), None)
                         .await?;
-                        rival_provider
-                            .set_workflow_status(
-                                &wf_id,
-                                "SUCCESS",
-                                Some(&serde_json::json!(50)),
-                                None,
-                            )
-                            .await?;
-                        // This attempt's own write — must roll back.
-                        sqlx::query("INSERT INTO orders(item) VALUES ('duplicate')")
-                            .execute(&mut *conn)
-                            .await?;
-                        Ok(1i64)
-                    })
+                    // This attempt's own write — must roll back.
+                    sqlx::query("INSERT INTO orders(item) VALUES ('duplicate')")
+                        .execute(&mut *conn)
+                        .await?;
+                    Ok(1i64)
                 })
                 .await?;
             after.fetch_add(1, Ordering::SeqCst);
