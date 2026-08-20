@@ -666,7 +666,13 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
         error,
         error_info,
         executor_id: row.get("executor_id"),
-        app_version: row.get("application_version"),
+        // NULL is the stored form of "unset" (see `WorkflowStatus::app_version_opt`),
+        // and rows written by another SDK use it too.
+        app_version: row
+            .try_get::<Option<String>, _>("application_version")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         queue_name: row.try_get("queue_name").ok().flatten(),
         attributes: row.try_get("attributes").ok().flatten(),
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
@@ -821,7 +827,7 @@ impl StateProvider for PostgresProvider {
         .bind(serialize::encode_input(&self.serializer, &s.input)?)
         .bind(&s.status)
         .bind(&s.executor_id)
-        .bind(&s.app_version)
+        .bind(s.app_version_opt())
         .bind(&s.queue_name)
         .bind(&s.queue_partition_key)
         .bind(s.priority)
@@ -1424,9 +1430,11 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&mut *tx)
         .await?
         .is_none_or(|latest| latest == req.app_version);
+        // Byte-identical to Go/Python/TypeScript's gate. An unversioned row is
+        // NULL, never `''` — admitting `''` here would let durare claim rows no
+        // other SDK's executor can see.
         let version_clause = if is_latest {
-            "(application_version = $3 OR application_version = '' \
-              OR application_version IS NULL)"
+            "(application_version = $3 OR application_version IS NULL)"
         } else {
             "application_version = $3"
         };
@@ -2044,7 +2052,9 @@ impl StateProvider for PostgresProvider {
         ))
         .bind(new_id)
         .bind(STATUS_ENQUEUED)
-        .bind(params.app_version.as_deref())
+        // Same normalization as `WorkflowStatus::app_version_opt`: an explicitly
+        // empty override means "unset" and must persist as NULL.
+        .bind(params.app_version.as_deref().filter(|v| !v.is_empty()))
         .bind(original_id)
         .bind(&params.queue_name)
         .bind(params.partition_key.as_deref())

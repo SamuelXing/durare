@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Client-enqueued workflows were invisible to Go, Python, and TypeScript
+  executors.** An enqueue with no explicit application version persisted
+  `application_version = ''` rather than SQL NULL. Every other SDK admits an
+  unversioned row with `application_version = $n OR application_version IS
+  NULL`; an empty string satisfies neither predicate, so the row was skipped by
+  every foreign executor and sat `ENQUEUED` forever — silently, with no error
+  anywhere. This is the cross-language enqueue path (a Rust client feeding
+  workers in another language), so the failure was invisible in a Rust-only
+  fleet: durare's own dequeue gate carried an extra `OR application_version =
+  ''` clause that no reference SDK has.
+
+  An unset version now persists as NULL everywhere it is written — the enqueue
+  path and the fork override — and both dequeue gates are byte-identical to the
+  references, with the `''` clause removed. Reads treat NULL as unset, so rows
+  written by any SDK are understood. Databases carrying rows already written as
+  `''` need `UPDATE <schema>.workflow_status SET application_version = NULL
+  WHERE application_version = ''` to become claimable by a foreign executor.
+
 ### Changed
 
 - **Breaking:** `ctx.transaction_on` / `transaction_on_with` take an async
