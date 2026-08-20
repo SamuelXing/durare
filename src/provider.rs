@@ -491,6 +491,10 @@ pub struct WorkflowStatus {
     /// The executor (process) that owns this run; empty until claimed.
     pub executor_id: String,
     /// Application version that produced this row — recovery is version-gated.
+    /// Empty means "unset", and is persisted as SQL NULL, never as `''`: every
+    /// SDK's dequeue gate admits an unversioned row with
+    /// `application_version = $n OR application_version IS NULL`, which an
+    /// empty string would not match.
     pub app_version: String,
     /// Queue this workflow was enqueued on, if any.
     pub queue_name: Option<String>,
@@ -547,6 +551,19 @@ pub struct WorkflowStatus {
 }
 
 impl WorkflowStatus {
+    /// The application version as it must be **persisted**: `None` when unset,
+    /// so the column holds SQL NULL rather than `''`.
+    ///
+    /// Every SDK's dequeue gate admits an unversioned row with
+    /// `application_version = $n OR application_version IS NULL`. An empty
+    /// string satisfies neither predicate, so a row written as `''` is
+    /// invisible to Go, Python, and TypeScript executors and sits `ENQUEUED`
+    /// forever. Normalizing here keeps that impossible to reintroduce at any
+    /// single call site.
+    pub(crate) fn app_version_opt(&self) -> Option<&str> {
+        Some(self.app_version.as_str()).filter(|v| !v.is_empty())
+    }
+
     /// A fresh row for `id`/`name`/`input` in the given non-terminal `status`,
     /// stamped with the owning executor and app version. Optional fields default
     /// to empty; callers set queue/priority/etc. as needed.

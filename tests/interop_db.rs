@@ -116,7 +116,7 @@ async fn durare_runs_a_foreign_written_portable_workflow() -> Result<()> {
         "INSERT INTO workflow_status
             (workflow_uuid, name, inputs, status, executor_id, application_version,
              queue_name, priority, serialization, created_at, updated_at)
-         VALUES (?, ?, ?, ?, '', '', ?, 0, 'portable_json', ?, ?)",
+         VALUES (?, ?, ?, ?, '', NULL, ?, 0, 'portable_json', ?, ?)",
     )
     .bind(&wf_id)
     .bind("canonicalWorkflow")
@@ -197,7 +197,7 @@ async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
         eprintln!("skipping pg interop test: DATABASE_URL not set");
         return Ok(());
     };
-    // The foreign row below carries `application_version = ''` — claimable only
+    // The foreign row below carries `application_version = NULL` — claimable only
     // by the engine running the *latest registered* version. The version
     // registry is durable and shared, and every test binary registers its own
     // default version (a hash of its own executable) at launch — so a sibling
@@ -221,7 +221,7 @@ async fn durare_runs_a_foreign_written_portable_workflow_pg() -> Result<()> {
         "INSERT INTO dbos.workflow_status
             (workflow_uuid, name, inputs, status, executor_id, application_version,
              queue_name, priority, serialization, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, '', '', $5, 0, 'portable_json', $6, $7)",
+         VALUES ($1, $2, $3, $4, '', NULL, $5, 0, 'portable_json', $6, $7)",
     )
     .bind(&wf_id)
     .bind("canonicalWorkflow")
@@ -353,5 +353,76 @@ async fn durare_reads_a_foreign_failed_workflow() -> Result<()> {
     }
 
     let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// A `Client` enqueue with no explicit application version must persist SQL
+/// **NULL**, not `''`.
+///
+/// Every other SDK admits an unversioned row with
+/// `application_version = $1 OR application_version IS NULL`. An empty string
+/// satisfies neither predicate, so a row written as `''` is invisible to a Go,
+/// Python, or TypeScript executor and sits `ENQUEUED` forever. This asserts the
+/// stored value directly and then re-runs the *foreign* gate predicate verbatim,
+/// so the test fails if either the write or the gate regresses.
+#[tokio::test]
+async fn client_enqueue_stores_null_application_version() -> Result<()> {
+    use durare::{Client, WorkflowOptions};
+
+    let Some(base) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("skipping client_enqueue_stores_null_application_version: DATABASE_URL unset");
+        return Ok(());
+    };
+    let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_appver").await;
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register_queue(WorkflowQueue::new("q"));
+
+    let client = Client::new(provider.clone());
+    client
+        .enqueue::<_, i64>(
+            "q",
+            "unversioned",
+            1i64,
+            WorkflowOptions::with_id("appver-null"),
+        )
+        .await?;
+
+    let pool = sqlx::postgres::PgPool::connect(&url).await.unwrap();
+
+    // The column is NULL, not the empty string.
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT application_version FROM dbos.workflow_status WHERE workflow_uuid = $1",
+    )
+    .bind("appver-null")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored, None,
+        "an unset application version must persist as NULL; `''` is invisible to every other SDK"
+    );
+
+    // The foreign executor's gate, verbatim from Go/Python/TypeScript — no
+    // `OR application_version = ''` clause. It must find the row.
+    let claimable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dbos.workflow_status
+         WHERE workflow_uuid = $1
+           AND (application_version = $2 OR application_version IS NULL)",
+    )
+    .bind("appver-null")
+    .bind("v1.2.3")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claimable, 1,
+        "a foreign SDK's dequeue gate must admit the unversioned row"
+    );
+
+    engine.shutdown(Duration::from_secs(5)).await?;
+    pool.close().await;
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
 }
