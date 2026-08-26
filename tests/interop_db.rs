@@ -356,28 +356,63 @@ async fn durare_reads_a_foreign_failed_workflow() -> Result<()> {
     Ok(())
 }
 
-/// A `Client` enqueue with no explicit application version must persist SQL
-/// **NULL**, not `''`.
+/// Shared assertions for the unset-application-version contract. The caller has
+/// already enqueued `appver-null` (unset version) and planted `appver-legacy`
+/// with the legacy `''` value that older durare wrote.
 ///
-/// Every other SDK admits an unversioned row with
-/// `application_version = $1 OR application_version IS NULL`. An empty string
-/// satisfies neither predicate, so a row written as `''` is invisible to a Go,
-/// Python, or TypeScript executor and sits `ENQUEUED` forever. This asserts the
-/// stored value directly and then re-runs the *foreign* gate predicate verbatim,
-/// so the test fails if either the write or the gate regresses.
+/// Drives the **real** dequeue gate through `dequeue_workflows` rather than
+/// re-running the predicate by hand, so this fails if the write regresses, if
+/// the `IS NULL` arm is dropped, or if the non-standard
+/// `OR application_version = ''` arm comes back.
+async fn assert_unset_version_claimable(provider: &Arc<dyn durare::StateProvider>) -> Result<()> {
+    use durare::DequeueRequest;
+
+    let status = provider
+        .get_workflow_status("appver-null")
+        .await?
+        .expect("the enqueued row");
+    assert_eq!(
+        status.app_version, "",
+        "an unset version reads back as unset"
+    );
+
+    // An executor whose version matches neither row's stored value.
+    let claimed = provider
+        .dequeue_workflows(&DequeueRequest {
+            queue_name: "q".into(),
+            executor_id: "exec-1".into(),
+            app_version: "v9.9.9".into(),
+            partition_key: None,
+            max_tasks: 10,
+            global_concurrency: None,
+            rate_limit_max: None,
+            rate_limit_period_ms: None,
+        })
+        .await?;
+    let ids: Vec<&str> = claimed.iter().map(|w| w.id.as_str()).collect();
+
+    assert!(
+        ids.contains(&"appver-null"),
+        "an unset (NULL) version must be claimable by any executor — this is the \
+         `IS NULL` arm every SDK's gate carries; claimed: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"appver-legacy"),
+        "a legacy `''` row must NOT be claimed: durare's gate now matches the other \
+         SDKs exactly, so `''` matches neither arm; claimed: {ids:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
-async fn client_enqueue_stores_null_application_version() -> Result<()> {
+async fn unset_application_version_is_null_and_claimable_sqlite() -> Result<()> {
     use durare::{Client, WorkflowOptions};
 
-    let Some(base) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
-        eprintln!("skipping client_enqueue_stores_null_application_version: DATABASE_URL unset");
-        return Ok(());
-    };
-    let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_appver").await;
-
-    let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register_queue(WorkflowQueue::new("q"));
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-appver-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let provider: Arc<dyn durare::StateProvider> = Arc::new(SqliteProvider::connect(&url).await?);
+    provider.init().await?;
 
     let client = Client::new(provider.clone());
     client
@@ -388,41 +423,147 @@ async fn client_enqueue_stores_null_application_version() -> Result<()> {
             WorkflowOptions::with_id("appver-null"),
         )
         .await?;
+    client
+        .enqueue::<_, i64>(
+            "q",
+            "unversioned",
+            1i64,
+            WorkflowOptions::with_id("appver-legacy"),
+        )
+        .await?;
 
-    let pool = sqlx::postgres::PgPool::connect(&url).await.unwrap();
+    // Rewrite one row to the legacy `''` an older durare would have stored.
+    let raw = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
+    sqlx::query("UPDATE workflow_status SET application_version = '' WHERE workflow_uuid = ?")
+        .bind("appver-legacy")
+        .execute(&raw)
+        .await
+        .unwrap();
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT application_version FROM workflow_status WHERE workflow_uuid = ?",
+    )
+    .bind("appver-null")
+    .fetch_one(&raw)
+    .await
+    .unwrap();
+    assert_eq!(stored, None, "an unset version persists as NULL, not `''`");
 
-    // The column is NULL, not the empty string.
+    assert_unset_version_claimable(&provider).await?;
+
+    raw.close().await;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unset_application_version_is_null_and_claimable_pg() -> Result<()> {
+    use durare::{Client, WorkflowOptions};
+
+    let Some(base) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("skipping unset_application_version_..._pg: DATABASE_URL unset");
+        return Ok(());
+    };
+    let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_appver").await;
+    let provider: Arc<dyn durare::StateProvider> = Arc::new(PostgresProvider::connect(&url).await?);
+    provider.init().await?;
+
+    let client = Client::new(provider.clone());
+    client
+        .enqueue::<_, i64>(
+            "q",
+            "unversioned",
+            1i64,
+            WorkflowOptions::with_id("appver-null"),
+        )
+        .await?;
+    client
+        .enqueue::<_, i64>(
+            "q",
+            "unversioned",
+            1i64,
+            WorkflowOptions::with_id("appver-legacy"),
+        )
+        .await?;
+
+    let raw = sqlx::postgres::PgPool::connect(&url).await.unwrap();
+    sqlx::query(
+        "UPDATE dbos.workflow_status SET application_version = '' WHERE workflow_uuid = $1",
+    )
+    .bind("appver-legacy")
+    .execute(&raw)
+    .await
+    .unwrap();
     let stored: Option<String> = sqlx::query_scalar(
         "SELECT application_version FROM dbos.workflow_status WHERE workflow_uuid = $1",
     )
     .bind("appver-null")
-    .fetch_one(&pool)
+    .fetch_one(&raw)
     .await
     .unwrap();
-    assert_eq!(
-        stored, None,
-        "an unset application version must persist as NULL; `''` is invisible to every other SDK"
-    );
+    assert_eq!(stored, None, "an unset version persists as NULL, not `''`");
 
-    // The foreign executor's gate, verbatim from Go/Python/TypeScript — no
-    // `OR application_version = ''` clause. It must find the row.
-    let claimable: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM dbos.workflow_status
-         WHERE workflow_uuid = $1
-           AND (application_version = $2 OR application_version IS NULL)",
+    assert_unset_version_claimable(&provider).await?;
+
+    raw.close().await;
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
+    Ok(())
+}
+
+/// A row written by a foreign client has `executor_id` **NULL** — the shared
+/// `enqueue_workflow()` SQL function does not list the column in its INSERT at
+/// all, and the schema allows NULL. Reading such a row must not panic.
+///
+/// Regression: `row_to_status` decoded it as a bare `String`, so any status
+/// read of a foreign-enqueued workflow died with
+/// `ColumnDecode { index: "executor_id", source: UnexpectedNullError }` on
+/// Postgres. SQLite silently decoded NULL as `""`, which is why the SQLite half
+/// of the suite never caught it.
+#[tokio::test]
+async fn foreign_row_with_null_executor_id_reads_cleanly_pg() -> Result<()> {
+    let Some(base) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+        eprintln!(
+            "skipping foreign_row_with_null_executor_id_reads_cleanly_pg: DATABASE_URL unset"
+        );
+        return Ok(());
+    };
+    let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_nullexec").await;
+    let provider: Arc<dyn durare::StateProvider> = Arc::new(PostgresProvider::connect(&url).await?);
+    provider.init().await?;
+
+    // Exactly the column set `enqueue_workflow()` writes: no executor_id, no
+    // application_version, no name-adjacent defaults.
+    let raw = sqlx::postgres::PgPool::connect(&url).await.unwrap();
+    sqlx::query(
+        "INSERT INTO dbos.workflow_status
+             (workflow_uuid, status, name, queue_name, created_at, updated_at, serialization)
+         VALUES ($1, 'ENQUEUED', 'foreign-wf', 'q', 0, 0, 'portable_json')",
     )
-    .bind("appver-null")
-    .bind("v1.2.3")
-    .fetch_one(&pool)
+    .bind("null-exec")
+    .execute(&raw)
     .await
     .unwrap();
-    assert_eq!(
-        claimable, 1,
-        "a foreign SDK's dequeue gate must admit the unversioned row"
-    );
 
-    engine.shutdown(Duration::from_secs(5)).await?;
-    pool.close().await;
+    let status = provider
+        .get_workflow_status("null-exec")
+        .await?
+        .expect("the foreign row must be readable, not a panic");
+    assert_eq!(
+        status.executor_id, "",
+        "NULL executor_id reads as unclaimed"
+    );
+    assert_eq!(
+        status.app_version, "",
+        "NULL application_version reads as unset"
+    );
+    assert_eq!(status.name, "foreign-wf");
+
+    // And it must be listable, which is the path the admin/conductor use.
+    let listed = provider
+        .list_workflows(&durare::ListFilter::default())
+        .await?;
+    assert!(listed.iter().any(|w| w.id == "null-exec"));
+
+    raw.close().await;
     common::drop_hermetic_pg_db(&admin, &dbname).await;
     Ok(())
 }

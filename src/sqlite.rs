@@ -174,8 +174,16 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
     let (error, error_info) = serialize::decode_error_opt(fmt, stored_error.as_deref());
     WorkflowStatus {
         id: row.get("workflow_uuid"),
-        name: row.get("name"),
-        status: row.get("status"),
+        name: row
+            .try_get::<Option<String>, _>("name")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        status: row
+            .try_get::<Option<String>, _>("status")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         input: serialize::decode_input_opt(serializer, fmt, inputs.as_deref())
             .ok()
             .flatten()
@@ -185,7 +193,15 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
             .flatten(),
         error,
         error_info,
-        executor_id: row.get("executor_id"),
+        // Nullable in the schema, and genuinely NULL on rows a foreign client
+        // wrote: the shared `enqueue_workflow()` SQL function does not list
+        // `executor_id` in its INSERT at all. Decoding it as a bare `String`
+        // panics on those rows, so treat NULL as "unclaimed" instead.
+        executor_id: row
+            .try_get::<Option<String>, _>("executor_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         // NULL is the stored form of "unset" (see `WorkflowStatus::app_version_opt`),
         // and rows written by another SDK use it too.
         app_version: row
@@ -810,7 +826,7 @@ impl StateProvider for SqliteProvider {
         }
 
         // A row's version must match this executor's exactly; unversioned rows
-        // ('' or NULL, e.g. client-enqueued) are claimable only by the fleet
+        // (NULL, e.g. client-enqueued) are claimable only by the fleet
         // running the LATEST registered application version — otherwise a
         // stale-version executor could claim work whose handlers it no longer
         // has. No registered versions ⇒ treat this executor as latest.
@@ -862,7 +878,9 @@ impl StateProvider for SqliteProvider {
             ))
             .bind(STATUS_PENDING)
             .bind(&req.executor_id)
-            .bind(&req.app_version)
+            // Same normalization as `WorkflowStatus::app_version_opt`: an
+            // empty-version executor must not stamp `''` onto a row it claims.
+            .bind(Some(req.app_version.as_str()).filter(|v| !v.is_empty()))
             .bind(now_ms)
             .bind(rate_limited)
             .bind(now_ms)
@@ -2071,7 +2089,9 @@ impl StateProvider for SqliteProvider {
             .bind(col_str(s, "executor_id"))
             .bind(col_i64(s, "created_at"))
             .bind(col_i64(s, "updated_at"))
-            .bind(col_str(s, "application_version"))
+            // An exported `""` (the in-memory provider renders an unset
+            // version that way) must import as NULL, not as an unclaimable `''`.
+            .bind(col_str(s, "application_version").filter(|v| !v.is_empty()))
             .bind(col_str(s, "application_id"))
             .bind(col_str(s, "class_name"))
             .bind(col_str(s, "config_name"))
