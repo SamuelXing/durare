@@ -350,7 +350,8 @@ impl EngineConfig {
 /// The default application version: a hex sha-256 of the running executable,
 /// computed once per process. Distinct builds hash differently, so two
 /// deployments sharing a system database never claim each other's queued or
-/// recovering work. Falls back to `""` (matches-any in dequeue gating) if the
+/// recovering work. Falls back to `""` — meaning "unset", persisted as SQL
+/// NULL and claimable by any executor — if the
 /// executable cannot be read, with a warning.
 fn binary_version() -> &'static str {
     static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -2476,9 +2477,20 @@ pub(crate) async fn list_pending_workflows(
     rt: &Arc<Runtime>,
     executor_ids: &[String],
 ) -> Result<Vec<WorkflowStatus>> {
+    // An empty runtime version means "unset" — `binary_version()` falls back to
+    // it when the executable cannot be hashed. Unset is persisted as SQL NULL,
+    // which `application_version = ANY(ARRAY[''])` does not match, so filtering
+    // on it would silently recover nothing and strand every pending workflow.
+    // Drop the predicate instead and recover on executor id alone, the way Go
+    // does (`if appVersion != ""`, system_database.go).
+    let app_version = if rt.app_version.is_empty() {
+        Vec::new()
+    } else {
+        vec![rt.app_version.clone()]
+    };
     let filter = ListFilter {
         status: vec![STATUS_PENDING.to_string()],
-        app_version: vec![rt.app_version.clone()],
+        app_version,
         executor_ids: executor_ids.to_vec(),
         ..Default::default()
     };

@@ -41,6 +41,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Client-enqueued workflows were invisible to Go, Python, and TypeScript
+  executors, and reading a foreign-written row panicked.** Two halves of the
+  same mismatch: durare assumed columns are non-NULL where the other SDKs leave
+  them NULL.
+
+  *Writes.* An enqueue with no explicit application version persisted
+  `application_version = ''` rather than SQL NULL. Every other SDK admits an
+  unversioned row with `application_version = $n OR application_version IS
+  NULL`; `''` satisfies neither predicate, so the row was skipped by every
+  foreign executor and sat `ENQUEUED` forever, silently. It was invisible in a
+  Rust-only fleet because durare's own gate carried an extra
+  `OR application_version = ''` clause no reference SDK has. An unset version
+  now persists as NULL on every path that writes it — enqueue, the fork
+  override, the dequeue claim, and `import_workflow` — and both gates are
+  byte-identical to the references', with the `''` clause removed.
+
+  *Reads.* `row_to_status` decoded `executor_id`, `name`, and `status` as bare
+  `String`s, but all three are nullable and the shared `enqueue_workflow()` SQL
+  function does not write `executor_id` at all. Any status read of a
+  foreign-enqueued workflow therefore panicked on Postgres with
+  `UnexpectedNullError` (SQLite silently decoded NULL as `""`, which is why the
+  always-on backend never caught it). All three now decode as `Option` and
+  treat NULL as unset.
+
+  Recovery no longer filters on an empty application version: `binary_version()`
+  falls back to `""` when the executable cannot be hashed, and
+  `application_version = ANY(ARRAY[''])` matches no NULL row, which would have
+  stranded every pending workflow of such an engine. The predicate is dropped
+  when the version is unset, as Go does.
+
+  On startup the Postgres provider warns if unfinished workflows still carry the
+  legacy `''`, naming the one-line backfill
+  (`UPDATE <schema>.workflow_status SET application_version = NULL WHERE
+  application_version = ''`) — those rows are claimable by no executor, durare's
+  or otherwise, until it is run.
+
 - Workflow ownership is fenced across processes. Recovery now *claims* each
   pending row through an atomic compare-and-set on
   `(PENDING, executor_id, recovery_attempts)` — any number of concurrent

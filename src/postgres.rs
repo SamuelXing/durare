@@ -457,6 +457,44 @@ impl PostgresProvider {
     /// explicitly first. (The SET matches the pool's connect-time default, so
     /// releasing the connection afterwards changes nothing. `from_pool` has no
     /// schema and keeps the caller's resolution untouched.)
+    /// Warn if the database still holds workflows whose `application_version` is
+    /// the legacy empty string.
+    ///
+    /// durare once persisted an unset version as `''`; it now writes NULL, and
+    /// the dequeue gate matches only `= $n OR IS NULL` (as every other SDK's
+    /// does). A leftover `''` row is therefore claimable by nobody and would sit
+    /// `ENQUEUED` forever — silently, which is the exact failure this change
+    /// exists to remove. Best-effort and never fatal: a warning is strictly
+    /// better than the silence, and a failed count must not block startup.
+    async fn warn_on_legacy_empty_app_version(&self) {
+        let sql = format!(
+            "SELECT count(*) FROM {workflow_status}
+             WHERE application_version = '' AND status IN ($1, $2, $3)",
+            workflow_status = self.tables.workflow_status
+        );
+        let stranded: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(&sql)
+            .bind(STATUS_ENQUEUED)
+            .bind(STATUS_PENDING)
+            .bind(STATUS_DELAYED)
+            .fetch_one(&self.pool)
+            .await;
+        if let Ok(n) = stranded {
+            if n > 0 {
+                tracing::warn!(
+                    workflows = n,
+                    "found {n} unfinished workflow(s) with the legacy \
+                     `application_version = ''`. durare now stores an unset version \
+                     as NULL, and no executor — durare's or any other SDK's — will \
+                     claim an `''` row. Back them off with: \
+                     UPDATE {table} SET application_version = NULL \
+                     WHERE application_version = '';",
+                    n = n,
+                    table = self.tables.workflow_status,
+                );
+            }
+        }
+    }
+
     async fn run_migrations(&self) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
         if !self.schema.is_empty() {
@@ -654,8 +692,16 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
     let (error, error_info) = serialize::decode_error_opt(fmt, stored_error.as_deref());
     WorkflowStatus {
         id: row.get("workflow_uuid"),
-        name: row.get("name"),
-        status: row.get("status"),
+        name: row
+            .try_get::<Option<String>, _>("name")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        status: row
+            .try_get::<Option<String>, _>("status")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         input: serialize::decode_input_opt(serializer, fmt, inputs.as_deref())
             .ok()
             .flatten()
@@ -665,8 +711,22 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
             .flatten(),
         error,
         error_info,
-        executor_id: row.get("executor_id"),
-        app_version: row.get("application_version"),
+        // Nullable in the schema, and genuinely NULL on rows a foreign client
+        // wrote: the shared `enqueue_workflow()` SQL function does not list
+        // `executor_id` in its INSERT at all. Decoding it as a bare `String`
+        // panics on those rows, so treat NULL as "unclaimed" instead.
+        executor_id: row
+            .try_get::<Option<String>, _>("executor_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
+        // NULL is the stored form of "unset" (see `WorkflowStatus::app_version_opt`),
+        // and rows written by another SDK use it too.
+        app_version: row
+            .try_get::<Option<String>, _>("application_version")
+            .ok()
+            .flatten()
+            .unwrap_or_default(),
         queue_name: row.try_get("queue_name").ok().flatten(),
         attributes: row.try_get("attributes").ok().flatten(),
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
@@ -764,6 +824,7 @@ impl StateProvider for PostgresProvider {
         // held connection before running them (the SET also matches the pool's
         // connect-time default, so releasing the connection changes nothing).
         self.run_migrations().await?;
+        self.warn_on_legacy_empty_app_version().await;
         // Start the LISTEN/NOTIFY listener once (it powers await_change). Spawned
         // here so it only runs for a provider that has been brought up; cancelled
         // when the provider is dropped. `Relaxed` suffices: this is purely a
@@ -821,7 +882,7 @@ impl StateProvider for PostgresProvider {
         .bind(serialize::encode_input(&self.serializer, &s.input)?)
         .bind(&s.status)
         .bind(&s.executor_id)
-        .bind(&s.app_version)
+        .bind(s.app_version_opt())
         .bind(&s.queue_name)
         .bind(&s.queue_partition_key)
         .bind(s.priority)
@@ -1412,7 +1473,7 @@ impl StateProvider for PostgresProvider {
             ("", "$4")
         };
         // A row's version must match this executor's exactly; unversioned rows
-        // ('' or NULL, e.g. client-enqueued) are claimable only by the fleet
+        // (NULL, e.g. client-enqueued) are claimable only by the fleet
         // running the LATEST registered application version — otherwise a
         // stale-version executor could claim work whose handlers it no longer
         // has. No registered versions ⇒ treat this executor as latest.
@@ -1424,9 +1485,11 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&mut *tx)
         .await?
         .is_none_or(|latest| latest == req.app_version);
+        // Byte-identical to Go/Python/TypeScript's gate. An unversioned row is
+        // NULL, never `''` — admitting `''` here would let durare claim rows no
+        // other SDK's executor can see.
         let version_clause = if is_latest {
-            "(application_version = $3 OR application_version = '' \
-              OR application_version IS NULL)"
+            "(application_version = $3 OR application_version IS NULL)"
         } else {
             "application_version = $3"
         };
@@ -1466,7 +1529,9 @@ impl StateProvider for PostgresProvider {
         ))
         .bind(STATUS_PENDING)
         .bind(&req.executor_id)
-        .bind(&req.app_version)
+        // Same normalization as `WorkflowStatus::app_version_opt`: an
+        // empty-version executor must not stamp `''` onto a row it claims.
+        .bind(Some(req.app_version.as_str()).filter(|v| !v.is_empty()))
         .bind(now_ms)
         .bind(req.rate_limit_max.is_some())
         .bind(&ids)
@@ -2044,7 +2109,9 @@ impl StateProvider for PostgresProvider {
         ))
         .bind(new_id)
         .bind(STATUS_ENQUEUED)
-        .bind(params.app_version.as_deref())
+        // Same normalization as `WorkflowStatus::app_version_opt`: an explicitly
+        // empty override means "unset" and must persist as NULL.
+        .bind(params.app_version.as_deref().filter(|v| !v.is_empty()))
         .bind(original_id)
         .bind(&params.queue_name)
         .bind(params.partition_key.as_deref())
@@ -2729,7 +2796,9 @@ impl StateProvider for PostgresProvider {
             .bind(col_str(s, "executor_id"))
             .bind(col_i64(s, "created_at"))
             .bind(col_i64(s, "updated_at"))
-            .bind(col_str(s, "application_version"))
+            // An exported `""` (the in-memory provider renders an unset
+            // version that way) must import as NULL, not as an unclaimable `''`.
+            .bind(col_str(s, "application_version").filter(|v| !v.is_empty()))
             .bind(col_str(s, "application_id"))
             .bind(col_str(s, "class_name"))
             .bind(col_str(s, "config_name"))
