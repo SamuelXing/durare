@@ -1547,6 +1547,9 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
     m.insert("forked_from".into(), json!(w.forked_from));
     m.insert("parent_workflow_id".into(), json!(w.parent_workflow_id));
     m.insert("delay_until_epoch_ms".into(), json!(w.delay_until_ms));
+    // Retention keys on `completed_at`, so it must survive an export/import
+    // round trip or the reimported row is uncollectable.
+    m.insert("completed_at".into(), json!(w.completed_at_ms));
     m.insert("serialization".into(), Value::Null);
     m
 }
@@ -1584,7 +1587,9 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
         started_at_ms: col_i64(s, "started_at_epoch_ms"),
         rate_limited: false,
         delay_until_ms: col_i64(s, "delay_until_epoch_ms"),
-        completed_at_ms: None,
+        // Retention is keyed on `completed_at`, so an imported terminal
+        // workflow that lost it would never be collectable again.
+        completed_at_ms: col_i64(s, "completed_at"),
         forked_from: col_str(s, "forked_from"),
         authenticated_user: col_str(s, "authenticated_user"),
         assumed_role: col_str(s, "assumed_role"),

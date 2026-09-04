@@ -1,9 +1,13 @@
-//! Garbage collection: the retention delete. Terminal (and dead-letter)
-//! history strictly older than the resolved cutoff goes — steps, events, and
-//! streams with it — while in-flight and still-queued work survives regardless
-//! of age. The cutoff is the newer of the absolute bound and the
-//! `rows_threshold`-th-newest workflow's `created_at`, matching the other DBOS
-//! SDKs.
+//! Garbage collection: the retention delete. History that *finished* strictly
+//! before the resolved cutoff goes — steps, events, and streams with it — while
+//! in-flight and still-queued work survives regardless of age. The cutoff is the
+//! newer of the absolute bound and the `rows_threshold`-th-newest workflow's
+//! `completed_at`, matching the other DBOS SDKs.
+//!
+//! The bound is `completed_at`, not `created_at`: a long-running workflow
+//! created before the cutoff but finished after it has barely any history to
+//! retain and must survive. That distinction is what
+//! `long_running_workflow_survives_a_cutoff_after_its_creation` pins down.
 
 use durare::{
     DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, WorkflowOptions,
@@ -26,6 +30,85 @@ async fn all_ids(engine: &DurableEngine) -> Result<Vec<String>> {
         .into_iter()
         .map(|w| w.id)
         .collect())
+}
+
+/// Seed a `workflow_status` row with exact `created_at` / `completed_at`
+/// instants, through `import_workflow` so the same seed works on every backend.
+/// `completed_at: None` leaves the row in flight.
+async fn seed(
+    engine: &DurableEngine,
+    id: &str,
+    status: &str,
+    created_ms: i64,
+    completed_ms: Option<i64>,
+) -> Result<()> {
+    let mut row = serde_json::Map::new();
+    row.insert("workflow_uuid".into(), serde_json::json!(id));
+    row.insert("status".into(), serde_json::json!(status));
+    row.insert("name".into(), serde_json::json!("seeded"));
+    row.insert("created_at".into(), serde_json::json!(created_ms));
+    row.insert("updated_at".into(), serde_json::json!(created_ms));
+    row.insert("completed_at".into(), serde_json::json!(completed_ms));
+    // Import binds every column explicitly, so an absent `priority` becomes an
+    // explicit NULL rather than falling back to SQLite's `NOT NULL DEFAULT 0`.
+    row.insert("priority".into(), serde_json::json!(0));
+    engine
+        .import_workflow(&[durare::ExportedWorkflow {
+            workflow_status: row,
+            ..Default::default()
+        }])
+        .await
+}
+
+/// The behaviour that separates a `completed_at` bound from a `created_at` one.
+///
+/// `long-runner` is created before the cutoff and finishes after it: it holds
+/// almost no history and must survive. Under the old `created_at` rule it was
+/// deleted — a workflow could be collected moments after finishing, purely
+/// because it started long ago.
+///
+/// `short-old` (created and finished before the cutoff) and `still-running`
+/// (created before it, never finished) are the controls: the first must go, the
+/// second must stay under any bound.
+async fn assert_completed_at_is_the_bound(engine: &DurableEngine) -> Result<()> {
+    const T0: i64 = 1_000_000; // creation, well before the cutoff
+    const CUTOFF: i64 = 2_000_000;
+    const T2: i64 = 3_000_000; // completion, after the cutoff
+
+    seed(engine, "long-runner", "SUCCESS", T0, Some(T2)).await?;
+    seed(engine, "short-old", "SUCCESS", T0, Some(T0 + 1)).await?;
+    seed(engine, "still-running", "PENDING", T0, None).await?;
+
+    let deleted = engine.garbage_collect(Some(CUTOFF), None).await?;
+    assert_eq!(deleted, 1, "only the run that finished before the cutoff");
+
+    let mut survivors = all_ids(engine).await?;
+    survivors.sort();
+    assert_eq!(
+        survivors,
+        vec!["long-runner", "still-running"],
+        "a workflow created before the cutoff but finished after it must survive"
+    );
+    Ok(())
+}
+
+/// `rows_threshold` ranks by `completed_at`, not `created_at`. The two orders
+/// are deliberately inverted here: the workflow created *first* finishes
+/// *last*, so "keep the newest 1" keeps a different row under each rule.
+async fn assert_threshold_ranks_by_completion(engine: &DurableEngine) -> Result<()> {
+    // created first, finished last
+    seed(engine, "slow-first", "SUCCESS", 1_000_000, Some(9_000_000)).await?;
+    // created last, finished first
+    seed(engine, "fast-second", "SUCCESS", 2_000_000, Some(3_000_000)).await?;
+
+    let deleted = engine.garbage_collect(None, Some(1)).await?;
+    assert_eq!(deleted, 1);
+    assert_eq!(
+        all_ids(engine).await?,
+        vec!["slow-first"],
+        "the newest by completion is kept, even though it was created first"
+    );
+    Ok(())
 }
 
 /// The GC predicate on the in-memory backend (the trait's default
@@ -126,7 +209,7 @@ async fn sqlite_gc_rows_threshold_keeps_newest_and_cascades() -> Result<()> {
             )
             .await?
             .await?;
-        // The threshold cutoff compares `created_at` in milliseconds; keep the
+        // The threshold cutoff compares `completed_at` in milliseconds; keep the
         // five runs on distinct timestamps so "the 2 newest" is well-defined.
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -290,6 +373,63 @@ async fn pg_gc_deletes_terminal_history_and_cascades() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn long_running_workflow_survives_a_cutoff_after_its_creation() -> Result<()> {
+    let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    assert_completed_at_is_the_bound(&engine).await
+}
+
+#[tokio::test]
+async fn rows_threshold_ranks_by_completion_not_creation() -> Result<()> {
+    let engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    assert_threshold_ranks_by_completion(&engine).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_long_running_workflow_survives_a_cutoff_after_its_creation() -> Result<()> {
+    use durare::SqliteProvider;
+
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-gc-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+
+    let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    assert_completed_at_is_the_bound(&engine).await?;
+    assert_threshold_ranks_by_completion_after_reset(&engine).await?;
+
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// The threshold assertion, run after the cutoff assertion has already left two
+/// rows behind: clear them first so "keep the newest 1" is unambiguous.
+async fn assert_threshold_ranks_by_completion_after_reset(engine: &DurableEngine) -> Result<()> {
+    let existing = all_ids(engine).await?;
+    engine.delete_workflows(&existing, false).await?;
+    assert_threshold_ranks_by_completion(engine).await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn pg_long_running_workflow_survives_a_cutoff_after_its_creation() -> Result<()> {
+    use durare::PostgresProvider;
+
+    let Some(base) = std::env::var("DATABASE_URL").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("skipping pg_long_running_workflow_survives_a_cutoff_after_its_creation: DATABASE_URL unset");
+        return Ok(());
+    };
+    let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_gc_completed").await;
+
+    let engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    assert_completed_at_is_the_bound(&engine).await?;
+    assert_threshold_ranks_by_completion_after_reset(&engine).await?;
+
+    drop(engine);
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
+    Ok(())
+}
+
 /// The retention knob end to end: a configured policy sweeps automatically
 /// after launch — terminal history goes, in-flight work survives, the
 /// collected count shows up in the metrics — and shutdown stops the sweeper.
@@ -382,12 +522,18 @@ async fn sqlite_gc_batches_large_backlogs() -> Result<()> {
     let url = format!("sqlite://{}", path.display());
 
     // Engine construction runs the migrations; the backlog is seeded raw.
+    // `completed_at` is seeded alongside `created_at` because collection is
+    // keyed on it — a terminal row without one is not collectable, which would
+    // make this a test of nothing. The point being pinned is unchanged: 12,000
+    // rows exceed the 10,000-row batch, so the delete must loop and still
+    // report the full count.
     let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
     sqlx::query(
         "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12000)
-         INSERT INTO workflow_status (workflow_uuid, status, name, created_at, updated_at)
-         SELECT 'seed-' || n, 'SUCCESS', 'seeded', 1000 + n, 1000 + n FROM seq",
+         INSERT INTO workflow_status
+             (workflow_uuid, status, name, created_at, updated_at, completed_at)
+         SELECT 'seed-' || n, 'SUCCESS', 'seeded', 1000 + n, 1000 + n, 1000 + n FROM seq",
     )
     .execute(&pool)
     .await

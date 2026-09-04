@@ -2520,6 +2520,19 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
     // Export, then delete the workflow (FK cascade clears its dependent rows).
     let exported = engine.export_workflow(id, false).await?;
     assert_eq!(exported.len(), 1);
+    // Retention is keyed on `completed_at`, so a round trip that drops it would
+    // silently make the reimported row uncollectable forever.
+    let completed_before = engine
+        .list_workflows(&ListFilter {
+            workflow_ids: vec![id.to_string()],
+            ..Default::default()
+        })
+        .await?[0]
+        .completed_at_ms;
+    assert!(
+        completed_before.is_some(),
+        "a finished workflow must have completed_at"
+    );
     engine.delete_workflows(&[id.to_string()], false).await?;
     assert!(engine
         .list_workflows(&ListFilter {
@@ -2541,6 +2554,10 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status, STATUS_SUCCESS);
     assert_eq!(rows[0].output, Some(serde_json::json!(42)));
+    assert_eq!(
+        rows[0].completed_at_ms, completed_before,
+        "completed_at must survive the round trip, or retention can never collect the row"
+    );
 
     let steps = engine.get_workflow_steps(id).await?;
     let double = steps.iter().find(|s| s.name == "double").expect("step");

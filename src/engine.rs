@@ -244,12 +244,14 @@ pub struct EngineConfig {
 /// ```
 #[derive(Clone, Debug)]
 pub struct RetentionPolicy {
-    /// Collect terminal workflows *created* longer ago than this. (`created_at`
-    /// is the reference bound across the DBOS SDKs — a workflow created 100
-    /// days ago that finished yesterday is collectable under a 90-day period.)
+    /// Collect workflows that *finished* longer ago than this. (`completed_at`
+    /// is the reference bound across the DBOS SDKs — a workflow created 100 days
+    /// ago that finished yesterday has one day of history and survives a 90-day
+    /// period.)
     pub period: Option<Duration>,
-    /// Keep at most the newest N workflows: the Nth-newest `created_at`
-    /// becomes the cutoff. Must be positive.
+    /// Keep at most the newest N completed workflows: the Nth-newest
+    /// `completed_at` becomes the cutoff. Must be positive. In-flight work is
+    /// not counted against the limit.
     pub max_rows: Option<i64>,
     /// How often the sweeper enforces the policy. Defaults to one hour.
     pub sweep_interval: Duration,
@@ -271,13 +273,13 @@ impl RetentionPolicy {
         Self::default()
     }
 
-    /// Collect terminal workflows created longer ago than `period`.
+    /// Collect workflows that finished longer ago than `period`.
     pub fn period(mut self, period: Duration) -> Self {
         self.period = Some(period);
         self
     }
 
-    /// Keep at most the newest `max_rows` workflows.
+    /// Keep at most the newest `max_rows` completed workflows.
     pub fn max_rows(mut self, max_rows: i64) -> Self {
         self.max_rows = Some(max_rows);
         self
@@ -1757,10 +1759,9 @@ impl DurableEngine {
         Ok(ids.len())
     }
 
-    /// Garbage-collect workflow history: delete every workflow **not** in
-    /// `PENDING`/`ENQUEUED`/`DELAYED` created strictly before a cutoff —
-    /// along with its step, event, and stream rows — and return how many were
-    /// deleted. The retention counterpart to
+    /// Garbage-collect workflow history: delete every workflow that **finished**
+    /// strictly before a cutoff — along with its step, event, and stream rows —
+    /// and return how many were deleted. The retention counterpart to
     /// [`delete_workflows`](Self::delete_workflows)' targeted delete, with the
     /// same cross-SDK semantics as the other DBOS SDKs (the DBOS console's
     /// retention policy calls this through the conductor, and the admin
@@ -1768,15 +1769,16 @@ impl DurableEngine {
     ///
     /// The cutoff is the more restrictive (newer) of the two bounds:
     ///
-    /// - `cutoff_epoch_ms` — delete anything created before this epoch-ms
+    /// - `cutoff_epoch_ms` — delete anything that finished before this epoch-ms
     ///   instant;
-    /// - `rows_threshold` — keep (at most) the newest N workflows: the
-    ///   `created_at` of the Nth-newest becomes the cutoff. Must be positive.
+    /// - `rows_threshold` — keep (at most) the newest N completed workflows: the
+    ///   `completed_at` of the Nth-newest becomes the cutoff. Must be positive.
     ///
     /// Both `None` is a no-op returning `0`. In-flight and still-queued work
-    /// survives regardless of age; deleted history is gone — run exports
-    /// ([`export_workflow`](Self::export_workflow)) first if you need an
-    /// archive.
+    /// survives regardless of age — it has no `completed_at` for either bound to
+    /// select — and is not counted against `rows_threshold`. Deleted history is
+    /// gone: run exports ([`export_workflow`](Self::export_workflow)) first if
+    /// you need an archive.
     pub async fn garbage_collect(
         &self,
         cutoff_epoch_ms: Option<i64>,

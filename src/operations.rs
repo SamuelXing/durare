@@ -146,9 +146,12 @@
 //!
 //! Underneath sits [`garbage_collect`](crate::DurableEngine::garbage_collect),
 //! the trimming primitive with the same semantics as the other DBOS SDKs:
-//! an absolute `created_at` cutoff, a keep-the-newest-N rows bound, or both
-//! (the newer cutoff wins), and everything terminal that falls outside is
-//! deleted — in-flight and queued work survives regardless of age. Drive it
+//! an absolute `completed_at` cutoff, a keep-the-newest-N rows bound, or both
+//! (the newer cutoff wins), and everything that finished outside the bound is
+//! deleted — in-flight and queued work survives regardless of age. The bound is
+//! when a workflow *finished*, not when it started: a 90-day policy keeps 90
+//! days of completed history, so a long-running workflow is never collected out
+//! from under itself. Drive it
 //! manually, from a cron job against the admin server's
 //! `POST /dbos-garbage-collect`, or let the DBOS console's retention policy
 //! drive it through the conductor; all of these compose with the knob, since

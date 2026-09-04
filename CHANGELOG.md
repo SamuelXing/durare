@@ -41,6 +41,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Retention now collects on `completed_at`, not `created_at`**, matching the
+  change Go (#456) and Python (#833) both made upstream. A workflow created 100
+  days ago that finished yesterday holds one day of history, and a 90-day policy
+  now keeps it; previously it was collected the moment it finished. Both halves
+  of the bound moved: the delete filter and the `rows_threshold` cutoff, which
+  ranks by completion — so a long-running workflow created first but finished
+  last counts among the newest. In-flight work has no `completed_at`, so no
+  cutoff can select it and it is not counted against `rows_threshold`.
+
+  This is a behaviour change for anyone relying on the old bound: long-running
+  workflows now retain more history than before, since the clock starts when
+  they finish rather than when they start. The `completed_at` column and its
+  partial index have existed since migration 36, so no migration is needed.
+
+  `completed_at` also now survives an export/import round trip on all three
+  backends. Neither side carried it, so a reimported workflow had a NULL
+  `completed_at` and — with collection keyed on it — would never have been
+  collectable again.
+
+- `recovery_attempts` decoded as a bare `i64` even though the column is
+  `DEFAULT 0` rather than `NOT NULL` on both backends, so reading a row written
+  without it panicked with `UnexpectedNullError`. It now decodes as `Option` and
+  treats NULL as zero. This completes the NULL-tolerance sweep below, which
+  fixed `executor_id`, `name`, and `status` but checked the wrong nullability
+  for this column; the other four read the same way (`created_at`, `updated_at`,
+  `priority`, `rate_limited`) are genuinely `NOT NULL`.
+
 - **Client-enqueued workflows were invisible to Go, Python, and TypeScript
   executors, and reading a foreign-written row panicked.** Two halves of the
   same mismatch: durare assumed columns are non-NULL where the other SDKs leave
