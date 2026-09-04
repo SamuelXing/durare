@@ -5,8 +5,8 @@ use crate::provider::{
     DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
     RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate,
     StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS,
+    NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
@@ -2060,12 +2060,11 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
-        if threshold <= 0 {
-            return Ok(None);
-        }
         // `IS NOT NULL` matches the partial index created by migration 36, so
-        // this is an index-only skip rather than a scan of the whole table.
-        let row: Option<(i64,)> = sqlx::query_as(&format!(
+        // this is an index-only skip rather than a scan of the whole table. It
+        // is also load-bearing on Postgres, which sorts NULLs *first* under
+        // `DESC` and would otherwise count them against the offset.
+        Ok(sqlx::query_scalar(&format!(
             "SELECT completed_at FROM {workflow_status}
              WHERE completed_at IS NOT NULL
              ORDER BY completed_at DESC
@@ -2074,8 +2073,7 @@ impl StateProvider for PostgresProvider {
         ))
         .bind(threshold - 1)
         .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(t,)| t))
+        .await?)
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
@@ -2852,8 +2850,6 @@ impl StateProvider for PostgresProvider {
             // reconstruction below covers payloads that omit it (Go exports, or
             // older Rust ones). Never derived from this row's own `forked_from`.
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
-            // Retention is keyed on `completed_at`, so an imported terminal
-            // workflow that lost it would never be collectable again.
             .bind(col_i64(s, "completed_at"))
             .execute(&mut *tx)
             .await?;
@@ -2975,21 +2971,11 @@ fn export_status_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
     for &c in EXPORT_STATUS_STR_COLS {
         m.insert(c.to_string(), s_col(row, c));
     }
-    // All exported status integers are BIGINT except `priority` (INTEGER).
-    for &c in &[
-        "created_at",
-        "updated_at",
-        "recovery_attempts",
-        "workflow_timeout_ms",
-        "workflow_deadline_epoch_ms",
-        "started_at_epoch_ms",
-        "delay_until_epoch_ms",
-        // Retention keys on `completed_at`, so it must survive an
-        // export/import round trip or the reimported row is uncollectable.
-        "completed_at",
-    ] {
+    for &c in EXPORT_STATUS_BIGINT_COLS {
         m.insert(c.to_string(), i64_col(row, c));
     }
+    // The one exported status integer that is not BIGINT here: INTEGER on
+    // Postgres, BIGINT on SQLite, so it sits outside the shared list.
     m.insert("priority".to_string(), i32_col(row, "priority"));
     // `was_forked_from` (BOOLEAN) — included so the flag round-trips across SDKs
     // the way Python's portable format does (Go omits it).

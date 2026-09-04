@@ -1112,7 +1112,7 @@ where
 
 /// The text columns carried in an exported `workflow_status` row — the cross-SDK
 /// portable set. String and integer columns are listed separately so each is read
-/// (and re-bound) with the right type. Together with [`EXPORT_STATUS_INT_COLS`]
+/// (and re-bound) with the right type. Together with [`EXPORT_STATUS_BIGINT_COLS`]
 /// these are exactly the columns the other SDKs export.
 pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
     "workflow_uuid",
@@ -1136,20 +1136,26 @@ pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
     "parent_workflow_id",
     "serialization",
 ];
-/// The integer columns of an exported `workflow_status` row (see
-/// [`EXPORT_STATUS_STR_COLS`]).
-#[cfg(feature = "sqlite")]
-pub(crate) const EXPORT_STATUS_INT_COLS: &[&str] = &[
+/// The 64-bit integer columns of an exported `workflow_status` row (see
+/// [`EXPORT_STATUS_STR_COLS`]). Shared by both SQL backends so a column added
+/// to the portable format cannot reach one export path and miss the other —
+/// which is exactly how `completed_at` came to be dropped from exports.
+///
+/// `priority` is deliberately absent: it is `INTEGER` on Postgres and `BIGINT`
+/// on SQLite, so each backend reads it with its own width.
+///
+/// Every column here must also round-trip through **import**, or a reimported
+/// workflow silently loses it. `completed_at` is the one with teeth: retention
+/// collects on it, so a row that loses it is uncollectable forever.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) const EXPORT_STATUS_BIGINT_COLS: &[&str] = &[
     "created_at",
     "updated_at",
     "recovery_attempts",
     "workflow_timeout_ms",
     "workflow_deadline_epoch_ms",
     "started_at_epoch_ms",
-    "priority",
     "delay_until_epoch_ms",
-    // Retention keys on `completed_at`, so it must survive an export/import
-    // round trip or the reimported row is uncollectable.
     "completed_at",
 ];
 
@@ -1647,16 +1653,31 @@ pub trait StateProvider: Send + Sync {
     /// counts among the newest — in-flight rows have no `completed_at` and are
     /// not counted at all.
     ///
-    /// The default implementation orders client-side over
-    /// [`list_workflows`](Self::list_workflows); the SQL backends override it
-    /// with a single `ORDER BY completed_at DESC ... LIMIT 1 OFFSET n-1`, served
-    /// by the partial index on `completed_at`.
+    /// `threshold` is expected to be positive; the only caller
+    /// (`resolve_gc_cutoff`) rejects anything else before getting here, and this
+    /// default returns `None` rather than underflowing if it ever changes.
+    ///
+    /// The SQL backends override this with a single
+    /// `ORDER BY completed_at DESC ... LIMIT 1 OFFSET n-1`, served by the
+    /// partial index on `completed_at`. **A provider backed by a real database
+    /// should do the same.** The default below cannot: `ListFilter` orders only
+    /// by `created_at`, so the limit is not pushable and it must rank every
+    /// terminal row client-side. That is fine for an in-memory store and costs a
+    /// full scan on anything larger.
     async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
         if threshold <= 0 {
             return Ok(None);
         }
         let mut completed: Vec<i64> = self
             .list_workflows(&ListFilter {
+                // Excludes in-flight rows in the backend rather than below, so
+                // an unfinished backlog costs nothing to rank.
+                status: vec![
+                    STATUS_SUCCESS.to_string(),
+                    STATUS_ERROR.to_string(),
+                    STATUS_CANCELLED.to_string(),
+                    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string(),
+                ],
                 load_input: false,
                 load_output: false,
                 ..Default::default()
@@ -1665,9 +1686,17 @@ pub trait StateProvider: Send + Sync {
             .into_iter()
             .filter_map(|w| w.completed_at_ms)
             .collect();
-        // Descending, so index `threshold - 1` is the Nth newest.
-        completed.sort_unstable_by(|a, b| b.cmp(a));
-        Ok(completed.get(threshold as usize - 1).copied())
+        let Some(idx) = (threshold as usize).checked_sub(1) else {
+            return Ok(None);
+        };
+        if idx >= completed.len() {
+            return Ok(None);
+        }
+        // Only the element at `idx` needs to be in its final position, so this
+        // partitions in O(n) instead of fully sorting. Descending, so `idx` is
+        // the Nth newest.
+        let (_, nth, _) = completed.select_nth_unstable_by(idx, |a, b| b.cmp(a));
+        Ok(Some(*nth))
     }
 
     /// Garbage-collect workflow history: delete every workflow that **finished**

@@ -5,7 +5,7 @@ use crate::provider::{
     ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert, RecordedStep,
     RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery,
     StepInfo, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
+    EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
     STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
     STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
@@ -1403,12 +1403,9 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
-        if threshold <= 0 {
-            return Ok(None);
-        }
         // `IS NOT NULL` matches the partial index created by migration 36, so
-        // this is an index-only skip rather than a scan of the whole table.
-        let row: Option<(i64,)> = sqlx::query_as(
+        // this is a covering index scan rather than a scan of the whole table.
+        Ok(sqlx::query_scalar(
             "SELECT completed_at FROM workflow_status
              WHERE completed_at IS NOT NULL
              ORDER BY completed_at DESC
@@ -1416,8 +1413,7 @@ impl StateProvider for SqliteProvider {
         )
         .bind(threshold - 1)
         .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(t,)| t))
+        .await?)
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
@@ -2143,8 +2139,6 @@ impl StateProvider for SqliteProvider {
             // reconstruction below covers payloads that omit it (Go exports, or
             // older Rust ones). Never derived from this row's own `forked_from`.
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
-            // Retention is keyed on `completed_at`, so an imported terminal
-            // workflow that lost it would never be collectable again.
             .bind(col_i64(s, "completed_at"))
             .execute(&mut *tx)
             .await?;
@@ -2256,9 +2250,12 @@ fn export_status_map(row: &sqlx::sqlite::SqliteRow) -> Map<String, Value> {
     for &c in EXPORT_STATUS_STR_COLS {
         m.insert(c.to_string(), s_col(row, c));
     }
-    for &c in EXPORT_STATUS_INT_COLS {
+    for &c in EXPORT_STATUS_BIGINT_COLS {
         m.insert(c.to_string(), i_col(row, c));
     }
+    // Not in the shared list: `priority` is INTEGER on Postgres and BIGINT
+    // here, so each backend reads it at its own width.
+    m.insert("priority".to_string(), i_col(row, "priority"));
     // `was_forked_from` (0/1) — emitted as a bool so the flag round-trips across
     // SDKs the way Python's portable format does (Go omits it).
     m.insert(

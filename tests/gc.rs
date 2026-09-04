@@ -96,6 +96,12 @@ async fn assert_completed_at_is_the_bound(engine: &DurableEngine) -> Result<()> 
 /// are deliberately inverted here: the workflow created *first* finishes
 /// *last*, so "keep the newest 1" keeps a different row under each rule.
 async fn assert_threshold_ranks_by_completion(engine: &DurableEngine) -> Result<()> {
+    // "Keep the newest 1" is only meaningful against a known table, and the
+    // per-backend tests run this after the cutoff assertion. A no-op when the
+    // engine is fresh.
+    let existing = all_ids(engine).await?;
+    engine.delete_workflows(&existing, false).await?;
+
     // created first, finished last
     seed(engine, "slow-first", "SUCCESS", 1_000_000, Some(9_000_000)).await?;
     // created last, finished first
@@ -396,18 +402,10 @@ async fn sqlite_long_running_workflow_survives_a_cutoff_after_its_creation() -> 
 
     let engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     assert_completed_at_is_the_bound(&engine).await?;
-    assert_threshold_ranks_by_completion_after_reset(&engine).await?;
+    assert_threshold_ranks_by_completion(&engine).await?;
 
     let _ = std::fs::remove_file(&path);
     Ok(())
-}
-
-/// The threshold assertion, run after the cutoff assertion has already left two
-/// rows behind: clear them first so "keep the newest 1" is unambiguous.
-async fn assert_threshold_ranks_by_completion_after_reset(engine: &DurableEngine) -> Result<()> {
-    let existing = all_ids(engine).await?;
-    engine.delete_workflows(&existing, false).await?;
-    assert_threshold_ranks_by_completion(engine).await
 }
 
 #[cfg(feature = "postgres")]
@@ -423,7 +421,7 @@ async fn pg_long_running_workflow_survives_a_cutoff_after_its_creation() -> Resu
 
     let engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
     assert_completed_at_is_the_bound(&engine).await?;
-    assert_threshold_ranks_by_completion_after_reset(&engine).await?;
+    assert_threshold_ranks_by_completion(&engine).await?;
 
     drop(engine);
     common::drop_hermetic_pg_db(&admin, &dbname).await;
