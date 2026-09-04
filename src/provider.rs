@@ -195,11 +195,16 @@ fn contains_value(stored: &Value, filter: &Value) -> bool {
 }
 
 /// Resolve the effective garbage-collection cutoff from the two bounds — the
-/// newer of the absolute `cutoff_epoch_ms` and the `created_at` of the
-/// `rows_threshold`-th-newest workflow. `None` means nothing to collect (no
-/// bound given, or fewer than `rows_threshold` workflows exist and no absolute
-/// cutoff). Validates `rows_threshold > 0`. Shared by the trait's default
-/// [`garbage_collect`](StateProvider::garbage_collect) and the SQL overrides.
+/// newer of the absolute `cutoff_epoch_ms` and the `completed_at` of the
+/// `rows_threshold`-th-newest completed workflow. `None` means nothing to
+/// collect (no bound given, or fewer than `rows_threshold` completed workflows
+/// exist and no absolute cutoff). Validates `rows_threshold > 0`. Shared by the
+/// trait's default [`garbage_collect`](StateProvider::garbage_collect) and the
+/// SQL overrides.
+///
+/// Both bounds are instants on the `completed_at` axis, so they are directly
+/// comparable and the returned cutoff means one thing throughout: collect
+/// workflows that *finished* before it.
 pub(crate) async fn resolve_gc_cutoff<P: StateProvider + ?Sized>(
     provider: &P,
     cutoff_epoch_ms: Option<i64>,
@@ -214,18 +219,7 @@ pub(crate) async fn resolve_gc_cutoff<P: StateProvider + ?Sized>(
     }
     let mut cutoff = cutoff_epoch_ms;
     if let Some(threshold) = rows_threshold {
-        let nth_newest = provider
-            .list_workflows(&ListFilter {
-                sort_desc: true,
-                limit: Some(1),
-                offset: Some(threshold - 1),
-                load_input: false,
-                load_output: false,
-                ..Default::default()
-            })
-            .await?;
-        if let Some(w) = nth_newest.first() {
-            let rows_cutoff = w.created_at.timestamp_millis();
+        if let Some(rows_cutoff) = provider.nth_newest_completed_at(threshold).await? {
             // The more restrictive (newer) bound wins.
             if cutoff.is_none_or(|c| rows_cutoff > c) {
                 cutoff = Some(rows_cutoff);
@@ -1118,7 +1112,7 @@ where
 
 /// The text columns carried in an exported `workflow_status` row — the cross-SDK
 /// portable set. String and integer columns are listed separately so each is read
-/// (and re-bound) with the right type. Together with [`EXPORT_STATUS_INT_COLS`]
+/// (and re-bound) with the right type. Together with [`EXPORT_STATUS_BIGINT_COLS`]
 /// these are exactly the columns the other SDKs export.
 pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
     "workflow_uuid",
@@ -1142,18 +1136,27 @@ pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
     "parent_workflow_id",
     "serialization",
 ];
-/// The integer columns of an exported `workflow_status` row (see
-/// [`EXPORT_STATUS_STR_COLS`]).
-#[cfg(feature = "sqlite")]
-pub(crate) const EXPORT_STATUS_INT_COLS: &[&str] = &[
+/// The 64-bit integer columns of an exported `workflow_status` row (see
+/// [`EXPORT_STATUS_STR_COLS`]). Shared by both SQL backends so a column added
+/// to the portable format cannot reach one export path and miss the other —
+/// which is exactly how `completed_at` came to be dropped from exports.
+///
+/// `priority` is deliberately absent: it is `INTEGER` on Postgres and `BIGINT`
+/// on SQLite, so each backend reads it with its own width.
+///
+/// Every column here must also round-trip through **import**, or a reimported
+/// workflow silently loses it. `completed_at` is the one with teeth: retention
+/// collects on it, so a row that loses it is uncollectable forever.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) const EXPORT_STATUS_BIGINT_COLS: &[&str] = &[
     "created_at",
     "updated_at",
     "recovery_attempts",
     "workflow_timeout_ms",
     "workflow_deadline_epoch_ms",
     "started_at_epoch_ms",
-    "priority",
     "delay_until_epoch_ms",
+    "completed_at",
 ];
 
 /// A column's value pulled from an exported row as an owned `String` (`None` for
@@ -1641,21 +1644,81 @@ pub trait StateProvider: Send + Sync {
     /// skipped. An empty slice is a no-op.
     async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()>;
 
-    /// Garbage-collect workflow history: delete every workflow **not** in
-    /// `PENDING`/`ENQUEUED`/`DELAYED` created strictly before a cutoff, along
-    /// with its step / event / stream rows. Returns how many workflows were
-    /// deleted.
+    /// The `completed_at` (epoch ms) of the `threshold`-th newest **completed**
+    /// workflow, or `None` when fewer than `threshold` of them exist.
+    ///
+    /// This is the row-count half of the retention bound: "keep the newest N"
+    /// means "collect everything that finished before this instant". Ordering is
+    /// by `completed_at`, so a workflow created long ago but finished recently
+    /// counts among the newest — in-flight rows have no `completed_at` and are
+    /// not counted at all.
+    ///
+    /// `threshold` is expected to be positive; the only caller
+    /// (`resolve_gc_cutoff`) rejects anything else before getting here, and this
+    /// default returns `None` rather than underflowing if it ever changes.
+    ///
+    /// The SQL backends override this with a single
+    /// `ORDER BY completed_at DESC ... LIMIT 1 OFFSET n-1`, served by the
+    /// partial index on `completed_at`. **A provider backed by a real database
+    /// should do the same.** The default below cannot: `ListFilter` orders only
+    /// by `created_at`, so the limit is not pushable and it must rank every
+    /// terminal row client-side. That is fine for an in-memory store and costs a
+    /// full scan on anything larger.
+    async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
+        if threshold <= 0 {
+            return Ok(None);
+        }
+        let mut completed: Vec<i64> = self
+            .list_workflows(&ListFilter {
+                // Excludes in-flight rows in the backend rather than below, so
+                // an unfinished backlog costs nothing to rank.
+                status: vec![
+                    STATUS_SUCCESS.to_string(),
+                    STATUS_ERROR.to_string(),
+                    STATUS_CANCELLED.to_string(),
+                    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string(),
+                ],
+                load_input: false,
+                load_output: false,
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .filter_map(|w| w.completed_at_ms)
+            .collect();
+        let Some(idx) = (threshold as usize).checked_sub(1) else {
+            return Ok(None);
+        };
+        if idx >= completed.len() {
+            return Ok(None);
+        }
+        // Only the element at `idx` needs to be in its final position, so this
+        // partitions in O(n) instead of fully sorting. Descending, so `idx` is
+        // the Nth newest.
+        let (_, nth, _) = completed.select_nth_unstable_by(idx, |a, b| b.cmp(a));
+        Ok(Some(*nth))
+    }
+
+    /// Garbage-collect workflow history: delete every workflow that **finished**
+    /// strictly before a cutoff, along with its step / event / stream rows.
+    /// Returns how many workflows were deleted.
     ///
     /// The cutoff is the more restrictive (newer) of the two bounds, matching
     /// the other DBOS SDKs:
     ///
     /// - `cutoff_epoch_ms` — an absolute epoch-milliseconds threshold;
-    /// - `rows_threshold` — keep (at most) the newest N workflows: the
-    ///   `created_at` of the Nth-newest becomes the cutoff. Must be positive.
+    /// - `rows_threshold` — keep (at most) the newest N completed workflows: the
+    ///   `completed_at` of the Nth-newest becomes the cutoff. Must be positive.
     ///
     /// With both `None` the call is a no-op returning `0`. In-flight work is
-    /// never collected: `PENDING`/`ENQUEUED`/`DELAYED` rows survive regardless
-    /// of age.
+    /// never collected: a `PENDING`/`ENQUEUED`/`DELAYED` row has no
+    /// `completed_at`, so no cutoff can select it.
+    ///
+    /// Collection is keyed on `completed_at`, not `created_at`: a workflow
+    /// created long ago that finished yesterday has only one day of history to
+    /// retain, which is what an operator means by "keep 90 days". `completed_at`
+    /// is set on every terminal transition and cleared on resume, so a resumed
+    /// workflow correctly stops being collectable.
     ///
     /// Deletion happens in bounded batches (10,000 rows at a time), so a
     /// first sweep over a large backlog is many short transactions instead of
@@ -1680,8 +1743,11 @@ pub trait StateProvider: Send + Sync {
                 STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED.to_string(),
             ],
             // The delete bound is *strictly* before the cutoff; the filter's
-            // bound is inclusive, so step one millisecond back.
-            end_time_ms: Some(cutoff - 1),
+            // bound is inclusive, so step one millisecond back. A workflow that
+            // has not completed has no `completed_at`, which this bound excludes
+            // on every backend — so in-flight work is spared by the bound itself,
+            // and the status list above is belt-and-braces.
+            completed_before_ms: Some(cutoff - 1),
             limit: Some(GC_BATCH),
             load_input: false,
             load_output: false,

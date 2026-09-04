@@ -5,8 +5,8 @@ use crate::provider::{
     DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
     RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate,
     StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS,
+    NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
@@ -732,7 +732,15 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get("priority"),
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
-        recovery_attempts: row.get::<i64, _>("recovery_attempts") as i32,
+        // `recovery_attempts BIGINT DEFAULT 0` is nullable, unlike the four
+        // genuinely `NOT NULL` columns read with `get` above and below, so a
+        // writer that omits it leaves SQL NULL and a plain `get` panics. Unset
+        // means no recovery has been attempted: zero.
+        recovery_attempts: row
+            .try_get::<Option<i64>, _>("recovery_attempts")
+            .ok()
+            .flatten()
+            .unwrap_or(0) as i32,
         parent_workflow_id: row.try_get("parent_workflow_id").ok().flatten(),
         timeout_ms: row.try_get("workflow_timeout_ms").ok().flatten(),
         deadline_ms: row.try_get("workflow_deadline_epoch_ms").ok().flatten(),
@@ -2018,17 +2026,22 @@ impl StateProvider for PostgresProvider {
         else {
             return Ok(0);
         };
-        // The canonical DBOS GC delete: strictly-older terminal (and dead-letter)
-        // rows go; in-flight work survives regardless of age. Children cascade.
-        // Batched so a large backlog is many short transactions, not one long
-        // delete pinning the MVCC horizon of the hottest table.
+        // The canonical DBOS GC delete: rows that *finished* before the cutoff
+        // go; in-flight work survives regardless of age, because it has no
+        // `completed_at` for the bound to select. Children cascade. Batched so a
+        // large backlog is many short transactions, not one long delete pinning
+        // the MVCC horizon of the hottest table.
+        //
+        // The status list is redundant given the `completed_at` bound and kept
+        // as a second line of defence: a stray row with both a terminal-looking
+        // `completed_at` and a live status must never be collected.
         let mut total = 0u64;
         loop {
             let res = sqlx::query(&format!(
                 "DELETE FROM {workflow_status}
                  WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM {workflow_status}
-                     WHERE created_at < $1 AND status NOT IN ($2, $3, $4)
+                     WHERE completed_at < $1 AND status NOT IN ($2, $3, $4)
                      LIMIT $5)",
                 workflow_status = self.tables.workflow_status
             ))
@@ -2044,6 +2057,23 @@ impl StateProvider for PostgresProvider {
                 return Ok(total);
             }
         }
+    }
+
+    async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
+        // `IS NOT NULL` matches the partial index created by migration 36, so
+        // this is an index-only skip rather than a scan of the whole table. It
+        // is also load-bearing on Postgres, which sorts NULLs *first* under
+        // `DESC` and would otherwise count them against the offset.
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT completed_at FROM {workflow_status}
+             WHERE completed_at IS NOT NULL
+             ORDER BY completed_at DESC
+             LIMIT 1 OFFSET $1",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(threshold - 1)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
@@ -2780,9 +2810,9 @@ impl StateProvider for PostgresProvider {
                       recovery_attempts, queue_name, workflow_timeout_ms,
                       workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
                       priority, queue_partition_key, forked_from, parent_workflow_id,
-                      delay_until_epoch_ms, serialization, was_forked_from)
+                      delay_until_epoch_ms, serialization, was_forked_from, completed_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)",
+                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)",
                 workflow_status = self.tables.workflow_status
             ))
             .bind(col_str(s, "workflow_uuid"))
@@ -2820,6 +2850,7 @@ impl StateProvider for PostgresProvider {
             // reconstruction below covers payloads that omit it (Go exports, or
             // older Rust ones). Never derived from this row's own `forked_from`.
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
+            .bind(col_i64(s, "completed_at"))
             .execute(&mut *tx)
             .await?;
 
@@ -2940,18 +2971,11 @@ fn export_status_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
     for &c in EXPORT_STATUS_STR_COLS {
         m.insert(c.to_string(), s_col(row, c));
     }
-    // All exported status integers are BIGINT except `priority` (INTEGER).
-    for &c in &[
-        "created_at",
-        "updated_at",
-        "recovery_attempts",
-        "workflow_timeout_ms",
-        "workflow_deadline_epoch_ms",
-        "started_at_epoch_ms",
-        "delay_until_epoch_ms",
-    ] {
+    for &c in EXPORT_STATUS_BIGINT_COLS {
         m.insert(c.to_string(), i64_col(row, c));
     }
+    // The one exported status integer that is not BIGINT here: INTEGER on
+    // Postgres, BIGINT on SQLite, so it sits outside the shared list.
     m.insert("priority".to_string(), i32_col(row, "priority"));
     // `was_forked_from` (BOOLEAN) — included so the flag round-trips across SDKs
     // the way Python's portable format does (Go omits it).

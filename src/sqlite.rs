@@ -5,7 +5,7 @@ use crate::provider::{
     ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert, RecordedStep,
     RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery,
     StepInfo, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    EXPORT_STATUS_INT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
+    EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
     STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
     STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
@@ -218,7 +218,14 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
         queue_partition_key: row.try_get("queue_partition_key").ok().flatten(),
         priority: row.get::<i64, _>("priority") as i32,
         dedup_id: row.try_get("deduplication_id").ok().flatten(),
-        recovery_attempts: row.get::<i64, _>("recovery_attempts") as i32,
+        // `recovery_attempts INTEGER DEFAULT 0` is nullable, so a writer that
+        // omits it leaves SQL NULL and a plain `get` panics. Unset means no
+        // recovery has been attempted: zero.
+        recovery_attempts: row
+            .try_get::<Option<i64>, _>("recovery_attempts")
+            .ok()
+            .flatten()
+            .unwrap_or(0) as i32,
         parent_workflow_id: row.try_get("parent_workflow_id").ok().flatten(),
         timeout_ms: row.try_get("workflow_timeout_ms").ok().flatten(),
         deadline_ms: row.try_get("workflow_deadline_epoch_ms").ok().flatten(),
@@ -1363,17 +1370,22 @@ impl StateProvider for SqliteProvider {
         else {
             return Ok(0);
         };
-        // The canonical DBOS GC delete: strictly-older terminal (and dead-letter)
-        // rows go; in-flight work survives regardless of age. Children cascade.
-        // Batched so a large backlog is many short write transactions — under
-        // WAL, long writes starve every other writer in the process.
+        // The canonical DBOS GC delete: rows that *finished* before the cutoff
+        // go; in-flight work survives regardless of age, because it has no
+        // `completed_at` for the bound to select. Children cascade. Batched so a
+        // large backlog is many short write transactions — under WAL, long
+        // writes starve every other writer in the process.
+        //
+        // The status list is redundant given the `completed_at` bound and kept
+        // as a second line of defence: a stray row with both a terminal-looking
+        // `completed_at` and a live status must never be collected.
         let mut total = 0u64;
         loop {
             let res = sqlx::query(
                 "DELETE FROM workflow_status
                  WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM workflow_status
-                     WHERE created_at < ? AND status NOT IN (?, ?, ?)
+                     WHERE completed_at < ? AND status NOT IN (?, ?, ?)
                      LIMIT ?)",
             )
             .bind(cutoff)
@@ -1388,6 +1400,20 @@ impl StateProvider for SqliteProvider {
                 return Ok(total);
             }
         }
+    }
+
+    async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
+        // `IS NOT NULL` matches the partial index created by migration 36, so
+        // this is a covering index scan rather than a scan of the whole table.
+        Ok(sqlx::query_scalar(
+            "SELECT completed_at FROM workflow_status
+             WHERE completed_at IS NOT NULL
+             ORDER BY completed_at DESC
+             LIMIT 1 OFFSET ?",
+        )
+        .bind(threshold - 1)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
@@ -2074,9 +2100,9 @@ impl StateProvider for SqliteProvider {
                       recovery_attempts, queue_name, workflow_timeout_ms,
                       workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
                       priority, queue_partition_key, forked_from, parent_workflow_id,
-                      delay_until_epoch_ms, serialization, was_forked_from)
+                      delay_until_epoch_ms, serialization, was_forked_from, completed_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                         ?, ?, ?, ?)",
+                         ?, ?, ?, ?, ?)",
             )
             .bind(col_str(s, "workflow_uuid"))
             .bind(col_str(s, "status"))
@@ -2113,6 +2139,7 @@ impl StateProvider for SqliteProvider {
             // reconstruction below covers payloads that omit it (Go exports, or
             // older Rust ones). Never derived from this row's own `forked_from`.
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
+            .bind(col_i64(s, "completed_at"))
             .execute(&mut *tx)
             .await?;
 
@@ -2223,9 +2250,12 @@ fn export_status_map(row: &sqlx::sqlite::SqliteRow) -> Map<String, Value> {
     for &c in EXPORT_STATUS_STR_COLS {
         m.insert(c.to_string(), s_col(row, c));
     }
-    for &c in EXPORT_STATUS_INT_COLS {
+    for &c in EXPORT_STATUS_BIGINT_COLS {
         m.insert(c.to_string(), i_col(row, c));
     }
+    // Not in the shared list: `priority` is INTEGER on Postgres and BIGINT
+    // here, so each backend reads it at its own width.
+    m.insert("priority".to_string(), i_col(row, "priority"));
     // `was_forked_from` (0/1) — emitted as a bool so the flag round-trips across
     // SDKs the way Python's portable format does (Go omits it).
     m.insert(
