@@ -8,6 +8,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: a durable call claims its position where it is written, not where
+  it is first polled.** `ctx.step`, `step_with`, `sleep`, `send`, `send_bulk`,
+  `recv`, `set_event`, `get_event`, `write_stream`, `close_stream`, `now`,
+  `uuid`, `random`, `set_workflow_attributes`, `start_workflow`, `select`,
+  `transaction` and `transaction_with` are plain `fn`s returning a
+  `PendingStep`, which is a `Future` — so `ctx.step(..).await?` reads exactly as
+  it did and no call site changes.
+
+  A position is the `(workflow_id, seq)` key a checkpoint is written under, and
+  a replay finds a recorded result only by asking for the position the first run
+  asked for. Claiming it inside an `async fn` body tied it to poll order, which
+  the combinator decides rather than the code: `tokio::select!` randomises it,
+  and awaiting two calls in the opposite order to the one they were written in
+  reversed them. Two same-named steps that swapped positions replayed each
+  other's recorded output, silently. Claiming the position at the call ties it
+  to Rust's evaluation order instead, which a replay reproduces by construction.
+
+  Building a call and dropping it now spends its position — deterministic, since
+  a replay skips the same one, but no longer a no-op, so `PendingStep` is
+  `#[must_use]`. Bodies and outputs need `Send`, and a call that cannot encode
+  its argument now fails without moving the counter.
+
+  Two calls keep the old shape and must be awaited where they are written, both
+  documented in place: `ctx.patch` / `deprecate_patch`, whose position is
+  claimed only if a database read says so, and `ctx.transaction_on` /
+  `transaction_on_with`, whose `AsyncFn` body cannot be required to return a
+  `Send` future on stable Rust (`async_fn_traits`).
+
 - **Breaking:** `ctx.transaction_on` / `transaction_on_with` take an async
   closure — `async |conn| { … }` — instead of a closure returning a boxed
   future. The `Box::pin(async move { … })` scaffolding, and the per-call

@@ -34,7 +34,8 @@
 //! | `Utc::now()`, `SystemTime::now()`, `Instant::now()` | a later run reads a different time | [`ctx.now()`](DurableContext::now) |
 //! | `Uuid::new_v4()`, `rand::random()` | a later run draws a different value | [`ctx.uuid()`](DurableContext::uuid) / [`ctx.random()`](DurableContext::random) |
 //! | iterating a `HashMap` / `HashSet` | order is randomized per map, so a loop issues its steps in a different order | a `BTreeMap` / `BTreeSet`, or sort the keys first |
-//! | `tokio::spawn`, task races, threads | interleaving is not reproducible, so which step runs first changes | keep the body sequential; run steps concurrently with `join!` / `try_join!` (each step's position is fixed when it is created, so a join is deterministic) |
+//! | `tokio::spawn` of durable work, `tokio::select!` over durable calls | a step's position is claimed where the call is **written**, but a spawned task and the workflow body reach the counter in whatever order the scheduler picks | keep durable calls on the workflow's own task; run them concurrently with `join!` / `try_join!`, which is deterministic because positions follow the source |
+//! | `FuturesUnordered`, `buffer_unordered`, any "handle them as they finish" loop | the first run observes real I/O latencies; a replay serves every step from its checkpoint at once, so the completion order — and anything derived from it, including which durable call is reached next — differs | collect with `join!` / `try_join!` and process in a fixed order, or give each branch a child workflow |
 //! | reading env vars, config, files, or the network | the value can differ between runs | read it inside a [step](DurableContext::step) |
 //! | side effects in `Drop` | drop timing and order are not part of the recorded log | put the effect in a step |
 //!

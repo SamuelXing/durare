@@ -237,6 +237,15 @@ impl DurableContext {
     /// Decide whether this workflow should run the **patched** (new) code at this
     /// point: returns `true` for new code, `false` for old.
     ///
+    /// **Await this where it is written.** Unlike every other durable call, a
+    /// patch cannot claim its position when it is built: whether it occupies one
+    /// at all depends on what is already recorded there, which is a read of the
+    /// database. It therefore takes its position when it is first polled, and a
+    /// patch built alongside other durable calls and awaited out of order would
+    /// collide with them. Nothing races a patch in practice — it is a branch
+    /// point in the workflow's own control flow — so the rule costs nothing to
+    /// keep.
+    ///
     /// This lets you change a workflow's body while long-lived workflows are
     /// still running. Wrap the changed region in a patch:
     ///
@@ -343,82 +352,92 @@ impl DurableContext {
     /// [`Error::UnknownWorkflow`] if `name` is not registered on this engine,
     /// or [`Error::UnexpectedStep`] if a replay finds a different child (or
     /// operation) recorded at this position.
-    pub async fn start_workflow<I, O>(
-        &self,
+    pub fn start_workflow<'a, I, O>(
+        &'a self,
         name: &str,
         input: I,
         opts: WorkflowOptions,
-    ) -> Result<WorkflowHandle<O>>
+    ) -> PendingStep<'a, WorkflowHandle<O>>
     where
         I: Serialize,
+        O: Send + 'a,
     {
-        let seq = self.next_seq();
-
-        // Replay: re-attach to the child already started at this step. A
-        // different workflow name recorded here means the parent is
-        // non-deterministic — re-attaching would hand back the wrong child.
-        if let Some((child_id, recorded)) = self
-            .provider
-            .check_child_workflow(&self.workflow_id, seq)
-            .await?
-        {
-            if recorded != name {
-                return Err(Error::unexpected_step(
-                    &self.workflow_id,
-                    seq,
-                    name,
-                    recorded,
-                ));
-            }
-            return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
-        }
-
-        let child_id = opts
-            .workflow_id
-            .clone()
-            // An explicit empty id means "assign one for me": fall through to the
-            // deterministic `{parent}-{seq}` so an empty id is never persisted.
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
-        let mut opts = opts;
-        opts.workflow_id = Some(child_id.clone());
-        let input_json = serde_json::to_value(input)?;
-
-        // The child inherits this workflow's identity **per field**: each auth
-        // field set on `opts` overrides just that field, and every unset field
-        // falls back to the parent's — so overriding only the assumed role still
-        // carries the parent's user and roles (matching the reference SDKs).
-        let child_auth = AuthContext {
-            authenticated_user: opts
-                .authenticated_user
-                .clone()
-                .or_else(|| self.auth.authenticated_user.clone()),
-            assumed_role: opts
-                .assumed_role
-                .clone()
-                .or_else(|| self.auth.assumed_role.clone()),
-            authenticated_roles: if opts.authenticated_roles.is_empty() {
-                self.auth.authenticated_roles.clone()
-            } else {
-                opts.authenticated_roles.clone()
-            },
+        // Encoded before the position is claimed, so an input that will not
+        // serialize fails without moving the counter.
+        let input_json = match serde_json::to_value(input) {
+            Ok(input_json) => input_json,
+            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
         };
+        let name = name.to_owned();
+        let seq = self.next_seq();
+        PendingStep::new(async move {
+            let name = name.as_str();
 
-        self.runtime
-            .spawn_child(
-                &child_id,
-                name,
-                input_json,
-                opts,
-                &self.workflow_id,
-                child_auth,
-            )
-            .await?;
-        self.provider
-            .record_child_workflow(&self.workflow_id, seq, name, &child_id)
-            .await?;
+            // Replay: re-attach to the child already started at this step. A
+            // different workflow name recorded here means the parent is
+            // non-deterministic — re-attaching would hand back the wrong child.
+            if let Some((child_id, recorded)) = self
+                .provider
+                .check_child_workflow(&self.workflow_id, seq)
+                .await?
+            {
+                if recorded != name {
+                    return Err(Error::unexpected_step(
+                        &self.workflow_id,
+                        seq,
+                        name,
+                        recorded,
+                    ));
+                }
+                return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
+            }
 
-        Ok(WorkflowHandle::polling(child_id, self.provider.clone()))
+            let child_id = opts
+                .workflow_id
+                .clone()
+                // An explicit empty id means "assign one for me": fall through to the
+                // deterministic `{parent}-{seq}` so an empty id is never persisted.
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
+            let mut opts = opts;
+            opts.workflow_id = Some(child_id.clone());
+
+            // The child inherits this workflow's identity **per field**: each auth
+            // field set on `opts` overrides just that field, and every unset field
+            // falls back to the parent's — so overriding only the assumed role still
+            // carries the parent's user and roles (matching the reference SDKs).
+            let child_auth = AuthContext {
+                authenticated_user: opts
+                    .authenticated_user
+                    .clone()
+                    .or_else(|| self.auth.authenticated_user.clone()),
+                assumed_role: opts
+                    .assumed_role
+                    .clone()
+                    .or_else(|| self.auth.assumed_role.clone()),
+                authenticated_roles: if opts.authenticated_roles.is_empty() {
+                    self.auth.authenticated_roles.clone()
+                } else {
+                    opts.authenticated_roles.clone()
+                },
+            };
+
+            self.runtime
+                .spawn_child(
+                    &child_id,
+                    name,
+                    input_json,
+                    opts,
+                    &self.workflow_id,
+                    child_auth,
+                )
+                .await?;
+            self.provider
+                .record_child_workflow(&self.workflow_id, seq, name, &child_id)
+                .await?;
+
+            Ok(WorkflowHandle::polling(child_id, self.provider.clone()))
+        })
     }
 
     /// Run a durable step with the default policy (no retries).
@@ -452,28 +471,31 @@ impl DurableContext {
     /// workflow was cancelled, and [`Error::UnexpectedStep`] if a replay finds a
     /// different operation recorded at this step position (a non-deterministic
     /// workflow function).
-    pub async fn step<T, F, Fut>(&self, name: &str, f: F) -> Result<T>
+    pub fn step<'a, T, F, Fut>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
-        T: Serialize + DeserializeOwned,
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        T: Serialize + DeserializeOwned + Send + 'a,
+        F: FnOnce() -> Fut + Send + 'a,
+        Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let seq = self.next_seq();
         let span = self.op_span("step", name, seq);
-        let out = async {
-            if let Some(stored) = self.replay_or_guard::<T>(seq, name).await? {
-                return Ok(stored);
+        let name = name.to_owned();
+        PendingStep::new(async move {
+            let out = async {
+                if let Some(stored) = self.replay_or_guard::<T>(seq, &name).await? {
+                    return Ok(stored);
+                }
+                let started = chrono::Utc::now().timestamp_millis();
+                match run_step_catching(&name, f()).await {
+                    Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
+                    Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
+                }
             }
-            let started = chrono::Utc::now().timestamp_millis();
-            match run_step_catching(name, f()).await {
-                Ok(v) => self.checkpoint(seq, name, v, Some(started)).await,
-                Err(e) => self.record_failure(seq, name, e, Some(started)).await,
-            }
-        }
-        .instrument(span.clone())
-        .await;
-        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
-        out
+            .instrument(span.clone())
+            .await;
+            span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+            out
+        })
     }
 
     /// Run a durable step with an explicit retry [`StepOptions`] policy.
@@ -507,30 +529,32 @@ impl DurableContext {
     /// checkpointed, so a replay yields the same error without re-running.
     /// Also [`Error::Cancelled`] if the workflow was cancelled, and
     /// [`Error::UnexpectedStep`] on a divergent replay.
-    pub async fn step_with<T, F, Fut>(&self, opts: StepOptions, mut f: F) -> Result<T>
+    pub fn step_with<'a, T, F, Fut>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
     where
-        T: Serialize + DeserializeOwned,
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        T: Serialize + DeserializeOwned + Send + 'a,
+        F: FnMut() -> Fut + Send + 'a,
+        Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let seq = self.next_seq();
         let span = self.op_span("step", &opts.name, seq);
-        let out = async {
-            if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
-                return Ok(stored);
+        PendingStep::new(async move {
+            let out = async {
+                if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
+                    return Ok(stored);
+                }
+                // Run with retries; only the final result/error is observed, then
+                // checkpointed — a success as its output, a failure as its error.
+                let started = chrono::Utc::now().timestamp_millis();
+                match self.run_with_retries(&opts, &mut f).await {
+                    Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
+                    Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
+                }
             }
-            // Run with retries; only the final result/error is observed, then
-            // checkpointed — a success as its output, a failure as its error.
-            let started = chrono::Utc::now().timestamp_millis();
-            match self.run_with_retries(&opts, &mut f).await {
-                Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
-                Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
-            }
-        }
-        .instrument(span.clone())
-        .await;
-        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
-        out
+            .instrument(span.clone())
+            .await;
+            span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+            out
+        })
     }
 
     /// Run a **transactional step**: the closure's SQL writes and this step's
@@ -572,16 +596,15 @@ impl DurableContext {
     ///     .await?;
     /// # Ok(()) }
     /// ```
-    pub async fn transaction<T, F>(&self, name: &str, f: F) -> Result<T>
+    pub fn transaction<'a, T, F>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
-        T: Serialize + DeserializeOwned + 'static,
+        T: Serialize + DeserializeOwned + Send + 'static,
         F: for<'t, 'c> Fn(&'t mut Tx<'c>) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>
             + Send
             + Sync
             + 'static,
     {
         self.transaction_with(TransactionOptions::new(name), f)
-            .await
     }
 
     /// Like [`transaction`](Self::transaction) but with explicit
@@ -602,42 +625,56 @@ impl DurableContext {
     /// })).await?;
     /// # Ok(()) }
     /// ```
-    pub async fn transaction_with<T, F>(&self, opts: TransactionOptions, f: F) -> Result<T>
+    pub fn transaction_with<'a, T, F>(
+        &'a self,
+        opts: TransactionOptions,
+        f: F,
+    ) -> PendingStep<'a, T>
     where
-        T: Serialize + DeserializeOwned + 'static,
+        T: Serialize + DeserializeOwned + Send + 'static,
         F: for<'t, 'c> Fn(&'t mut Tx<'c>) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>
             + Send
             + Sync
             + 'static,
     {
-        let _guard = self.begin_transaction()?;
-
         let seq = self.next_seq();
         let span = self.op_span("transaction", &opts.name, seq);
-        let started = chrono::Utc::now().timestamp_millis();
-        // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
-        // a future that we move in, so the wrapper stays `Fn` (re-runnable).
-        let body: TxBody = Box::new(move |tx| {
-            let fut = f(tx);
-            Box::pin(async move {
-                let out = fut.await?;
-                Ok::<_, Error>(serde_json::to_value(out)?)
-            })
-        });
-        let out = async {
-            let value = self
-                .provider
-                .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
-                .await?;
-            Ok(serde_json::from_value(value)?)
-        }
-        .instrument(span.clone())
-        .await;
-        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
-        out
+        PendingStep::new(async move {
+            let _guard = self.begin_transaction()?;
+            let started = chrono::Utc::now().timestamp_millis();
+            // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
+            // a future that we move in, so the wrapper stays `Fn` (re-runnable).
+            let body: TxBody = Box::new(move |tx| {
+                let fut = f(tx);
+                Box::pin(async move {
+                    let out = fut.await?;
+                    Ok::<_, Error>(serde_json::to_value(out)?)
+                })
+            });
+            let out = async {
+                let value = self
+                    .provider
+                    .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
+                    .await?;
+                Ok(serde_json::from_value(value)?)
+            }
+            .instrument(span.clone())
+            .await;
+            span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+            out
+        })
     }
 
     /// Run a durable transaction on a **separate application database**.
+    ///
+    /// **Await this where it is written.** The body is an `AsyncFn`, and stable
+    /// Rust has no way to say that the future it returns is `Send` — the bound
+    /// needs `async_fn_traits`, which is unstable — so this call cannot hand back
+    /// the [`PendingStep`] every other durable call does, and takes its position
+    /// when it is first polled rather than when it is built. Building one
+    /// alongside other durable calls and awaiting them out of order would give it
+    /// a position one of them already holds. A transaction is a sequence point by
+    /// nature, so this is a rule to keep rather than a cost to pay.
     ///
     /// [`transaction`](Self::transaction) commits the body's SQL and the step
     /// checkpoint together — but only in the *system* database. This runs the
@@ -1255,41 +1292,47 @@ impl DurableContext {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn select<T>(
-        &self,
-        branches: Vec<Pin<Box<dyn Future<Output = T> + Send + '_>>>,
-    ) -> Result<(usize, T)>
+    pub fn select<'a, T>(
+        &'a self,
+        branches: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
+    ) -> PendingStep<'a, (usize, T)>
     where
-        T: Serialize + DeserializeOwned,
+        T: Serialize + DeserializeOwned + Send + 'a,
     {
+        // Refused before the position is claimed, so a race that cannot run
+        // moves no counter and the calls around it keep their positions.
         if branches.is_empty() {
-            return Err(Error::app("select requires at least one branch"));
+            return PendingStep::new(async {
+                Err(Error::app("select requires at least one branch"))
+            });
         }
         let seq = self.next_seq();
-        if let Some(stored) = self
-            .replay_or_guard::<(usize, T)>(seq, "DBOS.select")
-            .await?
-        {
-            return Ok(stored);
-        }
-        let started = chrono::Utc::now().timestamp_millis();
-
-        // Poll the branches in index order on this one task; the first ready wins
-        // (lowest index on a tie). The losers are dropped — and so cancelled —
-        // when `branches` goes out of scope.
-        let mut branches = branches;
-        let (index, value) = poll_fn(|cx| {
-            for (i, branch) in branches.iter_mut().enumerate() {
-                if let Poll::Ready(value) = branch.as_mut().poll(cx) {
-                    return Poll::Ready((i, value));
-                }
+        PendingStep::new(async move {
+            if let Some(stored) = self
+                .replay_or_guard::<(usize, T)>(seq, "DBOS.select")
+                .await?
+            {
+                return Ok(stored);
             }
-            Poll::Pending
-        })
-        .await;
+            let started = chrono::Utc::now().timestamp_millis();
 
-        self.checkpoint(seq, "DBOS.select", (index, value), Some(started))
-            .await
+            // Poll the branches in index order on this one task; the first ready wins
+            // (lowest index on a tie). The losers are dropped — and so cancelled —
+            // when `branches` goes out of scope.
+            let mut branches = branches;
+            let (index, value) = poll_fn(|cx| {
+                for (i, branch) in branches.iter_mut().enumerate() {
+                    if let Poll::Ready(value) = branch.as_mut().poll(cx) {
+                        return Poll::Ready((i, value));
+                    }
+                }
+                Poll::Pending
+            })
+            .await;
+
+            self.checkpoint(seq, "DBOS.select", (index, value), Some(started))
+                .await
+        })
     }
 
     /// Shared step preamble: serve a replayed checkpoint if present, otherwise
@@ -1451,15 +1494,17 @@ impl DurableContext {
     /// divergent replay.
     #[doc(alias = "timer")]
     #[doc(alias = "delay")]
-    pub async fn sleep(&self, dur: Duration) -> Result<()> {
+    pub fn sleep(&self, dur: Duration) -> PendingStep<'_, ()> {
         let seq = self.next_seq();
-        let wake_at = self.durable_wake_at(seq, dur).await?;
-        let now = chrono::Utc::now();
-        if wake_at > now {
-            let remaining = (wake_at - now).to_std().unwrap_or(Duration::ZERO);
-            tokio::time::sleep(remaining).await;
-        }
-        Ok(())
+        PendingStep::new(async move {
+            let wake_at = self.durable_wake_at(seq, dur).await?;
+            let now = chrono::Utc::now();
+            if wake_at > now {
+                let remaining = (wake_at - now).to_std().unwrap_or(Duration::ZERO);
+                tokio::time::sleep(remaining).await;
+            }
+            Ok(())
+        })
     }
 
     /// Resolve the absolute wake instant for a durable timer at `seq`: the
@@ -1518,21 +1563,20 @@ impl DurableContext {
     /// let started = ctx.now().await?; // same value on every replay
     /// # Ok(()) }
     /// ```
-    pub async fn now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
-        self.durable_value("DBOS.now", chrono::Utc::now).await
+    pub fn now(&self) -> PendingStep<'_, chrono::DateTime<chrono::Utc>> {
+        self.durable_value("DBOS.now", chrono::Utc::now)
     }
 
     /// A durable random UUID (v4): minted on first execution and replayed
     /// thereafter. The safe way to generate an id inside a workflow — a bare
     /// `Uuid::new_v4()` would differ on recovery. Returned as a string.
-    pub async fn uuid(&self) -> Result<String> {
+    pub fn uuid(&self) -> PendingStep<'_, String> {
         self.durable_value("DBOS.uuid", || uuid::Uuid::new_v4().to_string())
-            .await
     }
 
     /// A durable random `f64` in `[0, 1)`: drawn on first execution and replayed
     /// thereafter. For any randomness a workflow's control flow depends on.
-    pub async fn random(&self) -> Result<f64> {
+    pub fn random(&self) -> PendingStep<'_, f64> {
         self.durable_value("DBOS.random", || {
             // 48 fully-random bits from a v4 UUID (OS-entropy-backed via
             // getrandom). Bytes 0..6 precede the version/variant nibbles, so
@@ -1542,7 +1586,6 @@ impl DurableContext {
             let n = (0..6).fold(0u64, |acc, i| (acc << 8) | b[i] as u64);
             n as f64 / (1u64 << 48) as f64
         })
-        .await
     }
 
     /// Record (first execution) or replay (thereafter) a non-deterministic value
@@ -1550,12 +1593,21 @@ impl DurableContext {
     /// returns the same value on every replay. The shared machinery behind
     /// [`now`](Self::now), [`uuid`](Self::uuid), and [`random`](Self::random) —
     /// the same record-or-replay shape as [`sleep`](Self::sleep)'s wake instant.
-    async fn durable_value<T, P>(&self, name: &str, produce: P) -> Result<T>
+    fn durable_value<'a, T, P>(&'a self, name: &'static str, produce: P) -> PendingStep<'a, T>
+    where
+        T: Serialize + DeserializeOwned + Send + 'a,
+        P: FnOnce() -> T + Send + 'a,
+    {
+        let seq = self.next_seq();
+        PendingStep::new(self.durable_value_at(seq, name, produce))
+    }
+
+    /// [`durable_value`](Self::durable_value)'s run, once the position is claimed.
+    async fn durable_value_at<T, P>(&self, seq: i32, name: &str, produce: P) -> Result<T>
     where
         T: Serialize + DeserializeOwned,
         P: FnOnce() -> T,
     {
-        let seq = self.next_seq();
         match self
             .provider
             .get_step_result(&self.workflow_id, seq)
@@ -1612,31 +1664,41 @@ impl DurableContext {
     /// exist; otherwise storage errors, [`Error::Cancelled`], or
     /// [`Error::UnexpectedStep`] on a divergent replay.
     #[doc(alias = "signal")]
-    pub async fn send<T: Serialize>(
+    pub fn send<T: Serialize>(
         &self,
         destination_id: &str,
         message: T,
         topic: &str,
-    ) -> Result<()> {
+    ) -> PendingStep<'_, ()> {
+        // Encoded before the position is claimed, so a message that will not
+        // serialize fails without moving the counter.
+        let encoded = match serde_json::to_value(message) {
+            Ok(encoded) => encoded,
+            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+        };
+        let destination_id = destination_id.to_owned();
+        let topic = topic.to_owned();
         let seq = self.next_seq();
-        if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
-            return Ok(());
-        }
-        self.provider
-            .insert_notification(destination_id, topic, serde_json::to_value(message)?, None)
-            .await?;
-        self.provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                "DBOS.send",
-                Value::Null,
-                None,
-                None,
-                Some(self.runtime.executor_id()),
-            )
-            .await?;
-        Ok(())
+        PendingStep::new(async move {
+            if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
+                return Ok(());
+            }
+            self.provider
+                .insert_notification(&destination_id, &topic, encoded, None)
+                .await?;
+            self.provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    "DBOS.send",
+                    Value::Null,
+                    None,
+                    None,
+                    Some(self.runtime.executor_id()),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     /// **Replace** the custom attributes attached to workflow `id` (commonly
@@ -1651,33 +1713,36 @@ impl DurableContext {
     /// [`Error::NonExistentWorkflow`] if the target workflow does not exist;
     /// otherwise storage errors, [`Error::Cancelled`], or
     /// [`Error::UnexpectedStep`] on a divergent replay.
-    pub async fn set_workflow_attributes(
+    pub fn set_workflow_attributes(
         &self,
         id: &str,
         attributes: Option<serde_json::Map<String, Value>>,
-    ) -> Result<()> {
+    ) -> PendingStep<'_, ()> {
+        let id = id.to_owned();
         let seq = self.next_seq();
-        if let Some(_done) = self
-            .replay_or_guard::<Value>(seq, "DBOS.updateWorkflowAttributes")
-            .await?
-        {
-            return Ok(());
-        }
-        self.provider
-            .set_workflow_attributes(id, attributes.as_ref())
-            .await?;
-        self.provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                "DBOS.updateWorkflowAttributes",
-                Value::Null,
-                None,
-                None,
-                Some(self.runtime.executor_id()),
-            )
-            .await?;
-        Ok(())
+        PendingStep::new(async move {
+            if let Some(_done) = self
+                .replay_or_guard::<Value>(seq, "DBOS.updateWorkflowAttributes")
+                .await?
+            {
+                return Ok(());
+            }
+            self.provider
+                .set_workflow_attributes(&id, attributes.as_ref())
+                .await?;
+            self.provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    "DBOS.updateWorkflowAttributes",
+                    Value::Null,
+                    None,
+                    None,
+                    Some(self.runtime.executor_id()),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     /// Send many messages in one durable operation — the fan-out counterpart
@@ -1691,27 +1756,35 @@ impl DurableContext {
     /// [`Error::NonExistentWorkflow`] if any destination does not exist;
     /// otherwise storage errors, [`Error::Cancelled`], or
     /// [`Error::UnexpectedStep`] on a divergent replay.
-    pub async fn send_bulk<T: Serialize>(&self, messages: &[crate::SendMessage<T>]) -> Result<()> {
+    pub fn send_bulk<T: Serialize>(
+        &self,
+        messages: &[crate::SendMessage<T>],
+    ) -> PendingStep<'_, ()> {
         // Validate + serialize before claiming the seq, so a bad batch fails
         // without consuming a checkpoint slot.
-        let rows = crate::engine::prepare_bulk(messages)?;
+        let rows = match crate::engine::prepare_bulk(messages) {
+            Ok(rows) => rows,
+            Err(e) => return PendingStep::new(async move { Err(e) }),
+        };
         let seq = self.next_seq();
-        if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send_bulk").await? {
-            return Ok(());
-        }
-        self.provider.insert_notifications(&rows).await?;
-        self.provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                "DBOS.send_bulk",
-                Value::Null,
-                None,
-                None,
-                Some(self.runtime.executor_id()),
-            )
-            .await?;
-        Ok(())
+        PendingStep::new(async move {
+            if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send_bulk").await? {
+                return Ok(());
+            }
+            self.provider.insert_notifications(&rows).await?;
+            self.provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    "DBOS.send_bulk",
+                    Value::Null,
+                    None,
+                    None,
+                    Some(self.runtime.executor_id()),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     /// Receive the oldest unconsumed message sent to this workflow on `topic`,
@@ -1741,60 +1814,64 @@ impl DurableContext {
     /// decode errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
     /// divergent replay.
     #[doc(alias = "signal")]
-    pub async fn recv<T: DeserializeOwned>(
-        &self,
+    pub fn recv<'a, T: DeserializeOwned + Send + 'a>(
+        &'a self,
         topic: &str,
         timeout: Duration,
-    ) -> Result<Option<T>> {
+    ) -> PendingStep<'a, Option<T>> {
+        let topic = topic.to_owned();
         let seq = self.next_seq();
         let deadline_seq = self.next_seq();
+        PendingStep::new(async move {
+            let topic = topic.as_str();
 
-        if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
-            return Ok(stored);
-        }
-
-        let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
-        loop {
-            if let Some(msg) = self
-                .provider
-                .consume_notification(&self.workflow_id, topic, seq, "DBOS.recv")
-                .await?
-            {
-                return Ok(Some(serde_json::from_value(msg)?));
+            if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
+                return Ok(stored);
             }
 
-            // Mailbox empty: fix the durable deadline (first miss only), then
-            // poll until a message arrives or the deadline passes.
-            let deadline = match deadline {
-                Some(d) => d,
-                None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
-            };
-            let now = chrono::Utc::now();
-            if now >= deadline {
+            let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+            loop {
+                if let Some(msg) = self
+                    .provider
+                    .consume_notification(&self.workflow_id, topic, seq, "DBOS.recv")
+                    .await?
+                {
+                    return Ok(Some(serde_json::from_value(msg)?));
+                }
+
+                // Mailbox empty: fix the durable deadline (first miss only), then
+                // poll until a message arrives or the deadline passes.
+                let deadline = match deadline {
+                    Some(d) => d,
+                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+                };
+                let now = chrono::Utc::now();
+                if now >= deadline {
+                    self.provider
+                        .record_step_result(
+                            &self.workflow_id,
+                            seq,
+                            "DBOS.recv",
+                            Value::Null,
+                            None,
+                            None,
+                            Some(self.runtime.executor_id()),
+                        )
+                        .await?;
+                    return Ok(None);
+                }
+                let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
                 self.provider
-                    .record_step_result(
-                        &self.workflow_id,
-                        seq,
-                        "DBOS.recv",
-                        Value::Null,
-                        None,
-                        None,
-                        Some(self.runtime.executor_id()),
+                    .await_change(
+                        ChangeWait::Notification {
+                            workflow_id: &self.workflow_id,
+                            topic,
+                        },
+                        remaining.min(self.wait_interval()),
                     )
-                    .await?;
-                return Ok(None);
+                    .await;
             }
-            let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-            self.provider
-                .await_change(
-                    ChangeWait::Notification {
-                        workflow_id: &self.workflow_id,
-                        topic,
-                    },
-                    remaining.min(self.wait_interval()),
-                )
-                .await;
-        }
+        })
     }
 
     /// Publish (or overwrite) the value of event `key` on this workflow.
@@ -1814,26 +1891,36 @@ impl DurableContext {
     ///
     /// Fails on a storage error, [`Error::Cancelled`], or
     /// [`Error::UnexpectedStep`] on a divergent replay.
-    pub async fn set_event<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+    pub fn set_event<T: Serialize>(&self, key: &str, value: T) -> PendingStep<'_, ()> {
+        // Encoded before the position is claimed, so a value that will not
+        // serialize fails without moving the counter and leaving every later
+        // call one slot along.
+        let encoded = match serde_json::to_value(value) {
+            Ok(encoded) => encoded,
+            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+        };
+        let key = key.to_owned();
         let seq = self.next_seq();
-        if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.setEvent").await? {
-            return Ok(());
-        }
-        self.provider
-            .upsert_event(&self.workflow_id, key, serde_json::to_value(value)?)
-            .await?;
-        self.provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                "DBOS.setEvent",
-                Value::Null,
-                None,
-                None,
-                Some(self.runtime.executor_id()),
-            )
-            .await?;
-        Ok(())
+        PendingStep::new(async move {
+            if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.setEvent").await? {
+                return Ok(());
+            }
+            self.provider
+                .upsert_event(&self.workflow_id, &key, encoded)
+                .await?;
+            self.provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    "DBOS.setEvent",
+                    Value::Null,
+                    None,
+                    None,
+                    Some(self.runtime.executor_id()),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     /// Read event `key` of another workflow, waiting up to `timeout` for it to
@@ -1858,74 +1945,79 @@ impl DurableContext {
     /// A timeout is **not** an error — it is `Ok(None)`. Fails on storage or
     /// decode errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
     /// divergent replay.
-    pub async fn get_event<T: DeserializeOwned>(
-        &self,
+    pub fn get_event<'a, T: DeserializeOwned + Send + 'a>(
+        &'a self,
         target_workflow_id: &str,
         key: &str,
         timeout: Duration,
-    ) -> Result<Option<T>> {
+    ) -> PendingStep<'a, Option<T>> {
+        let target_workflow_id = target_workflow_id.to_owned();
+        let key = key.to_owned();
         let seq = self.next_seq();
         let deadline_seq = self.next_seq();
+        PendingStep::new(async move {
+            let (target_workflow_id, key) = (target_workflow_id.as_str(), key.as_str());
 
-        if let Some(stored) = self
-            .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
-            .await?
-        {
-            return Ok(stored);
-        }
-
-        let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
-        loop {
-            if let Some(value) = self
-                .provider
-                .get_event_value(target_workflow_id, key)
+            if let Some(stored) = self
+                .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
                 .await?
             {
-                let outcome = self
-                    .provider
-                    .record_step_result(
-                        &self.workflow_id,
-                        seq,
-                        "DBOS.getEvent",
-                        value,
-                        None,
-                        None,
-                        Some(self.runtime.executor_id()),
-                    )
-                    .await?;
-                return Ok(Some(outcome_value(outcome)?));
+                return Ok(stored);
             }
 
-            let deadline = match deadline {
-                Some(d) => d,
-                None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
-            };
-            let now = chrono::Utc::now();
-            if now >= deadline {
+            let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+            loop {
+                if let Some(value) = self
+                    .provider
+                    .get_event_value(target_workflow_id, key)
+                    .await?
+                {
+                    let outcome = self
+                        .provider
+                        .record_step_result(
+                            &self.workflow_id,
+                            seq,
+                            "DBOS.getEvent",
+                            value,
+                            None,
+                            None,
+                            Some(self.runtime.executor_id()),
+                        )
+                        .await?;
+                    return Ok(Some(outcome_value(outcome)?));
+                }
+
+                let deadline = match deadline {
+                    Some(d) => d,
+                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+                };
+                let now = chrono::Utc::now();
+                if now >= deadline {
+                    self.provider
+                        .record_step_result(
+                            &self.workflow_id,
+                            seq,
+                            "DBOS.getEvent",
+                            Value::Null,
+                            None,
+                            None,
+                            Some(self.runtime.executor_id()),
+                        )
+                        .await?;
+                    return Ok(None);
+                }
+                let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
                 self.provider
-                    .record_step_result(
-                        &self.workflow_id,
-                        seq,
-                        "DBOS.getEvent",
-                        Value::Null,
-                        None,
-                        None,
-                        Some(self.runtime.executor_id()),
+                    .await_change(
+                        ChangeWait::Event {
+                            workflow_id: target_workflow_id,
+                            key,
+                        },
+                        remaining.min(self.wait_interval()),
                     )
-                    .await?;
-                return Ok(None);
+                    .await;
             }
-            let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-            self.provider
-                .await_change(
-                    ChangeWait::Event {
-                        workflow_id: target_workflow_id,
-                        key,
-                    },
-                    remaining.min(self.wait_interval()),
-                )
-                .await;
-        }
+        })
     }
 
     /// Append `value` to the append-only durable stream `key` on this workflow.
@@ -1952,65 +2044,70 @@ impl DurableContext {
     /// Fails if the stream was already closed by
     /// [`close_stream`](Self::close_stream); otherwise storage errors,
     /// [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a divergent replay.
-    pub async fn write_stream<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+    pub fn write_stream<T: Serialize>(&self, key: &str, value: T) -> PendingStep<'_, ()> {
+        let encoded = match serde_json::to_value(value) {
+            Ok(encoded) => encoded,
+            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+        };
+        let key = key.to_owned();
         let seq = self.next_seq();
-        if self
-            .replay_or_guard::<Value>(seq, "DBOS.writeStream")
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-        self.provider
-            .write_stream(
-                &self.workflow_id,
-                key,
-                Some(serde_json::to_value(value)?),
-                seq,
-            )
-            .await?;
-        self.provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                "DBOS.writeStream",
-                Value::Null,
-                None,
-                None,
-                Some(self.runtime.executor_id()),
-            )
-            .await?;
-        Ok(())
+        PendingStep::new(async move {
+            if self
+                .replay_or_guard::<Value>(seq, "DBOS.writeStream")
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            self.provider
+                .write_stream(&self.workflow_id, &key, Some(encoded), seq)
+                .await?;
+            self.provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    "DBOS.writeStream",
+                    Value::Null,
+                    None,
+                    None,
+                    Some(self.runtime.executor_id()),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     /// Close the durable stream `key` on this workflow, sealing it against
     /// further writes. Recorded as a `DBOS.closeStream` step. A reader draining
     /// the stream observes the close and stops. Writing to a closed stream
     /// errors.
-    pub async fn close_stream(&self, key: &str) -> Result<()> {
+    pub fn close_stream(&self, key: &str) -> PendingStep<'_, ()> {
+        let key = key.to_owned();
         let seq = self.next_seq();
-        if self
-            .replay_or_guard::<Value>(seq, "DBOS.closeStream")
-            .await?
-            .is_some()
-        {
-            return Ok(());
-        }
-        self.provider
-            .write_stream(&self.workflow_id, key, None, seq)
-            .await?;
-        self.provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                "DBOS.closeStream",
-                Value::Null,
-                None,
-                None,
-                Some(self.runtime.executor_id()),
-            )
-            .await?;
-        Ok(())
+        PendingStep::new(async move {
+            if self
+                .replay_or_guard::<Value>(seq, "DBOS.closeStream")
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+            self.provider
+                .write_stream(&self.workflow_id, &key, None, seq)
+                .await?;
+            self.provider
+                .record_step_result(
+                    &self.workflow_id,
+                    seq,
+                    "DBOS.closeStream",
+                    Value::Null,
+                    None,
+                    None,
+                    Some(self.runtime.executor_id()),
+                )
+                .await?;
+            Ok(())
+        })
     }
 
     /// Read the durable stream `key` produced by `workflow_id` (another workflow,
@@ -2178,5 +2275,62 @@ async fn run_step_catching<T>(name: &str, fut: impl Future<Output = Result<T>>) 
             "step `{name}` panicked: {}",
             panic_message(&*payload)
         ))),
+    }
+}
+
+/// A durable operation that has claimed its position in the workflow but has
+/// not run yet.
+///
+/// Every durable call on a [`DurableContext`] hands one of these back instead of
+/// being an `async fn`, and the difference is where the call's **position** is
+/// decided. A position is the `(workflow_id, seq)` key its checkpoint is written
+/// under, and a replay finds the recorded result only by asking for the same
+/// position the first run asked for.
+///
+/// An `async fn` body does not begin until something polls it, so a position
+/// taken inside one follows *poll* order — which the combinator driving the
+/// futures decides, not the code. `tokio::select!` polls in a randomised order;
+/// awaiting two calls in the opposite order to the one they were written in
+/// reverses them. Either way a replay is free to number the same calls
+/// differently, and two calls that share a name then replay each other's
+/// results with nothing to notice it.
+///
+/// Building one of these takes the position immediately, in the order the calls
+/// appear in the source, so what fixes a position is a rule the language
+/// guarantees rather than one the runtime happens to follow. Awaiting is then
+/// only *running* something that already knows where it stands, and
+/// `tokio::join!` over several is ordinary code.
+///
+/// # A built call has spent its position
+///
+/// The position is claimed at the call, so building one and dropping it without
+/// awaiting still moves the counter. That is deterministic — a replay runs the
+/// same code and skips the same position — but it is no longer the no-op it
+/// would be for a plain future, which is why this is `#[must_use]`.
+#[must_use = "this durable call has already claimed its position; awaiting it is what runs it"]
+pub struct PendingStep<'a, T> {
+    running: Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+}
+
+impl<'a, T> PendingStep<'a, T> {
+    /// Wraps the run of a call whose position has already been claimed.
+    fn new(running: impl Future<Output = Result<T>> + Send + 'a) -> Self {
+        Self {
+            running: Box::pin(running),
+        }
+    }
+}
+
+impl<T> Future for PendingStep<'_, T> {
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.running.as_mut().poll(cx)
+    }
+}
+
+impl<T> std::fmt::Debug for PendingStep<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingStep").finish_non_exhaustive()
     }
 }
