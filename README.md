@@ -11,12 +11,16 @@ and, after a crash, restart, or redeploy, resumes every unfinished workflow
 exactly where it stopped. Completed steps are never re-run.
 
 `durare` is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
-aligned by design with the DBOS Transact SDKs for Python, Go, and TypeScript:
-the same programming model, the same semantics, and the same system schema on
-the same database. There is no server to operate and no sidecar — the engine
+aligned by design with the DBOS Transact SDKs for Python, Go, TypeScript, and
+Rust: the same programming model, the same semantics, and the same system schema
+on the same database. There is no server to operate and no sidecar — the engine
 is a library inside your process that talks directly to Postgres or SQLite.
 See [DBOS compatibility](#dbos-compatibility). Full API documentation is on
 [docs.rs](https://docs.rs/durare).
+
+DBOS also publishes an official Rust SDK,
+[`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust). `durare` is
+community-maintained.
 
 ```rust
 use std::time::Duration;
@@ -193,8 +197,6 @@ In practice this means:
 SELECT workflow_uuid, name, status FROM dbos.workflow_status;
 SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_outputs;
 ```
-
-`durare` is community-maintained.
 
 ## Backends
 
