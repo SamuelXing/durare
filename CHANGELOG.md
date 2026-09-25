@@ -16,8 +16,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `PendingStep`, which is a `Future` — so `ctx.step(..).await?` reads exactly as
   it did and no call site changes. `#[durare::step]` and
   `#[durare::transaction]` emit such a `fn` rather than an `async fn`, so a
-  macro-written call follows the same rule; the context must be the only
-  reference the annotated fn takes.
+  macro-written call follows the same rule.
 
   A position is the `(workflow_id, seq)` key a checkpoint is written under, and
   a replay finds a recorded result only by asking for the position the first run

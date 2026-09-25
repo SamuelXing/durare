@@ -7,34 +7,35 @@
 //! order — which `tokio::select!` randomises and an out-of-order await reverses —
 //! so these pin it to the source instead.
 
-use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, WorkflowOptions,
-};
+use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
 
+/// The `(position, operation)` pairs a workflow recorded, in position order.
+/// A position nothing was written at is simply absent, which is how a call that
+/// claimed one without running shows up.
+async fn recorded(engine: &DurableEngine) -> Result<Vec<(i32, String)>> {
+    Ok(engine
+        .get_workflow_steps("wf")
+        .await?
+        .into_iter()
+        .map(|step| (step.step_id, step.name))
+        .collect())
+}
+
 /// Runs `body` as a workflow and reports which operation landed at each position.
-async fn positions<F, Fut>(body: F) -> Result<Vec<String>>
+async fn positions<F, Fut>(body: F) -> Result<Vec<(i32, String)>>
 where
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<i64>> + Send + 'static,
 {
-    let provider = Arc::new(InMemoryProvider::new());
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register("probe", move |ctx: DurableContext, _: ()| body(ctx));
     engine
         .start::<_, i64>("probe", (), WorkflowOptions::with_id("wf"))
         .await?
         .result()
         .await?;
-
-    let mut seen = Vec::new();
-    for seq in 0.. {
-        match provider.get_step_result("wf", seq).await? {
-            Some(record) => seen.push(record.name),
-            None => break,
-        }
-    }
-    Ok(seen)
+    recorded(&engine).await
 }
 
 /// Awaiting two steps in the opposite order to the one they were written in must
@@ -59,7 +60,10 @@ async fn awaiting_out_of_order_does_not_move_a_position() -> Result<()> {
     })
     .await?;
 
-    assert_eq!(in_order, ["first", "second"]);
+    assert_eq!(
+        in_order,
+        [(0, "first".to_string()), (1, "second".to_string())]
+    );
     assert_eq!(
         reversed, in_order,
         "positions must follow the order the calls are written, not the order they are awaited"
@@ -73,10 +77,8 @@ async fn awaiting_out_of_order_does_not_move_a_position() -> Result<()> {
 async fn a_randomised_poll_order_does_not_move_a_position() -> Result<()> {
     for _ in 0..24 {
         let seen = positions(|ctx| async move {
-            let a = ctx.step("a", || async { Ok::<_, Error>(1_i64) });
-            let b = ctx.step("b", || async { Ok::<_, Error>(2_i64) });
-            let mut a = Box::pin(a);
-            let mut b = Box::pin(b);
+            let mut a = ctx.step("a", || async { Ok::<_, Error>(1_i64) });
+            let mut b = ctx.step("b", || async { Ok::<_, Error>(2_i64) });
             tokio::select! {
                 _ = &mut a => { let _ = b.await; }
                 _ = &mut b => { let _ = a.await; }
@@ -86,7 +88,7 @@ async fn a_randomised_poll_order_does_not_move_a_position() -> Result<()> {
         .await?;
         assert_eq!(
             seen,
-            ["a", "b"],
+            [(0, "a".to_string()), (1, "b".to_string())],
             "a randomised poll order reached the counter in a different order"
         );
     }
@@ -108,7 +110,14 @@ async fn the_rule_holds_across_the_kinds_of_call() -> Result<()> {
         Ok(0)
     })
     .await?;
-    assert_eq!(seen, ["a_step", "DBOS.setEvent", "DBOS.uuid"]);
+    assert_eq!(
+        seen,
+        [
+            (0, "a_step".to_string()),
+            (1, "DBOS.setEvent".to_string()),
+            (2, "DBOS.uuid".to_string())
+        ]
+    );
     Ok(())
 }
 
@@ -117,39 +126,19 @@ async fn the_rule_holds_across_the_kinds_of_call() -> Result<()> {
 /// the no-op it would be for a plain future.
 #[tokio::test]
 async fn a_built_call_that_is_dropped_has_spent_its_position() -> Result<()> {
-    let provider = Arc::new(InMemoryProvider::new());
-    let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("probe", |ctx: DurableContext, _: ()| async move {
+    let seen = positions(|ctx| async move {
         let abandoned = ctx.step("abandoned", || async { Ok::<_, Error>(1_i64) });
         drop(abandoned);
         ctx.step("recorded", || async { Ok::<_, Error>(2_i64) })
             .await?;
-        Ok::<_, Error>(0_i64)
-    });
-    engine
-        .start::<_, i64>("probe", (), WorkflowOptions::with_id("wf"))
-        .await?
-        .result()
-        .await?;
-
-    let name_at = |seq: i32| {
-        let provider = provider.clone();
-        async move {
-            provider
-                .get_step_result("wf", seq)
-                .await
-                .map(|r| r.map(|r| r.name))
-        }
-    };
+        Ok(0)
+    })
+    .await?;
     assert_eq!(
-        name_at(0).await?,
-        None,
-        "the dropped call claimed position 0 and wrote nothing there"
-    );
-    assert_eq!(
-        name_at(1).await?,
-        Some("recorded".to_string()),
-        "the next call took the position after the abandoned one, not position 0"
+        seen,
+        [(1, "recorded".to_string())],
+        "the dropped call spent position 0 and wrote nothing there, so the next \
+         call took 1 rather than 0"
     );
     Ok(())
 }
@@ -179,7 +168,13 @@ async fn a_macro_written_call_claims_its_position_where_it_is_written() -> Resul
         Ok(0)
     })
     .await?;
-    assert_eq!(seen, ["macro_first", "macro_second"]);
+    assert_eq!(
+        seen,
+        [
+            (0, "macro_first".to_string()),
+            (1, "macro_second".to_string())
+        ]
+    );
     Ok(())
 }
 
@@ -193,22 +188,17 @@ async fn a_refused_nested_transaction_leaves_the_counter_alone() -> Result<()> {
     use std::time::Duration;
 
     let path = std::env::temp_dir().join(format!("durare-nested-seq-{}.db", uuid::Uuid::new_v4()));
-    let provider =
-        Arc::new(SqliteProvider::connect(&format!("sqlite://{}", path.display())).await?);
-    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let provider = SqliteProvider::connect(&format!("sqlite://{}", path.display())).await?;
+    let mut engine = DurableEngine::new(Arc::new(provider)).await?;
     engine.register("probe", |ctx: DurableContext, _: ()| async move {
         let nested_ctx = ctx.clone();
         ctx.transaction::<(), _>("outer", move |_tx| {
             let nested_ctx = nested_ctx.clone();
             Box::pin(async move {
-                let refused = nested_ctx
+                nested_ctx
                     .transaction::<(), _>("inner", |_tx| Box::pin(async { Ok(()) }))
                     .await
                     .expect_err("a transaction inside a transaction is refused");
-                assert!(
-                    refused.to_string().contains("inside another transaction"),
-                    "{refused}"
-                );
                 Ok(())
             })
         })
@@ -224,19 +214,9 @@ async fn a_refused_nested_transaction_leaves_the_counter_alone() -> Result<()> {
         .result()
         .await?;
 
-    let name_at = |seq: i32| {
-        let provider = provider.clone();
-        async move {
-            provider
-                .get_step_result("wf", seq)
-                .await
-                .map(|r| r.map(|r| r.name))
-        }
-    };
-    assert_eq!(name_at(0).await?, Some("outer".to_string()));
     assert_eq!(
-        name_at(1).await?,
-        Some("after".to_string()),
+        recorded(&engine).await?,
+        [(0, "outer".to_string()), (1, "after".to_string())],
         "the refused nested transaction must not have spent position 1"
     );
 

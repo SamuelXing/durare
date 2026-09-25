@@ -203,17 +203,6 @@ impl DurableContext {
     const NESTED_TRANSACTION: &'static str =
         "cannot start a transaction inside another transaction";
 
-    /// The nesting rule on its own, leaving the flag alone. A transaction that
-    /// cannot run must not move the counter, so this is what a call checks
-    /// before claiming its position; [`begin_transaction`](Self::begin_transaction)
-    /// then takes the flag when the call is actually polled.
-    fn check_outside_transaction(&self) -> Result<()> {
-        if self.in_transaction.load(Ordering::SeqCst) {
-            return Err(Error::app(Self::NESTED_TRANSACTION));
-        }
-        Ok(())
-    }
-
     /// Set the in-transaction flag, refusing a nested transaction (it would
     /// deadlock on the outer's write lock). The guard clears the flag on drop.
     fn begin_transaction(&self) -> Result<TxFlagGuard<'_>> {
@@ -369,7 +358,7 @@ impl DurableContext {
         &'a self,
         name: &str,
         input: I,
-        opts: WorkflowOptions,
+        mut opts: WorkflowOptions,
     ) -> PendingStep<'a, WorkflowHandle<O>>
     where
         I: Serialize,
@@ -379,13 +368,11 @@ impl DurableContext {
         // serialize fails without moving the counter.
         let input_json = match serde_json::to_value(input) {
             Ok(input_json) => input_json,
-            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+            Err(e) => return PendingStep::failed(e.into()),
         };
         let name = name.to_owned();
         let seq = self.next_seq();
         PendingStep::new(async move {
-            let name = name.as_str();
-
             // Replay: re-attach to the child already started at this step. A
             // different workflow name recorded here means the parent is
             // non-deterministic — re-attaching would hand back the wrong child.
@@ -398,7 +385,7 @@ impl DurableContext {
                     return Err(Error::unexpected_step(
                         &self.workflow_id,
                         seq,
-                        name,
+                        &name,
                         recorded,
                     ));
                 }
@@ -412,7 +399,6 @@ impl DurableContext {
                 // deterministic `{parent}-{seq}` so an empty id is never persisted.
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
-            let mut opts = opts;
             opts.workflow_id = Some(child_id.clone());
 
             // The child inherits this workflow's identity **per field**: each auth
@@ -438,7 +424,7 @@ impl DurableContext {
             self.runtime
                 .spawn_child(
                     &child_id,
-                    name,
+                    &name,
                     input_json,
                     opts,
                     &self.workflow_id,
@@ -446,7 +432,7 @@ impl DurableContext {
                 )
                 .await?;
             self.provider
-                .record_child_workflow(&self.workflow_id, seq, name, &child_id)
+                .record_child_workflow(&self.workflow_id, seq, &name, &child_id)
                 .await?;
 
             Ok(WorkflowHandle::polling(child_id, self.provider.clone()))
@@ -650,12 +636,15 @@ impl DurableContext {
             + Sync
             + 'static,
     {
-        // Refused before the position is claimed, so a transaction that cannot
-        // run moves no counter. Only the check happens here: taking the flag at
-        // construction would refuse two transactions built together and awaited
-        // one after the other, which is ordinary code under this rule.
-        if let Err(e) = self.check_outside_transaction() {
-            return PendingStep::new(async move { Err(e) });
+        // A transaction nested inside another is refused before the position is
+        // claimed, so it moves no counter. Only the check happens here: taking
+        // the flag at construction would refuse two transactions built together
+        // and awaited one after the other, which is ordinary code under this
+        // rule. (Two transactions run *concurrently* still fail, and report the
+        // same nesting error, with their positions already claimed — the flag
+        // cannot tell re-entrancy from concurrency. Unchanged by this rule.)
+        if self.in_transaction.load(Ordering::SeqCst) {
+            return PendingStep::failed(Error::app(Self::NESTED_TRANSACTION));
         }
         let seq = self.next_seq();
         let span = self.op_span("transaction", &opts.name, seq);
@@ -1314,7 +1303,7 @@ impl DurableContext {
     /// ```
     pub fn select<'a, T>(
         &'a self,
-        branches: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
+        mut branches: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
     ) -> PendingStep<'a, (usize, T)>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
@@ -1322,9 +1311,7 @@ impl DurableContext {
         // Refused before the position is claimed, so a race that cannot run
         // moves no counter and the calls around it keep their positions.
         if branches.is_empty() {
-            return PendingStep::new(async {
-                Err(Error::app("select requires at least one branch"))
-            });
+            return PendingStep::failed(Error::app("select requires at least one branch"));
         }
         let seq = self.next_seq();
         PendingStep::new(async move {
@@ -1339,7 +1326,6 @@ impl DurableContext {
             // Poll the branches in index order on this one task; the first ready wins
             // (lowest index on a tie). The losers are dropped — and so cancelled —
             // when `branches` goes out of scope.
-            let mut branches = branches;
             let (index, value) = poll_fn(|cx| {
                 for (i, branch) in branches.iter_mut().enumerate() {
                     if let Poll::Ready(value) = branch.as_mut().poll(cx) {
@@ -1694,7 +1680,7 @@ impl DurableContext {
         // serialize fails without moving the counter.
         let encoded = match serde_json::to_value(message) {
             Ok(encoded) => encoded,
-            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+            Err(e) => return PendingStep::failed(e.into()),
         };
         let destination_id = destination_id.to_owned();
         let topic = topic.to_owned();
@@ -1784,7 +1770,7 @@ impl DurableContext {
         // without consuming a checkpoint slot.
         let rows = match crate::engine::prepare_bulk(messages) {
             Ok(rows) => rows,
-            Err(e) => return PendingStep::new(async move { Err(e) }),
+            Err(e) => return PendingStep::failed(e),
         };
         let seq = self.next_seq();
         PendingStep::new(async move {
@@ -1843,8 +1829,6 @@ impl DurableContext {
         let seq = self.next_seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(async move {
-            let topic = topic.as_str();
-
             if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
                 return Ok(stored);
             }
@@ -1853,7 +1837,7 @@ impl DurableContext {
             loop {
                 if let Some(msg) = self
                     .provider
-                    .consume_notification(&self.workflow_id, topic, seq, "DBOS.recv")
+                    .consume_notification(&self.workflow_id, &topic, seq, "DBOS.recv")
                     .await?
                 {
                     return Ok(Some(serde_json::from_value(msg)?));
@@ -1885,7 +1869,7 @@ impl DurableContext {
                     .await_change(
                         ChangeWait::Notification {
                             workflow_id: &self.workflow_id,
-                            topic,
+                            topic: &topic,
                         },
                         remaining.min(self.wait_interval()),
                     )
@@ -1917,7 +1901,7 @@ impl DurableContext {
         // call one slot along.
         let encoded = match serde_json::to_value(value) {
             Ok(encoded) => encoded,
-            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+            Err(e) => return PendingStep::failed(e.into()),
         };
         let key = key.to_owned();
         let seq = self.next_seq();
@@ -1976,8 +1960,6 @@ impl DurableContext {
         let seq = self.next_seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(async move {
-            let (target_workflow_id, key) = (target_workflow_id.as_str(), key.as_str());
-
             if let Some(stored) = self
                 .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
                 .await?
@@ -1989,7 +1971,7 @@ impl DurableContext {
             loop {
                 if let Some(value) = self
                     .provider
-                    .get_event_value(target_workflow_id, key)
+                    .get_event_value(&target_workflow_id, &key)
                     .await?
                 {
                     let outcome = self
@@ -2030,8 +2012,8 @@ impl DurableContext {
                 self.provider
                     .await_change(
                         ChangeWait::Event {
-                            workflow_id: target_workflow_id,
-                            key,
+                            workflow_id: &target_workflow_id,
+                            key: &key,
                         },
                         remaining.min(self.wait_interval()),
                     )
@@ -2067,7 +2049,7 @@ impl DurableContext {
     pub fn write_stream<T: Serialize>(&self, key: &str, value: T) -> PendingStep<'_, ()> {
         let encoded = match serde_json::to_value(value) {
             Ok(encoded) => encoded,
-            Err(e) => return PendingStep::new(async move { Err(e.into()) }),
+            Err(e) => return PendingStep::failed(e.into()),
         };
         let key = key.to_owned();
         let seq = self.next_seq();
@@ -2338,6 +2320,12 @@ impl<'a, T> PendingStep<'a, T> {
         Self {
             running: Box::pin(running),
         }
+    }
+
+    /// A call that failed before it could run, and so never claimed a position.
+    /// Returned in place of a claim, never after one.
+    fn failed(e: Error) -> Self {
+        Self::new(async move { Err(e) })
     }
 }
 

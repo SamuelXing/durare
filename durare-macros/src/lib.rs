@@ -16,10 +16,13 @@
 
 use heck::ToUpperCamelCase;
 use proc_macro::TokenStream;
+use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
+use syn::visit_mut::{self, VisitMut};
 use syn::{
-    parse_macro_input, parse_quote, FnArg, Ident, ItemFn, LitStr, ReturnType, Signature, Token,
+    parse_macro_input, parse_quote, FnArg, GenericParam, Ident, ItemFn, Lifetime, LifetimeParam,
+    LitStr, ReturnType, Signature, Token, Type, TypeParamBound, TypeReference,
 };
 
 /// Parsed `#[workflow(...)]` arguments. Supports a bare name literal
@@ -115,19 +118,9 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
             .into()
         }
     };
-    // Return type: `Result<Output>`. The macro does not parse `Output` out of
-    // the tokens — it projects `<ReturnType as WorkflowResult>::Ok` below and
-    // lets the compiler extract it (through any `Result` alias).
-    let return_ty = match &func.sig.output {
-        ReturnType::Type(_, ty) => &**ty,
-        ReturnType::Default => {
-            return syn::Error::new_spanned(
-                &func.sig,
-                "a `#[workflow]` fn must return `Result<Output>`",
-            )
-            .to_compile_error()
-            .into()
-        }
+    let return_ty = match result_ty(&func.sig, "workflow") {
+        Ok(ty) => ty,
+        Err(e) => return e.to_compile_error().into(),
     };
     // Marker type name: `UpperCamelCase` of the function identifier.
     let marker = Ident::new(&ident.to_string().to_upper_camel_case(), ident.span());
@@ -166,21 +159,95 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// The `Ok` type is projected at the type level rather than parsed out of the
 /// return type's tokens, so any `Result` alias works, as in [`macro@workflow`].
-/// The returned lifetime is elided to the fn's one input lifetime, which is the
-/// context's, so the context must be the only reference the fn takes.
-fn pending_signature(sig: &Signature, macro_name: &str) -> syn::Result<Signature> {
-    let ReturnType::Type(_, ret) = &sig.output else {
-        return Err(syn::Error::new_spanned(
+fn pending_signature(mut sig: Signature, macro_name: &str) -> syn::Result<Signature> {
+    let ret = result_ty(&sig, macro_name)?.clone();
+    let borrow = Lifetime::new("'__durare", Span::call_site());
+
+    // The returned `PendingStep` borrows for as long as the call lives, so the
+    // signature needs a lifetime to name. Relying on elision would only work
+    // for a fn whose context is its one reference, and would reject an ordinary
+    // generic step outright, so the macro introduces its own: every elided
+    // borrow in the arguments becomes `'__durare`, every lifetime already named
+    // must outlive it, and every type parameter must be valid for it, since the
+    // future the call returns holds all of them.
+    let mut elided = ElidedBorrows(borrow.clone());
+    for arg in sig.inputs.iter_mut() {
+        elided.visit_fn_arg_mut(arg);
+    }
+    // Each bound goes where that parameter's bounds already are: adding a
+    // `where` predicate for a parameter written as `<T: Serialize>` would leave
+    // it bounded in two places, which `clippy::multiple_bound_locations` reports
+    // in the caller's code, about a bound the caller never wrote.
+    let mut unbounded_lifetimes = Vec::new();
+    let mut unbounded_types = Vec::new();
+    for param in sig.generics.params.iter_mut() {
+        match param {
+            GenericParam::Lifetime(def) if def.bounds.is_empty() => {
+                unbounded_lifetimes.push(def.lifetime.clone())
+            }
+            GenericParam::Lifetime(def) => def.bounds.push(borrow.clone()),
+            GenericParam::Type(ty) if ty.bounds.is_empty() => {
+                unbounded_types.push(ty.ident.clone())
+            }
+            GenericParam::Type(ty) => ty.bounds.push(TypeParamBound::Lifetime(borrow.clone())),
+            GenericParam::Const(_) => {}
+        }
+    }
+    if !unbounded_lifetimes.is_empty() || !unbounded_types.is_empty() {
+        let where_clause = sig.generics.make_where_clause();
+        for lifetime in unbounded_lifetimes {
+            where_clause
+                .predicates
+                .push(parse_quote!(#lifetime: #borrow));
+        }
+        for ty in unbounded_types {
+            where_clause.predicates.push(parse_quote!(#ty: #borrow));
+        }
+    }
+    sig.generics.params.insert(
+        0,
+        GenericParam::Lifetime(LifetimeParam::new(borrow.clone())),
+    );
+
+    sig.asyncness = None;
+    sig.output = parse_quote! {
+        -> durare::PendingStep<#borrow, <#ret as durare::WorkflowResult>::Ok>
+    };
+    Ok(sig)
+}
+
+/// Rewrites the elided borrows in a durable fn's arguments — `&T` and `&'_ T` —
+/// to the lifetime the macro owns. An already-named lifetime is left alone and
+/// picks up an outlives bound instead.
+struct ElidedBorrows(Lifetime);
+
+impl VisitMut for ElidedBorrows {
+    fn visit_type_reference_mut(&mut self, node: &mut TypeReference) {
+        if node.lifetime.as_ref().is_none_or(|lt| lt.ident == "_") {
+            node.lifetime = Some(self.0.clone());
+        }
+        visit_mut::visit_type_reference_mut(self, node);
+    }
+
+    fn visit_lifetime_mut(&mut self, node: &mut Lifetime) {
+        if node.ident == "_" {
+            *node = self.0.clone();
+        }
+    }
+}
+
+/// A durable fn's declared return type, which every one of these macros
+/// requires to be a `Result`. None of them parses the `Ok` type out of it —
+/// they project `<ReturnType as WorkflowResult>::Ok` and let the compiler
+/// extract it, so any `Result` alias works.
+fn result_ty<'s>(sig: &'s Signature, macro_name: &str) -> syn::Result<&'s Type> {
+    match &sig.output {
+        ReturnType::Type(_, ty) => Ok(ty),
+        ReturnType::Default => Err(syn::Error::new_spanned(
             sig,
-            format!("a `#[{macro_name}]` fn must return `Result<T>`"),
-        ));
-    };
-    let mut pending = sig.clone();
-    pending.asyncness = None;
-    pending.output = parse_quote! {
-        -> durare::PendingStep<'_, <#ret as durare::WorkflowResult>::Ok>
-    };
-    Ok(pending)
+            format!("a `#[{macro_name}]` fn must return `Result<..>`"),
+        )),
+    }
 }
 
 /// Parsed `#[step(...)]` arguments: an optional name override — a bare literal
@@ -242,8 +309,9 @@ impl Parse for StepArgs {
 /// polled — the rule every durable call on a `DurableContext` follows. Calls
 /// still read as `charge(&ctx, 1299).await?`; what changes is that building one
 /// and never awaiting it spends the position anyway, which `#[must_use]` warns
-/// about. The context must be the fn's only reference parameter, since the
-/// `PendingStep` borrows it.
+/// about. The fn may take further references and be generic: the macro gives
+/// the signature a lifetime of its own and bounds the parameters by it, rather
+/// than leaning on elision.
 #[proc_macro_attribute]
 pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -277,7 +345,7 @@ pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let block = &func.block;
-    let sig = match pending_signature(&func.sig, "step") {
+    let sig = match pending_signature(func.sig.clone(), "step") {
         Ok(sig) => sig,
         Err(e) => return e.to_compile_error().into(),
     };
@@ -360,8 +428,7 @@ fn param_ident(arg: &FnArg) -> Option<&Ident> {
 ///
 /// Like [`macro@step`], what it emits is a plain `fn` returning a
 /// `durare::PendingStep`, so the transaction claims its position
-/// where it is written; the context must be the fn's only reference parameter
-/// once `tx` is dropped from the signature.
+/// where it is written.
 #[proc_macro_attribute]
 pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -429,7 +496,7 @@ pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let block = &func.block;
-    let sig = match pending_signature(&sig, "transaction") {
+    let sig = match pending_signature(sig, "transaction") {
         Ok(sig) => sig,
         Err(e) => return e.to_compile_error().into(),
     };
