@@ -3,7 +3,7 @@
 //! produces, the engine consumes.
 
 use durare::{
-    Client, DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result,
+    workflow_fn, Client, DurableEngine, Error, InMemoryProvider, ListFilter, Result,
     ScheduledInput, WorkflowOptions, WorkflowQueue,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,9 +17,12 @@ async fn client_enqueues_work_an_engine_runs() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("double", |ctx: DurableContext, n: i64| async move {
-        ctx.step("mul", || async { Ok::<_, Error>(n * 2) }).await
-    });
+    engine.register(
+        "double",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move { ctx.step("mul", |_| async { Ok::<_, Error>(n * 2) }).await })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -61,12 +64,17 @@ async fn client_sends_messages_and_reads_events() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("waiter", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("topic", Duration::from_secs(5)).await?;
-        let msg = msg.unwrap_or_default();
-        ctx.set_event("echo", &msg).await?;
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("topic", Duration::from_secs(5)).await?;
+                let msg = msg.unwrap_or_default();
+                ctx.set_event("echo", &msg).await?;
+                Ok::<_, Error>(msg)
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -148,10 +156,15 @@ async fn client_set_workflow_delay_pulls_in() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("ping", |_ctx: DurableContext, _: ()| async move {
-        RAN.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "ping",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -197,10 +210,15 @@ async fn client_set_workflow_delay_until_pulls_in() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("ping", |_ctx: DurableContext, _: ()| async move {
-        RAN.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "ping",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -241,12 +259,17 @@ async fn client_reads_a_stream() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("producer", |ctx: DurableContext, _: ()| async move {
-        ctx.write_stream("s", 1i64).await?;
-        ctx.write_stream("s", 2i64).await?;
-        ctx.close_stream("s").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.write_stream("s", 1i64).await?;
+                ctx.write_stream("s", 2i64).await?;
+                ctx.close_stream("s").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -365,10 +388,12 @@ async fn client_created_schedule_fires_on_engine() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "tick_job",
-        |_ctx: DurableContext, _at: ScheduledInput| async move {
-            FIRED.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(())
-        },
+        workflow_fn(|_ctx, _at: ScheduledInput| {
+            Box::pin(async move {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
     );
     engine.launch().await?;
 
@@ -404,16 +429,21 @@ async fn client_resumes_a_cancelled_workflow() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("two_step", |ctx: DurableContext, _: ()| async move {
-        ctx.step("s0", || async { Ok::<_, Error>(1i64) }).await?;
-        let v = ctx
-            .step("s1", || async {
-                S1.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(2i64)
+    engine.register(
+        "two_step",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("s0", |_| async { Ok::<_, Error>(1i64) }).await?;
+                let v = ctx
+                    .step("s1", |_| async {
+                        S1.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(2i64)
+                    })
+                    .await?;
+                Ok::<_, Error>(v)
             })
-            .await?;
-        Ok::<_, Error>(v)
-    });
+        }),
+    );
     engine.launch().await?;
 
     // A direct workflow with step 0 already checkpointed, then cancelled.
@@ -462,10 +492,15 @@ async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("job", |_ctx: DurableContext, _: ()| async move {
-        RAN.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "job",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("orders"));
     // Listen to a different queue: "orders" gets no dispatcher here, but the
     // internal queue is always dispatched.
@@ -515,18 +550,23 @@ async fn client_forks_a_workflow() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("pipeline", |ctx: DurableContext, _: ()| async move {
-        let a = ctx
-            .step("first", || async { Ok::<_, Error>(10i64) })
-            .await?;
-        let b = ctx
-            .step("second", || async {
-                SECOND.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(a + 5)
+    engine.register(
+        "pipeline",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("first", |_| async { Ok::<_, Error>(10i64) })
+                    .await?;
+                let b = ctx
+                    .step("second", |_| async {
+                        SECOND.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(a + 5)
+                    })
+                    .await?;
+                Ok::<_, Error>(b)
             })
-            .await?;
-        Ok::<_, Error>(b)
-    });
+        }),
+    );
     engine.launch().await?;
 
     // Original run via the engine.
@@ -561,13 +601,15 @@ async fn client_triggers_a_schedule_run_on_an_engine() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "tick_job",
-        |_ctx: DurableContext, at: ScheduledInput| async move {
-            FIRED.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(
-                at.scheduled_time
-                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            )
-        },
+        workflow_fn(|_ctx, at: ScheduledInput| {
+            Box::pin(async move {
+                FIRED.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(
+                    at.scheduled_time
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                )
+            })
+        }),
     );
     engine.launch().await?;
 
@@ -820,9 +862,10 @@ async fn client_resume_missing_and_completed() -> Result<()> {
     use durare::ErrorCode;
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("one", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(1_i64)
-    });
+    engine.register(
+        "one",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(1_i64) })),
+    );
     engine.launch().await?;
     let out: i64 = engine
         .start("one", (), WorkflowOptions::with_id("wf-one"))
@@ -892,9 +935,10 @@ async fn client_enqueue_persists_delay_timeout_and_auth() -> Result<()> {
 async fn client_delayed_cancel_then_resume_bypasses_delay() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("late", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 2)
-    });
+    engine.register(
+        "late",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 2) })),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 

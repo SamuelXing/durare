@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[durare::workflow]
-async fn double(_ctx: DurableContext, n: i64) -> Result<i64> {
+async fn double(_ctx: &DurableContext, n: i64) -> Result<i64> {
     Ok(n * 2)
 }
 
 #[durare::workflow]
-async fn greet(_ctx: DurableContext, name: String) -> Result<String> {
+async fn greet(_ctx: &DurableContext, name: String) -> Result<String> {
     Ok(format!("hello, {name}"))
 }
 

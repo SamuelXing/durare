@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[durare::workflow]
-async fn crunch(ctx: DurableContext, items: i64) -> Result<i64> {
+async fn crunch(ctx: &DurableContext, items: i64) -> Result<i64> {
     for i in 1..=items {
         // Publish progress into the durable stream as we go.
         ctx.write_stream("progress", format!("processed {i}/{items}"))

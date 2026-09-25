@@ -3,9 +3,9 @@
 //! (separate engine + provider instances over the same database file).
 
 use durare::{
-    DurableContext, DurableEngine, Error, ListFilter, RateLimiter, Result, ScheduledInput,
-    SqliteProvider, TransactionOptions, WorkflowOptions, WorkflowQueue, STATUS_CANCELLED,
-    STATUS_SUCCESS,
+    workflow_fn, DurableContext, DurableEngine, Error, ListFilter, RateLimiter, Result,
+    ScheduledInput, SqliteProvider, TransactionOptions, WorkflowOptions, WorkflowQueue,
+    STATUS_CANCELLED, STATUS_SUCCESS,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -26,9 +26,10 @@ async fn sqlite_persists_and_runs_workflow() -> Result<()> {
     let (url, path) = temp_db_url("basic");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("add_one", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "add_one",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
 
     let handle = engine
         .start::<_, i64>("add_one", 41_i64, WorkflowOptions::with_id("wf-sqlite-1"))
@@ -50,15 +51,20 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
     // "Process 1": run the workflow to completion, charging once.
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-        engine.register("charge", |ctx: DurableContext, _: ()| async move {
-            let amt = ctx
-                .step("charge_card", || async {
-                    CHARGES.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, Error>(4999_i64)
+        engine.register(
+            "charge",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let amt = ctx
+                        .step("charge_card", |_| async {
+                            CHARGES.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Error>(4999_i64)
+                        })
+                        .await?;
+                    Ok::<_, Error>(amt)
                 })
-                .await?;
-            Ok::<_, Error>(amt)
-        });
+            }),
+        );
         let out: i64 = engine
             .start("charge", (), WorkflowOptions::with_id("wf-charge"))
             .await?
@@ -71,15 +77,20 @@ async fn sqlite_recovers_across_restart() -> Result<()> {
     // the same id replays the checkpoint — the card is NOT charged again.
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-        engine.register("charge", |ctx: DurableContext, _: ()| async move {
-            let amt = ctx
-                .step("charge_card", || async {
-                    CHARGES.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, Error>(4999_i64)
+        engine.register(
+            "charge",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let amt = ctx
+                        .step("charge_card", |_| async {
+                            CHARGES.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Error>(4999_i64)
+                        })
+                        .await?;
+                    Ok::<_, Error>(amt)
                 })
-                .await?;
-            Ok::<_, Error>(amt)
-        });
+            }),
+        );
         let out: i64 = engine
             .start("charge", (), WorkflowOptions::with_id("wf-charge"))
             .await?
@@ -111,21 +122,26 @@ async fn sqlite_checkpoints_a_caught_step_failure() -> Result<()> {
     // The step errors the first time its closure runs, but would succeed on any
     // later run — so re-running on replay would change the outcome.
     let register = |engine: &mut DurableEngine| {
-        engine.register("flaky_caught", |ctx: DurableContext, _: ()| async move {
-            let r: Result<i64> = ctx
-                .step("maybe", || async {
-                    let n = RUNS.fetch_add(1, Ordering::SeqCst);
-                    if n == 0 {
-                        Err(Error::app("transient"))
-                    } else {
-                        Ok(7)
-                    }
+        engine.register(
+            "flaky_caught",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let r: Result<i64> = ctx
+                        .step("maybe", |_| async {
+                            let n = RUNS.fetch_add(1, Ordering::SeqCst);
+                            if n == 0 {
+                                Err(Error::app("transient"))
+                            } else {
+                                Ok(7)
+                            }
+                        })
+                        .await;
+                    // Catch the step error and report which branch we took, so a divergent
+                    // replay would surface as a different workflow output.
+                    Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
                 })
-                .await;
-            // Catch the step error and report which branch we took, so a divergent
-            // replay would surface as a different workflow output.
-            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
-        });
+            }),
+        );
     };
 
     // Process 1: the step fails, the workflow catches it and completes.
@@ -183,16 +199,21 @@ async fn sqlite_patch_is_durable_across_replay() -> Result<()> {
     let (url, path) = temp_db_url("patch");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("wf", |ctx: DurableContext, _: ()| async move {
-            let patched = ctx.patch("feat").await?;
-            let v = ctx
-                .step("work", || async {
-                    WORK_RUNS.fetch_add(1, Ordering::Relaxed);
-                    Ok::<_, Error>(10_i64)
+        engine.register(
+            "wf",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let patched = ctx.patch("feat").await?;
+                    let v = ctx
+                        .step("work", |_| async {
+                            WORK_RUNS.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Error>(10_i64)
+                        })
+                        .await?;
+                    Ok::<_, Error>((patched, v))
                 })
-                .await?;
-            Ok::<_, Error>((patched, v))
-        });
+            }),
+        );
     };
 
     for _ in 0..2 {
@@ -231,16 +252,21 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
     // Phase A — code carrying the patch: records the marker at seq 0, "work" at 1.
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-        engine.register("wf", |ctx: DurableContext, _: ()| async move {
-            let _ = ctx.patch("feat").await?;
-            let v = ctx
-                .step("work", || async {
-                    WORK_RUNS.fetch_add(1, Ordering::Relaxed);
-                    Ok::<_, Error>(5_i64)
+        engine.register(
+            "wf",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let _ = ctx.patch("feat").await?;
+                    let v = ctx
+                        .step("work", |_| async {
+                            WORK_RUNS.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Error>(5_i64)
+                        })
+                        .await?;
+                    Ok::<_, Error>(v)
                 })
-                .await?;
-            Ok::<_, Error>(v)
-        });
+            }),
+        );
         let v: i64 = engine
             .start("wf", (), WorkflowOptions::with_id("w"))
             .await?
@@ -253,16 +279,21 @@ async fn sqlite_deprecate_patch_keeps_alignment() -> Result<()> {
     // slot, so "work" stays at seq 1 and replays rather than re-running.
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-        engine.register("wf", |ctx: DurableContext, _: ()| async move {
-            ctx.deprecate_patch("feat").await?;
-            let v = ctx
-                .step("work", || async {
-                    WORK_RUNS.fetch_add(1, Ordering::Relaxed);
-                    Ok::<_, Error>(5_i64)
+        engine.register(
+            "wf",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    ctx.deprecate_patch("feat").await?;
+                    let v = ctx
+                        .step("work", |_| async {
+                            WORK_RUNS.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Error>(5_i64)
+                        })
+                        .await?;
+                    Ok::<_, Error>(v)
                 })
-                .await?;
-            Ok::<_, Error>(v)
-        });
+            }),
+        );
         let v: i64 = engine
             .start("wf", (), WorkflowOptions::with_id("w"))
             .await?
@@ -290,19 +321,24 @@ async fn sqlite_concurrent_steps_are_durable() -> Result<()> {
     let (url, path) = temp_db_url("fanout");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("fanout", |ctx: DurableContext, _: ()| async move {
-            let (a, b) = tokio::try_join!(
-                ctx.step("a", || async {
-                    A_RUNS.fetch_add(1, Ordering::Relaxed);
-                    Ok::<_, Error>(1_i64)
-                }),
-                ctx.step("b", || async {
-                    B_RUNS.fetch_add(1, Ordering::Relaxed);
-                    Ok::<_, Error>(2_i64)
-                }),
-            )?;
-            Ok::<_, Error>(a + b)
-        });
+        engine.register(
+            "fanout",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let (a, b) = tokio::try_join!(
+                        ctx.step("a", |_| async {
+                            A_RUNS.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Error>(1_i64)
+                        }),
+                        ctx.step("b", |_| async {
+                            B_RUNS.fetch_add(1, Ordering::Relaxed);
+                            Ok::<_, Error>(2_i64)
+                        }),
+                    )?;
+                    Ok::<_, Error>(a + b)
+                })
+            }),
+        );
     };
 
     for _ in 0..2 {
@@ -339,19 +375,24 @@ async fn sqlite_select_winner_is_durable() -> Result<()> {
     let (url, path) = temp_db_url("select");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("racer", |ctx: DurableContext, _: ()| async move {
-            let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
-                Box::pin(async {
-                    FAST_RUNS.fetch_add(1, Ordering::Relaxed);
-                    2_i64
-                }),
-                Box::pin(async {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    1_i64
-                }),
-            ];
-            ctx.select(branches).await
-        });
+        engine.register(
+            "racer",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
+                        Box::pin(async {
+                            FAST_RUNS.fetch_add(1, Ordering::Relaxed);
+                            2_i64
+                        }),
+                        Box::pin(async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            1_i64
+                        }),
+                    ];
+                    ctx.select(branches).await
+                })
+            }),
+        );
     };
 
     for _ in 0..2 {
@@ -383,13 +424,18 @@ async fn sqlite_stream_is_durable_across_replay() -> Result<()> {
     let (url, path) = temp_db_url("stream");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("producer", |ctx: DurableContext, _: ()| async move {
-            for i in 0..3_i64 {
-                ctx.write_stream("nums", i).await?;
-            }
-            ctx.close_stream("nums").await?;
-            Ok::<_, Error>(())
-        });
+        engine.register(
+            "producer",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    for i in 0..3_i64 {
+                        ctx.write_stream("nums", i).await?;
+                    }
+                    ctx.close_stream("nums").await?;
+                    Ok::<_, Error>(())
+                })
+            }),
+        );
     };
 
     for _ in 0..2 {
@@ -420,11 +466,16 @@ async fn sqlite_write_to_closed_stream_errors() -> Result<()> {
     let (url, path) = temp_db_url("stream-closed");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("bad", |ctx: DurableContext, _: ()| async move {
-        ctx.close_stream("s").await?;
-        ctx.write_stream("s", 1_i64).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "bad",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.close_stream("s").await?;
+                ctx.write_stream("s", 1_i64).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     let res: Result<()> = engine
         .start("bad", (), WorkflowOptions::with_id("p"))
@@ -444,9 +495,10 @@ async fn sqlite_queue_dispatch_and_dedup() -> Result<()> {
     let (url, path) = temp_db_url("queue");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("double", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 2)
-    });
+    engine.register(
+        "double",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 2) })),
+    );
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
 
     // Enqueue before launching the dispatcher so wf-q-1 still holds its dedup
@@ -496,11 +548,17 @@ async fn sqlite_config_name_routes_on_queue_dispatch() -> Result<()> {
     engine.register_configured(
         "greet",
         "en",
-        |_ctx: DurableContext, who: String| async move { Ok::<_, Error>(format!("Hello, {who}")) },
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Hello, {who}")) })
+        }),
     );
-    engine.register_configured("greet", "fr", |_ctx: DurableContext, who: String| async move {
-        Ok::<_, Error>(format!("Bonjour, {who}"))
-    });
+    engine.register_configured(
+        "greet",
+        "fr",
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Bonjour, {who}")) })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
 
@@ -546,16 +604,21 @@ async fn sqlite_messaging_and_events() -> Result<()> {
     let (url, path) = temp_db_url("comm");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("exchange", |ctx: DurableContext, _: ()| async move {
-        ctx.set_event("phase", "waiting").await?;
-        let a: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
-        let b: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(format!(
-            "{},{}",
-            a.unwrap_or_default(),
-            b.unwrap_or_default()
-        ))
-    });
+    engine.register(
+        "exchange",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.set_event("phase", "waiting").await?;
+                let a: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+                let b: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(format!(
+                    "{},{}",
+                    a.unwrap_or_default(),
+                    b.unwrap_or_default()
+                ))
+            })
+        }),
+    );
 
     let handle = engine
         .start::<_, String>("exchange", (), WorkflowOptions::with_id("wf-comm"))
@@ -588,14 +651,19 @@ async fn sqlite_auth_context_persists_and_propagates() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     // The workflow observes its own identity through the context and returns it,
     // proving the persisted fields are threaded into `DurableContext`.
-    engine.register("whoami", |ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(format!(
-            "{}/{}/{}",
-            ctx.authenticated_user().unwrap_or("-"),
-            ctx.assumed_role().unwrap_or("-"),
-            ctx.authenticated_roles().join(","),
-        ))
-    });
+    engine.register(
+        "whoami",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                Ok::<_, Error>(format!(
+                    "{}/{}/{}",
+                    ctx.authenticated_user().unwrap_or("-"),
+                    ctx.assumed_role().unwrap_or("-"),
+                    ctx.authenticated_roles().join(","),
+                ))
+            })
+        }),
+    );
 
     let opts = WorkflowOptions::with_id("wf-auth")
         .authenticated_user("alice")
@@ -640,16 +708,26 @@ async fn sqlite_child_workflow_runs_once_across_restart() -> Result<()> {
     let (url, path) = temp_db_url("child");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("child", |_ctx: DurableContext, n: i64| async move {
-            CHILD_RUNS.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(n + 100)
-        });
-        engine.register("parent", |ctx: DurableContext, n: i64| async move {
-            let child = ctx
-                .start_workflow::<_, i64>("child", n, WorkflowOptions::default())
-                .await?;
-            child.result().await
-        });
+        engine.register(
+            "child",
+            workflow_fn(|_ctx, n: i64| {
+                Box::pin(async move {
+                    CHILD_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(n + 100)
+                })
+            }),
+        );
+        engine.register(
+            "parent",
+            workflow_fn(|ctx, n: i64| {
+                Box::pin(async move {
+                    let child = ctx
+                        .start_workflow::<_, i64>("child", n, WorkflowOptions::default())
+                        .await?;
+                    child.result().await
+                })
+            }),
+        );
     };
 
     // Process 1: run the parent to completion; the child runs once.
@@ -696,21 +774,29 @@ async fn sqlite_workflow_steps_introspection() -> Result<()> {
     let (url, path) = temp_db_url("steps");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("kid", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 2)
-    });
-    engine.register("worker", |ctx: DurableContext, _: ()| async move {
-        let a = ctx
-            .step("alpha", || async { Ok::<_, Error>(1_i64) })
-            .await?;
-        let b = ctx.step("beta", || async { Ok::<_, Error>(a + 1) }).await?;
-        let child = ctx
-            .start_workflow::<_, i64>("kid", b, WorkflowOptions::default())
-            .await?;
-        child.result().await?;
-        // Two steps + one child invocation consumed seqs 0,1,2 → next is 3.
-        Ok::<_, Error>(ctx.current_step_id() as i64)
-    });
+    engine.register(
+        "kid",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 2) })),
+    );
+    engine.register(
+        "worker",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("alpha", |_| async { Ok::<_, Error>(1_i64) })
+                    .await?;
+                let b = ctx
+                    .step("beta", |_| async { Ok::<_, Error>(a + 1) })
+                    .await?;
+                let child = ctx
+                    .start_workflow::<_, i64>("kid", b, WorkflowOptions::default())
+                    .await?;
+                child.result().await?;
+                // Two steps + one child invocation consumed seqs 0,1,2 → next is 3.
+                Ok::<_, Error>(ctx.current_step_id() as i64)
+            })
+        }),
+    );
 
     let next_seq: i64 = engine
         .start("worker", (), WorkflowOptions::with_id("w1"))
@@ -750,27 +836,32 @@ async fn sqlite_interleaved_step_and_transaction_share_seq() -> Result<()> {
     use durare::params;
     let (url, path) = temp_db_url("interleave");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("mix", |ctx: DurableContext, _: ()| async move {
-        // seq 0: a plain step.
-        ctx.step("before", || async { Ok::<_, Error>(1_i64) })
-            .await?;
-        // seq 1: a transaction step in between.
-        ctx.transaction::<(), _>("tx", |tx| {
+    engine.register(
+        "mix",
+        workflow_fn(|ctx, _: ()| {
             Box::pin(async move {
-                tx.execute(
-                    "CREATE TABLE IF NOT EXISTS m (id INTEGER PRIMARY KEY)",
-                    &params![],
-                )
+                // seq 0: a plain step.
+                ctx.step("before", |_| async { Ok::<_, Error>(1_i64) })
+                    .await?;
+                // seq 1: a transaction step in between.
+                ctx.transaction::<(), _>("tx", |tx| {
+                    Box::pin(async move {
+                        tx.execute(
+                            "CREATE TABLE IF NOT EXISTS m (id INTEGER PRIMARY KEY)",
+                            &params![],
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })
                 .await?;
-                Ok(())
+                // seq 2: another plain step.
+                ctx.step("after", |_| async { Ok::<_, Error>(2_i64) })
+                    .await?;
+                Ok::<_, Error>(ctx.current_step_id() as i64)
             })
-        })
-        .await?;
-        // seq 2: another plain step.
-        ctx.step("after", || async { Ok::<_, Error>(2_i64) })
-            .await?;
-        Ok::<_, Error>(ctx.current_step_id() as i64)
-    });
+        }),
+    );
 
     let next_seq: i64 = engine
         .start("mix", (), WorkflowOptions::with_id("w-mix"))
@@ -801,18 +892,23 @@ async fn sqlite_management() -> Result<()> {
     static SECOND_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("pipeline", |ctx: DurableContext, _: ()| async move {
-        let a = ctx
-            .step("first", || async { Ok::<_, Error>(10_i64) })
-            .await?;
-        let b = ctx
-            .step("second", || async {
-                SECOND_RUNS.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(a + 5)
+    engine.register(
+        "pipeline",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("first", |_| async { Ok::<_, Error>(10_i64) })
+                    .await?;
+                let b = ctx
+                    .step("second", |_| async {
+                        SECOND_RUNS.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(a + 5)
+                    })
+                    .await?;
+                Ok::<_, Error>(b)
             })
-            .await?;
-        Ok::<_, Error>(b)
-    });
+        }),
+    );
     // Resume/fork re-queue work for a dispatcher, so the engine must be live.
     engine.launch().await?;
 
@@ -897,9 +993,10 @@ async fn sqlite_bulk_ops() -> Result<()> {
     let (url, path) = temp_db_url("bulk");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     // Resume re-queues work for a dispatcher, so the engine must be live.
     engine.launch().await?;
     let provider = SqliteProvider::connect(&url).await?;
@@ -972,9 +1069,10 @@ async fn sqlite_set_workflow_delay() -> Result<()> {
     let (url, path) = temp_db_url("set-delay");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.register_queue(WorkflowQueue::new("d").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
 
@@ -1012,9 +1110,10 @@ async fn sqlite_queues_only_filter() -> Result<()> {
     let (url, path) = temp_db_url("queues-only");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
 
@@ -1052,9 +1151,10 @@ async fn sqlite_partitioned_queue_dispatch() -> Result<()> {
     let (url, path) = temp_db_url("partition");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.register_queue(
         WorkflowQueue::new("pq")
             .partitioned()
@@ -1105,15 +1205,21 @@ async fn sqlite_list_filters_extended() -> Result<()> {
     let (url, path) = temp_db_url("list-filters");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("child", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 10)
-    });
-    engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let h = ctx
-            .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
-            .await?;
-        h.result().await
-    });
+    engine.register(
+        "child",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 10) })),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let h = ctx
+                    .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
+                    .await?;
+                h.result().await
+            })
+        }),
+    );
     let out: i64 = engine
         .start("parent", (), WorkflowOptions::with_id("p"))
         .await?
@@ -1173,12 +1279,14 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
     let (url, path) = temp_db_url("aggregates");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("ok", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
-    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
-        Err::<(), _>(Error::app("nope"))
-    });
+    engine.register(
+        "ok",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
+    engine.register(
+        "boom",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Err::<(), _>(Error::app("nope")) })),
+    );
     engine
         .start::<_, ()>("ok", (), WorkflowOptions::with_id("a"))
         .await?
@@ -1261,12 +1369,17 @@ async fn sqlite_step_timing_is_recorded() -> Result<()> {
     let (url, path) = temp_db_url("step-timing");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("work", |ctx: DurableContext, _: ()| async move {
-        ctx.step("compute", || async { Ok::<_, Error>(1_i64) })
-            .await?;
-        ctx.sleep(Duration::from_millis(1)).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("compute", |_| async { Ok::<_, Error>(1_i64) })
+                    .await?;
+                ctx.sleep(Duration::from_millis(1)).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine
         .start::<_, ()>("work", (), WorkflowOptions::with_id("w"))
         .await?
@@ -1302,16 +1415,21 @@ async fn sqlite_step_aggregates() -> Result<()> {
     let (url, path) = temp_db_url("step-aggregates");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("work", |ctx: DurableContext, _: ()| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.step("b", || async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            Ok::<_, Error>(2_i64)
-        })
-        .await?;
-        ctx.step("a", || async { Ok::<_, Error>(3_i64) }).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
+                ctx.step("b", |_| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, Error>(2_i64)
+                })
+                .await?;
+                ctx.step("a", |_| async { Ok::<_, Error>(3_i64) }).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine
         .start::<_, ()>("work", (), WorkflowOptions::with_id("w"))
         .await?
@@ -1366,7 +1484,7 @@ async fn sqlite_schedule_persists_across_restart() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         engine.register(
             "nightly_job",
-            |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
+            workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
         );
         engine
             .create_schedule(
@@ -1385,7 +1503,7 @@ async fn sqlite_schedule_persists_across_restart() -> Result<()> {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         engine.register(
             "nightly_job",
-            |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
+            workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
         );
         let got = engine.get_schedule("nightly").await?.expect("persisted");
         assert_eq!(got.workflow_name, "nightly_job");
@@ -1431,7 +1549,7 @@ async fn sqlite_backfill_persists_each_tick_once() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "nightly_job",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
+        workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
     );
     engine
         .create_schedule(
@@ -1548,9 +1666,12 @@ async fn sqlite_client_enqueues_work_an_engine_runs() -> Result<()> {
 
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("double", |ctx: DurableContext, n: i64| async move {
-        ctx.step("mul", || async { Ok::<_, Error>(n * 2) }).await
-    });
+    engine.register(
+        "double",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move { ctx.step("mul", |_| async { Ok::<_, Error>(n * 2) }).await })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -1624,9 +1745,12 @@ async fn sqlite_portable_input_envelope() -> Result<()> {
         .await?
         .with_serializer(Serializer::Portable);
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("echo", |_ctx: DurableContext, name: String| async move {
-        Ok::<_, Error>(format!("echo:{name}"))
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, name: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("echo:{name}")) })
+        }),
+    );
     let out: String = engine
         .start::<_, String>(
             "echo",
@@ -1702,19 +1826,24 @@ async fn sqlite_custom_serializer_roundtrips() -> Result<()> {
         .await?
         .with_serializer(Serializer::custom(Arc::new(HexCodec)));
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("greet", |ctx: DurableContext, name: String| async move {
-        // A step output also flows through the custom codec.
-        let upper = ctx
-            .step("shout", {
-                let name = name.clone();
-                move || {
-                    let name = name.clone();
-                    async move { Ok::<_, Error>(name.to_uppercase()) }
-                }
+    engine.register(
+        "greet",
+        workflow_fn(|ctx, name: String| {
+            Box::pin(async move {
+                // A step output also flows through the custom codec.
+                let upper = ctx
+                    .step("shout", {
+                        let name = name.clone();
+                        move |_| {
+                            let name = name.clone();
+                            async move { Ok::<_, Error>(name.to_uppercase()) }
+                        }
+                    })
+                    .await?;
+                Ok::<_, Error>(format!("hi {upper}"))
             })
-            .await?;
-        Ok::<_, Error>(format!("hi {upper}"))
-    });
+        }),
+    );
 
     let out: String = engine
         .start::<_, String>(
@@ -1960,40 +2089,45 @@ async fn sqlite_transaction_step_exactly_once() -> Result<()> {
     let (url, path) = temp_db_url("txn");
 
     fn register(engine: &mut DurableEngine) {
-        engine.register("acct", |ctx: DurableContext, _: ()| async move {
-            ctx.transaction::<(), _>("setup", |tx| {
+        engine.register(
+            "acct",
+            workflow_fn(|ctx, _: ()| {
                 Box::pin(async move {
-                    tx.execute(
-                        "CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, bal INTEGER)",
-                        &params![],
-                    )
-                    .await?;
-                    tx.execute(
+                    ctx.transaction::<(), _>("setup", |tx| {
+                        Box::pin(async move {
+                            tx.execute(
+                            "CREATE TABLE IF NOT EXISTS acct (id INTEGER PRIMARY KEY, bal INTEGER)",
+                            &params![],
+                        )
+                        .await?;
+                            tx.execute(
                         "INSERT INTO acct (id, bal) VALUES (1, 100) ON CONFLICT (id) DO NOTHING",
                         &params![],
                     )
                     .await?;
-                    Ok(())
-                })
-            })
-            .await?;
-            let bal: i64 = ctx
-                .transaction("debit", |tx| {
-                    Box::pin(async move {
-                        tx.execute(
-                            "UPDATE acct SET bal = bal - ? WHERE id = ?",
-                            &params![10_i64, 1_i64],
-                        )
-                        .await?;
-                        let row = tx
-                            .query_one("SELECT bal FROM acct WHERE id = ?", &params![1_i64])
-                            .await?;
-                        Ok(row.get::<i64>("bal"))
+                            Ok(())
+                        })
                     })
+                    .await?;
+                    let bal: i64 = ctx
+                        .transaction("debit", |tx| {
+                            Box::pin(async move {
+                                tx.execute(
+                                    "UPDATE acct SET bal = bal - ? WHERE id = ?",
+                                    &params![10_i64, 1_i64],
+                                )
+                                .await?;
+                                let row = tx
+                                    .query_one("SELECT bal FROM acct WHERE id = ?", &params![1_i64])
+                                    .await?;
+                                Ok(row.get::<i64>("bal"))
+                            })
+                        })
+                        .await?;
+                    Ok::<_, Error>(bal)
                 })
-                .await?;
-            Ok::<_, Error>(bal)
-        });
+            }),
+        );
     }
 
     // First run: seed 100, debit 10 -> 90.
@@ -2027,59 +2161,12 @@ async fn sqlite_transaction_step_exactly_once() -> Result<()> {
     Ok(())
 }
 
-/// A transaction started inside another transaction's body is rejected with a
-/// clear error rather than deadlocking on the outer's write lock (the inner would
-/// otherwise open a second connection and block forever). The workflow fails fast.
-#[tokio::test]
-async fn sqlite_nested_transaction_is_rejected() -> Result<()> {
-    use durare::params;
-    use std::time::Duration;
-    let (url, path) = temp_db_url("txnnest");
-    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("nest", |ctx: DurableContext, _: ()| async move {
-        let inner_ctx = ctx.clone();
-        ctx.transaction::<(), _>("outer", move |tx| {
-            let inner_ctx = inner_ctx.clone();
-            Box::pin(async move {
-                tx.execute(
-                    "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)",
-                    &params![],
-                )
-                .await?;
-                // Nesting a transaction via a captured context must be refused.
-                inner_ctx
-                    .transaction::<(), _>("inner", |tx2| {
-                        Box::pin(async move {
-                            tx2.execute("INSERT INTO t (id) VALUES (1)", &params![])
-                                .await?;
-                            Ok(())
-                        })
-                    })
-                    .await?;
-                Ok(())
-            })
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
-
-    // Must complete (fail) promptly — a deadlock would hang until the timeout.
-    let handle = engine
-        .start::<_, ()>("nest", (), WorkflowOptions::with_id("wf-nest"))
-        .await?;
-    let res = tokio::time::timeout(Duration::from_secs(5), handle.result())
-        .await
-        .expect("nested transaction must be rejected, not deadlock");
-    let err = res.expect_err("nesting a transaction is an error");
-    assert_eq!(
-        err.code(),
-        durare::ErrorCode::NestedDurableCall,
-        "clear nesting error, got: {err}"
-    );
-
-    let _ = std::fs::remove_file(path);
-    Ok(())
-}
+// A transaction nested inside another transaction's body through a captured
+// context is no longer a runtime refusal: `transaction`'s body must be `'static`
+// and the context is only ever lent to a workflow, so the capture does not
+// compile (see tests/compile_fail/nested_transaction.rs). The runtime guard
+// remains for `transaction_on`, whose body may borrow the context; see
+// tests/datasource.rs.
 
 /// A transactional step whose body returns an error rolls back its writes: a
 /// later step reads the original value, proving the failed write did not commit.
@@ -2088,46 +2175,51 @@ async fn sqlite_transaction_step_rolls_back_on_error() -> Result<()> {
     use durare::params;
     let (url, path) = temp_db_url("txnrb");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("rb", |ctx: DurableContext, _: ()| async move {
-        ctx.transaction::<(), _>("setup", |tx| {
+    engine.register(
+        "rb",
+        workflow_fn(|ctx, _: ()| {
             Box::pin(async move {
-                tx.execute(
-                    "CREATE TABLE IF NOT EXISTS r (id INTEGER PRIMARY KEY, v INTEGER)",
-                    &params![],
-                )
-                .await?;
-                tx.execute(
-                    "INSERT INTO r (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
-                    &params![],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await?;
-        // Write, then fail: the write must roll back with the transaction.
-        let failed = ctx
-            .transaction::<(), _>("bad", |tx| {
-                Box::pin(async move {
-                    tx.execute("UPDATE r SET v = 999 WHERE id = 1", &params![])
+                ctx.transaction::<(), _>("setup", |tx| {
+                    Box::pin(async move {
+                        tx.execute(
+                            "CREATE TABLE IF NOT EXISTS r (id INTEGER PRIMARY KEY, v INTEGER)",
+                            &params![],
+                        )
                         .await?;
-                    Err(Error::app("boom"))
-                })
-            })
-            .await
-            .is_err();
-        let v: i64 = ctx
-            .transaction("read", |tx| {
-                Box::pin(async move {
-                    let row = tx
-                        .query_one("SELECT v FROM r WHERE id = 1", &params![])
+                        tx.execute(
+                            "INSERT INTO r (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+                            &params![],
+                        )
                         .await?;
-                    Ok(row.get::<i64>("v"))
+                        Ok(())
+                    })
                 })
+                .await?;
+                // Write, then fail: the write must roll back with the transaction.
+                let failed = ctx
+                    .transaction::<(), _>("bad", |tx| {
+                        Box::pin(async move {
+                            tx.execute("UPDATE r SET v = 999 WHERE id = 1", &params![])
+                                .await?;
+                            Err(Error::app("boom"))
+                        })
+                    })
+                    .await
+                    .is_err();
+                let v: i64 = ctx
+                    .transaction("read", |tx| {
+                        Box::pin(async move {
+                            let row = tx
+                                .query_one("SELECT v FROM r WHERE id = 1", &params![])
+                                .await?;
+                            Ok(row.get::<i64>("v"))
+                        })
+                    })
+                    .await?;
+                Ok::<_, Error>((failed, v))
             })
-            .await?;
-        Ok::<_, Error>((failed, v))
-    });
+        }),
+    );
     let (failed, v): (bool, i64) = engine
         .start("rb", (), WorkflowOptions::with_id("wf-rb"))
         .await?
@@ -2149,21 +2241,26 @@ async fn sqlite_checkpoints_a_caught_transaction_failure() -> Result<()> {
     let (url, path) = temp_db_url("txn-err");
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("txn_flaky", |ctx: DurableContext, _: ()| async move {
-            let r: Result<i64> = ctx
-                .transaction::<i64, _>("maybe", |_tx| {
-                    Box::pin(async move {
-                        let n = TX_RUNS.fetch_add(1, Ordering::SeqCst);
-                        if n == 0 {
-                            Err(Error::app("transient"))
-                        } else {
-                            Ok(7)
-                        }
-                    })
+        engine.register(
+            "txn_flaky",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let r: Result<i64> = ctx
+                        .transaction::<i64, _>("maybe", |_tx| {
+                            Box::pin(async move {
+                                let n = TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                                if n == 0 {
+                                    Err(Error::app("transient"))
+                                } else {
+                                    Ok(7)
+                                }
+                            })
+                        })
+                        .await;
+                    Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
                 })
-                .await;
-            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
-        });
+            }),
+        );
     };
 
     {
@@ -2214,26 +2311,31 @@ async fn sqlite_transaction_retries_body_error() -> Result<()> {
     static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-retry");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("retry", |ctx: DurableContext, _: ()| async move {
-        let opts = TransactionOptions::new("flaky")
-            .max_retries(3)
-            .base_interval(Duration::from_millis(1));
-        let n: i64 = ctx
-            .transaction_with(opts, |tx| {
-                Box::pin(async move {
-                    // Touch the tx so each attempt really opens one.
-                    tx.execute("SELECT 1", &params![]).await?;
-                    let run = TX_RUNS.fetch_add(1, Ordering::SeqCst);
-                    if run < 2 {
-                        Err(Error::app("transient"))
-                    } else {
-                        Ok(42_i64)
-                    }
-                })
+    engine.register(
+        "retry",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = TransactionOptions::new("flaky")
+                    .max_retries(3)
+                    .base_interval(Duration::from_millis(1));
+                let n: i64 = ctx
+                    .transaction_with(opts, |tx| {
+                        Box::pin(async move {
+                            // Touch the tx so each attempt really opens one.
+                            tx.execute("SELECT 1", &params![]).await?;
+                            let run = TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                            if run < 2 {
+                                Err(Error::app("transient"))
+                            } else {
+                                Ok(42_i64)
+                            }
+                        })
+                    })
+                    .await?;
+                Ok::<_, Error>(n)
             })
-            .await?;
-        Ok::<_, Error>(n)
-    });
+        }),
+    );
     let out: i64 = engine
         .start("retry", (), WorkflowOptions::with_id("wf-txn-retry"))
         .await?
@@ -2265,23 +2367,28 @@ async fn sqlite_transaction_retry_predicate_fails_fast() -> Result<()> {
     static TX_RUNS: AtomicUsize = AtomicUsize::new(0);
     let (url, path) = temp_db_url("txn-nofast");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("nofast", |ctx: DurableContext, _: ()| async move {
-        let opts = TransactionOptions::new("permanent")
-            .max_retries(5)
-            .base_interval(Duration::from_millis(1))
-            .retry_if(|e: &Error| e.is_retryable());
-        let r: Result<i64> = ctx
-            .transaction_with(opts, |tx| {
-                Box::pin(async move {
-                    tx.execute("SELECT 1", &params![]).await?;
-                    TX_RUNS.fetch_add(1, Ordering::SeqCst);
-                    // A plain app error is not retryable, so the predicate rejects it.
-                    Err(Error::app("permanent failure"))
-                })
+    engine.register(
+        "nofast",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = TransactionOptions::new("permanent")
+                    .max_retries(5)
+                    .base_interval(Duration::from_millis(1))
+                    .retry_if(|e: &Error| e.is_retryable());
+                let r: Result<i64> = ctx
+                    .transaction_with(opts, |tx| {
+                        Box::pin(async move {
+                            tx.execute("SELECT 1", &params![]).await?;
+                            TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                            // A plain app error is not retryable, so the predicate rejects it.
+                            Err(Error::app("permanent failure"))
+                        })
+                    })
+                    .await;
+                Ok::<_, Error>(r.is_err())
             })
-            .await;
-        Ok::<_, Error>(r.is_err())
-    });
+        }),
+    );
     let failed: bool = engine
         .start("nofast", (), WorkflowOptions::with_id("wf-txn-nofast"))
         .await?
@@ -2311,23 +2418,28 @@ async fn sqlite_transaction_retries_transient_db_error() -> Result<()> {
     RUNS.store(0, Ordering::SeqCst);
     let (url, path) = temp_db_url("txn-transient");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("flaky", |ctx: DurableContext, _: ()| async move {
-        let n: i64 = ctx
-            .transaction_with(TransactionOptions::new("t"), |tx| {
-                Box::pin(async move {
-                    tx.execute("SELECT 1", &params![]).await?;
-                    // Fail with a retryable (connection-class) error three times,
-                    // then succeed. The old conflict loop would not retry this at all.
-                    if RUNS.fetch_add(1, Ordering::SeqCst) < 3 {
-                        Err(durare::Error::Db(sqlx::Error::PoolClosed))
-                    } else {
-                        Ok(7_i64)
-                    }
-                })
+    engine.register(
+        "flaky",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let n: i64 = ctx
+                    .transaction_with(TransactionOptions::new("t"), |tx| {
+                        Box::pin(async move {
+                            tx.execute("SELECT 1", &params![]).await?;
+                            // Fail with a retryable (connection-class) error three times,
+                            // then succeed. The old conflict loop would not retry this at all.
+                            if RUNS.fetch_add(1, Ordering::SeqCst) < 3 {
+                                Err(durare::Error::Db(sqlx::Error::PoolClosed))
+                            } else {
+                                Ok(7_i64)
+                            }
+                        })
+                    })
+                    .await?;
+                Ok::<_, Error>(n)
             })
-            .await?;
-        Ok::<_, Error>(n)
-    });
+        }),
+    );
     let out: i64 = engine
         .start("flaky", (), WorkflowOptions::with_id("wf-transient"))
         .await?
@@ -2357,17 +2469,22 @@ async fn sqlite_transaction_conflict_retry_is_unbounded_but_cancellable() -> Res
     SPINS.store(0, Ordering::SeqCst);
     let (url, path) = temp_db_url("txn-spin-cancel");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("spinner", |ctx: DurableContext, _: ()| async move {
-        ctx.transaction_with(TransactionOptions::new("t"), |tx| {
+    engine.register(
+        "spinner",
+        workflow_fn(|ctx, _: ()| {
             Box::pin(async move {
-                tx.execute("SELECT 1", &params![]).await?;
-                SPINS.fetch_add(1, Ordering::SeqCst);
-                Err::<i64, _>(durare::Error::Db(sqlx::Error::PoolClosed))
+                ctx.transaction_with(TransactionOptions::new("t"), |tx| {
+                    Box::pin(async move {
+                        tx.execute("SELECT 1", &params![]).await?;
+                        SPINS.fetch_add(1, Ordering::SeqCst);
+                        Err::<i64, _>(durare::Error::Db(sqlx::Error::PoolClosed))
+                    })
+                })
+                .await?;
+                Ok::<_, Error>(())
             })
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
+        }),
+    );
     engine.launch().await?;
     let engine = Arc::new(engine);
 
@@ -2426,21 +2543,26 @@ async fn sqlite_recorded_transaction_failure_replays_immediately() -> Result<()>
     // has created the workflow row and the recorded failure.
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("rec", |ctx: DurableContext, _: ()| async move {
-        let r: Result<i64> = ctx
-            .transaction_with(
-                TransactionOptions::new("boom").base_interval(Duration::from_millis(1)),
-                |tx| {
-                    Box::pin(async move {
-                        tx.execute("SELECT 1", &params![]).await?;
-                        REC_RUNS.fetch_add(1, Ordering::SeqCst);
-                        Err(Error::app("always"))
-                    })
-                },
-            )
-            .await;
-        Ok::<_, Error>(if r.is_err() { "caught" } else { "ok" }.to_string())
-    });
+    engine.register(
+        "rec",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let r: Result<i64> = ctx
+                    .transaction_with(
+                        TransactionOptions::new("boom").base_interval(Duration::from_millis(1)),
+                        |tx| {
+                            Box::pin(async move {
+                                tx.execute("SELECT 1", &params![]).await?;
+                                REC_RUNS.fetch_add(1, Ordering::SeqCst);
+                                Err(Error::app("always"))
+                            })
+                        },
+                    )
+                    .await;
+                Ok::<_, Error>(if r.is_err() { "caught" } else { "ok" }.to_string())
+            })
+        }),
+    );
     let id = "wf-txn-replay";
     let out: String = engine
         .start("rec", (), WorkflowOptions::with_id(id))
@@ -2498,16 +2620,21 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
     let (url, path) = temp_db_url("export");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("expo", |ctx: DurableContext, n: i64| async move {
-        let doubled = ctx
-            .step("double", || async { Ok::<_, Error>(n * 2) })
-            .await?;
-        ctx.set_event("k", "v").await?;
-        ctx.write_stream("s", 1_i64).await?;
-        ctx.write_stream("s", 2_i64).await?;
-        ctx.close_stream("s").await?;
-        Ok::<_, Error>(doubled)
-    });
+    engine.register(
+        "expo",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                let doubled = ctx
+                    .step("double", |_| async { Ok::<_, Error>(n * 2) })
+                    .await?;
+                ctx.set_event("k", "v").await?;
+                ctx.write_stream("s", 1_i64).await?;
+                ctx.write_stream("s", 2_i64).await?;
+                ctx.close_stream("s").await?;
+                Ok::<_, Error>(doubled)
+            })
+        }),
+    );
 
     let id = "wf-export-1";
     let out: i64 = engine
@@ -2591,9 +2718,12 @@ async fn sqlite_export_import_round_trip() -> Result<()> {
 async fn sqlite_was_forked_from_survives_import() -> Result<()> {
     let (url, path) = temp_db_url("wff-import");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("wff", |ctx: DurableContext, n: i64| async move {
-        ctx.step("s", || async { Ok::<_, Error>(n) }).await
-    });
+    engine.register(
+        "wff",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move { ctx.step("s", |_| async { Ok::<_, Error>(n) }).await })
+        }),
+    );
     engine.launch().await?;
 
     // Source runs; a fork is taken from it (marks the source `was_forked_from`).
@@ -2659,9 +2789,12 @@ async fn sqlite_was_forked_from_survives_import() -> Result<()> {
 async fn sqlite_was_forked_from_reconstructed_when_payload_omits_it() -> Result<()> {
     let (url, path) = temp_db_url("wff-fallback");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("wff", |ctx: DurableContext, n: i64| async move {
-        ctx.step("s", || async { Ok::<_, Error>(n) }).await
-    });
+    engine.register(
+        "wff",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move { ctx.step("s", |_| async { Ok::<_, Error>(n) }).await })
+        }),
+    );
     engine.launch().await?;
 
     engine
@@ -2724,18 +2857,23 @@ async fn sqlite_recovery_replays_checkpointed_step_without_rerunning() -> Result
 
     // Register the same workflow on each engine instance (a fresh "process").
     let register = |engine: &mut DurableEngine| {
-        engine.register("replay_me", |ctx: DurableContext, _: ()| async move {
-            // Runs on every execution of the body (including a replay).
-            BODY_RUNS.fetch_add(1, Ordering::SeqCst);
-            let half = ctx
-                .step("compute", || async {
-                    // Runs only when the step actually executes, never on replay.
-                    STEP_RUNS.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, Error>(21_i64)
+        engine.register(
+            "replay_me",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    // Runs on every execution of the body (including a replay).
+                    BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+                    let half = ctx
+                        .step("compute", |_| async {
+                            // Runs only when the step actually executes, never on replay.
+                            STEP_RUNS.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, Error>(21_i64)
+                        })
+                        .await?;
+                    Ok::<_, Error>(half * 2)
                 })
-                .await?;
-            Ok::<_, Error>(half * 2)
-        });
+            }),
+        );
     };
 
     // First run to completion: body runs once, the step runs and checkpoints.
@@ -2928,7 +3066,7 @@ async fn sqlite_unhandled_claim_is_released_not_stranded() -> Result<()> {
     let mut y = DurableEngine::new(provider.clone()).await?;
     y.register(
         "ghost",
-        |_ctx: DurableContext, _: serde_json::Value| async { Ok::<_, Error>(7_i64) },
+        |_ctx: &DurableContext, _: serde_json::Value| async { Ok::<_, Error>(7_i64) },
     );
     y.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
     y.launch().await?;
@@ -3017,15 +3155,20 @@ async fn sqlite_renamed_transaction_fails_as_unexpected_step() -> Result<()> {
 
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("tx-wf", |ctx: DurableContext, _: ()| async move {
-        ctx.transaction_with(TransactionOptions::new("tx-a"), |tx| {
+    engine.register(
+        "tx-wf",
+        workflow_fn(|ctx, _: ()| {
             Box::pin(async move {
-                tx.execute("SELECT 1", &params![]).await?;
-                Ok(7_i64)
+                ctx.transaction_with(TransactionOptions::new("tx-a"), |tx| {
+                    Box::pin(async move {
+                        tx.execute("SELECT 1", &params![]).await?;
+                        Ok(7_i64)
+                    })
+                })
+                .await
             })
-        })
-        .await
-    });
+        }),
+    );
     let id = "wf-txn-rename";
     let out: i64 = engine
         .start("tx-wf", (), WorkflowOptions::with_id(id))
@@ -3076,16 +3219,21 @@ async fn sqlite_transaction_replays_on_recovery_without_rerunning_body() -> Resu
 
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("txrec", |ctx: DurableContext, _: ()| async move {
-        ctx.transaction_with(TransactionOptions::new("tx-a"), |tx| {
+    engine.register(
+        "txrec",
+        workflow_fn(|ctx, _: ()| {
             Box::pin(async move {
-                tx.execute("SELECT 1", &params![]).await?;
-                TX_RUNS.fetch_add(1, Ordering::SeqCst);
-                Ok(7_i64)
+                ctx.transaction_with(TransactionOptions::new("tx-a"), |tx| {
+                    Box::pin(async move {
+                        tx.execute("SELECT 1", &params![]).await?;
+                        TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                        Ok(7_i64)
+                    })
+                })
+                .await
             })
-        })
-        .await
-    });
+        }),
+    );
     engine.launch().await?;
 
     // Simulate the crash window: the workflow row exists (PENDING) and the
@@ -3248,9 +3396,10 @@ async fn sqlite_persists_queue_registry_across_restart() -> Result<()> {
     let (url, path) = temp_db_url("queues");
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-        engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-            Ok::<_, Error>(())
-        });
+        engine.register(
+            "noop",
+            workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+        );
         engine.register_queue(
             WorkflowQueue::new("emails")
                 .worker_concurrency(4)
@@ -3284,11 +3433,16 @@ async fn sqlite_persists_queue_registry_across_restart() -> Result<()> {
 #[tokio::test]
 async fn sqlite_durable_now_uuid_replay_across_restart() -> Result<()> {
     fn register_clocked(engine: &mut DurableEngine) {
-        engine.register("clocked", |ctx: DurableContext, _: ()| async move {
-            let now = ctx.now().await?.timestamp_micros();
-            let id = ctx.uuid().await?;
-            Ok::<_, Error>((now, id))
-        });
+        engine.register(
+            "clocked",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let now = ctx.now().await?.timestamp_micros();
+                    let id = ctx.uuid().await?;
+                    Ok::<_, Error>((now, id))
+                })
+            }),
+        );
     }
 
     let (url, path) = temp_db_url("f2");
@@ -3332,10 +3486,15 @@ async fn sqlite_send_bulk_atomic_fan_out() -> Result<()> {
 
     let (url, path) = temp_db_url("send-bulk");
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("waiter", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("t", std::time::Duration::from_secs(10)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("t", std::time::Duration::from_secs(10)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
     engine.launch().await?;
 
     let mut handles = Vec::new();
@@ -3394,21 +3553,24 @@ async fn sqlite_read_only_transaction_records_checkpoint() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let wf_runs = runs.clone();
-    engine.register("ro", move |ctx: DurableContext, (): ()| {
-        let runs = wf_runs.clone();
-        async move {
-            let opts = TransactionOptions::new("snapshot-read").read_only(true);
-            ctx.transaction_with::<i64, _>(opts, move |tx| {
-                let runs = runs.clone();
-                Box::pin(async move {
-                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let row = tx.query_one("SELECT 42 AS v", &params![]).await?;
-                    Ok(row.get::<i64>("v"))
+    engine.register(
+        "ro",
+        workflow_fn(move |ctx, (): ()| {
+            let runs = wf_runs.clone();
+            Box::pin(async move {
+                let opts = TransactionOptions::new("snapshot-read").read_only(true);
+                ctx.transaction_with::<i64, _>(opts, move |tx| {
+                    let runs = runs.clone();
+                    Box::pin(async move {
+                        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let row = tx.query_one("SELECT 42 AS v", &params![]).await?;
+                        Ok(row.get::<i64>("v"))
+                    })
                 })
+                .await
             })
-            .await
-        }
-    });
+        }),
+    );
 
     let n: i64 = engine
         .start::<(), i64>("ro", (), WorkflowOptions::with_id("wf-ro"))

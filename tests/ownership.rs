@@ -7,7 +7,7 @@
 //! pending workflow) and terminal-state overwrites (a completion landing on
 //! a row that already reached a different terminal state).
 
-use durare::{DurableContext, DurableEngine, SqliteProvider, StateProvider, WorkflowOptions};
+use durare::{workflow_fn, DurableEngine, SqliteProvider, StateProvider, WorkflowOptions};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,17 +30,22 @@ async fn engine_over(url: &str, executor: &str) -> DurableEngine {
     let provider = Arc::new(SqliteProvider::connect(url).await.expect("connect"));
     let mut b = DurableEngine::builder(provider);
     b.executor_id(executor);
-    b.register("tracked", |ctx: DurableContext, _input: i32| async move {
-        // Slow enough that two racing replays overlap inside the step —
-        // neither has checkpointed it when the other starts.
-        ctx.step("slow", || async {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            SLOW_STEP_RUNS.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, durare::Error>(1_i64)
-        })
-        .await?;
-        Ok::<_, durare::Error>("done".to_string())
-    });
+    b.register(
+        "tracked",
+        workflow_fn(|ctx, _input: i32| {
+            Box::pin(async move {
+                // Slow enough that two racing replays overlap inside the step —
+                // neither has checkpointed it when the other starts.
+                ctx.step("slow", |_| async {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    SLOW_STEP_RUNS.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, durare::Error>(1_i64)
+                })
+                .await?;
+                Ok::<_, durare::Error>("done".to_string())
+            })
+        }),
+    );
     b.build().await.expect("engine builds")
 }
 

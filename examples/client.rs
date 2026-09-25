@@ -24,7 +24,7 @@ async fn render(ctx: &DurableContext, month: String) -> Result<String> {
 }
 
 #[durare::workflow]
-async fn monthly_report(ctx: DurableContext, month: String) -> Result<String> {
+async fn monthly_report(ctx: &DurableContext, month: String) -> Result<String> {
     render(&ctx, month).await
 }
 

@@ -1,0 +1,11 @@
+error: lifetime may not live long enough
+  --> tests/compile_fail/nested_transaction.rs:8:9
+   |
+ 6 |   async fn wf(ctx: &DurableContext, _: ()) -> Result<()> {
+   |                    - let's call the lifetime of this reference `'1`
+ 7 |       ctx.transaction::<(), _>("outer", move |_tx| {
+ 8 | /         Box::pin(async move {
+ 9 | |             ctx.transaction::<(), _>("inner", |_tx| Box::pin(async { Ok(()) }))
+10 | |                 .await
+11 | |         })
+   | |__________^ returning this value requires that `'1` must outlive `'static`

@@ -23,7 +23,7 @@ static TICKS: AtomicUsize = AtomicUsize::new(0);
 // Runs every second. The `ScheduledInput` carries the cron instant this run
 // fires for (and any context value attached to the schedule).
 #[durare::workflow(schedule = "* * * * * *")]
-async fn collect_metrics(_ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
+async fn collect_metrics(_ctx: &DurableContext, tick: ScheduledInput) -> Result<()> {
     let n = TICKS.fetch_add(1, Ordering::SeqCst) + 1;
     println!(
         "  ⏰ tick #{n} at {} — collecting metrics",

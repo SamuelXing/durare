@@ -2,16 +2,17 @@
 //! through a shared `&self` (`result`), and `clone` it to observe the same
 //! workflow from another task.
 
-use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{workflow_fn, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// A launched in-memory engine with a `quick` workflow that returns `n + 1`.
 async fn engine_with_quick() -> Result<DurableEngine> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("quick", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "quick",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     engine.launch().await?;
     Ok(engine)
 }

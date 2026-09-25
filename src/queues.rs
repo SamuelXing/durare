@@ -15,8 +15,8 @@
 //! use std::time::Duration;
 //!
 //! #[durare::workflow]
-//! async fn convert(ctx: DurableContext, file: String) -> Result<String> {
-//!     ctx.step("transcode", || async move { Ok::<_, durare::Error>(format!("{file}.mp4")) })
+//! async fn convert(ctx: &DurableContext, file: String) -> Result<String> {
+//!     ctx.step("transcode", |_| async move { Ok::<_, durare::Error>(format!("{file}.mp4")) })
 //!         .await
 //! }
 //!

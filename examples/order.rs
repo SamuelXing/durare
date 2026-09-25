@@ -61,7 +61,7 @@ async fn send_email(ctx: &DurableContext, to: String) -> Result<()> {
 }
 
 #[durare::workflow]
-async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> {
+async fn process_order(ctx: &DurableContext, order: Order) -> Result<Receipt> {
     let charge_id = charge_card(&ctx, order.id.clone(), order.amount_cents).await?;
     println!("  charge_id = {charge_id}");
 

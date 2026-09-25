@@ -3,7 +3,7 @@
 //! these tests create — keeping firing counts isolated.
 
 use durare::{
-    DurableContext, DurableEngine, InMemoryProvider, Result, ScheduleFilter, ScheduleOptions,
+    workflow_fn, DurableEngine, InMemoryProvider, Result, ScheduleFilter, ScheduleOptions,
     ScheduleStatus, ScheduledInput,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,11 +24,13 @@ async fn create_schedule_fires_and_pauses() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "created_tick",
-        |_ctx: DurableContext, tick: ScheduledInput| async move {
-            CREATED_RUNS.fetch_add(1, Ordering::SeqCst);
-            *SEEN_CONTEXT.lock().unwrap() = tick.context_as::<String>().unwrap();
-            Ok::<_, durare::Error>(())
-        },
+        workflow_fn(|_ctx, tick: ScheduledInput| {
+            Box::pin(async move {
+                CREATED_RUNS.fetch_add(1, Ordering::SeqCst);
+                *SEEN_CONTEXT.lock().unwrap() = tick.context_as::<String>().unwrap();
+                Ok::<_, durare::Error>(())
+            })
+        }),
     );
 
     // Unknown workflow and bad cron are rejected.
@@ -116,11 +118,11 @@ async fn list_schedules_filters() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf_a",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durare::Error>(()) },
+        workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, durare::Error>(()) })),
     );
     engine.register(
         "wf_b",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, durare::Error>(()) },
+        workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, durare::Error>(()) })),
     );
 
     engine
@@ -163,7 +165,9 @@ async fn resume_reactivates_and_unknown_name_is_a_noop() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf",
-        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, durare::Error>(()) },
+        workflow_fn(|_ctx, _at: ScheduledInput| {
+            Box::pin(async move { Ok::<_, durare::Error>(()) })
+        }),
     );
     engine
         .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())

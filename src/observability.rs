@@ -75,8 +75,8 @@
 //! # use durare::{DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 //! # use std::sync::Arc;
 //! # #[durare::workflow]
-//! # async fn hello(ctx: durare::DurableContext, name: String) -> Result<String> {
-//! #     ctx.step("greet", || async { Ok(format!("hello, {name}")) }).await
+//! # async fn hello(ctx: &durare::DurableContext, name: String) -> Result<String> {
+//! #     ctx.step("greet", |_| async { Ok(format!("hello, {name}")) }).await
 //! # }
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> Result<()> {

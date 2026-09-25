@@ -5,7 +5,7 @@
 
 use chrono::{TimeZone, Utc};
 use durare::{
-    ApplySchedule, DurableContext, DurableEngine, Error, InMemoryProvider, Result, ScheduleFilter,
+    workflow_fn, ApplySchedule, DurableEngine, Error, InMemoryProvider, Result, ScheduleFilter,
     ScheduleOptions, ScheduledInput, StateProvider, WorkflowHandle,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,7 +20,7 @@ async fn apply_creates_replaces_and_validates() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf",
-        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, Error>(()) },
+        workflow_fn(|_ctx, _at: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
     );
 
     engine
@@ -79,10 +79,12 @@ async fn backfill_fires_each_tick_once() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf",
-        |_ctx: DurableContext, _at: ScheduledInput| async move {
-            WORK.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(())
-        },
+        workflow_fn(|_ctx, _at: ScheduledInput| {
+            Box::pin(async move {
+                WORK.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
     );
     // Daily at noon UTC.
     engine
@@ -132,10 +134,12 @@ async fn trigger_runs_once_now() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf",
-        |_ctx: DurableContext, _at: ScheduledInput| async move {
-            WORK.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>("done".to_string())
-        },
+        workflow_fn(|_ctx, _at: ScheduledInput| {
+            Box::pin(async move {
+                WORK.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>("done".to_string())
+            })
+        }),
     );
     engine
         .create_schedule("s", "wf", "0 0 12 * * *", ScheduleOptions::new())
@@ -163,7 +167,7 @@ async fn timezone_shifts_the_fired_instant() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "wf",
-        |_ctx: DurableContext, _at: ScheduledInput| async move { Ok::<_, Error>(()) },
+        workflow_fn(|_ctx, _at: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
     );
     engine
         .create_schedule(
@@ -211,10 +215,12 @@ async fn automatic_backfill_catches_up_missed_ticks_on_launch() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "beat",
-        |_ctx: DurableContext, _at: ScheduledInput| async move {
-            WORK.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(())
-        },
+        workflow_fn(|_ctx, _at: ScheduledInput| {
+            Box::pin(async move {
+                WORK.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
     );
     // Fire every second, with automatic backfill enabled.
     engine

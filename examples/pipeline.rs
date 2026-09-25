@@ -37,7 +37,7 @@ async fn resize(ctx: &DurableContext, image: String) -> Result<u64> {
 }
 
 #[durare::workflow]
-async fn make_thumbnail(ctx: DurableContext, image: String) -> Result<u64> {
+async fn make_thumbnail(ctx: &DurableContext, image: String) -> Result<u64> {
     let running = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     PEAK.fetch_max(running, Ordering::SeqCst);
 

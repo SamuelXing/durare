@@ -531,7 +531,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// if ctx.patch("use-v2-pricing").await? {
     ///     // new code
     /// } else {
@@ -619,7 +619,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, WorkflowOptions};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// // Fan out durable children, then gather their results.
     /// let mut handles = Vec::new();
     /// for region in ["us", "eu", "ap"] {
@@ -733,7 +733,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Error, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let charge_id = ctx
     ///     .step("charge_card", |_step| async {
     ///         // Any side effect: an HTTP call, an email, a write to another system.
@@ -796,7 +796,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Error, Result, StepOptions};
     /// # async fn fetch_quote() -> Result<f64> { Ok(1.0) }
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let quote = ctx
     ///     .step_with(
     ///         StepOptions::new("fetch_quote").max_retries(5),
@@ -874,7 +874,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, params};
-    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext) -> Result<()> {
     /// let bal: i64 = ctx
     ///     .transaction("debit", |tx| Box::pin(async move {
     ///         tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?",
@@ -907,7 +907,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, IsolationLevel, Result, TransactionOptions, params};
-    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext) -> Result<()> {
     /// let opts = TransactionOptions::new("transfer").isolation(IsolationLevel::Serializable);
     /// ctx.transaction_with::<(), _>(opts, |tx| Box::pin(async move {
     ///     tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?", &params![10_i64, 1_i64]).await?;
@@ -1048,7 +1048,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, PgDataSource, Result};
-    /// # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext, ds: PgDataSource) -> Result<()> {
     /// let total: i64 = ctx
     ///     .transaction_on(&ds, "record-order", async |conn| {
     ///         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
@@ -1599,7 +1599,7 @@ impl DurableContext {
     /// # use durare::{DurableContext, Result};
     /// # async fn fetch_primary() -> String { String::new() }
     /// # async fn fetch_fallback() -> String { String::new() }
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let (winner, value) = ctx
     ///     .select(vec![
     ///         Box::pin(async { fetch_primary().await }),
@@ -1816,7 +1816,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Result};
     /// # use std::time::Duration;
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// ctx.sleep(Duration::from_secs(7 * 24 * 3600)).await?; // a restart doesn't reset it
     /// # Ok(())
     /// # }
@@ -1855,7 +1855,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext) -> Result<()> {
     /// let started = ctx.now().await?; // same value on every replay
     /// # Ok(()) }
     /// ```
@@ -1928,7 +1928,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// ctx.send("order-1001", "approved".to_string(), "review").await?;
     /// # Ok(())
     /// # }
@@ -2081,7 +2081,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Result};
     /// # use std::time::Duration;
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// // Block this workflow until an approval message arrives (or a day passes).
     /// match ctx.recv::<String>("review", Duration::from_secs(24 * 3600)).await? {
     ///     Some(decision) => println!("decision: {decision}"),
@@ -2170,7 +2170,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// ctx.set_event("status", "shipped".to_string()).await?;
     /// # Ok(())
     /// # }
@@ -2221,7 +2221,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Result};
     /// # use std::time::Duration;
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let status: Option<String> = ctx
     ///     .get_event("order-1001", "status", Duration::from_secs(60))
     ///     .await?;
@@ -2326,7 +2326,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// for i in 0..3 {
     ///     ctx.write_stream("progress", format!("chunk {i}")).await?;
     /// }
@@ -2450,7 +2450,7 @@ impl DurableContext {
     /// ```no_run
     /// use durare::StreamExt;
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext, id: &str) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext, id: &str) -> Result<()> {
     /// let mut values = ctx.read_stream_values::<String>(id, "events");
     /// while let Some(v) = values.next().await {
     ///     println!("{}", v?);

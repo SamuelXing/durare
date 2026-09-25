@@ -4,7 +4,7 @@
 //! terminal — the row is finalized `ERROR`, never left to be redequeued.
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, Result,
+    workflow_fn, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, Result,
     WorkflowOptions, WorkflowQueue,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -13,9 +13,14 @@ use std::time::Duration;
 
 async fn engine_with_admin_wf() -> Result<DurableEngine> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("delete-tenant", |ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(ctx.assumed_role().unwrap_or_default().to_string())
-    });
+    engine.register(
+        "delete-tenant",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(
+                async move { Ok::<_, Error>(ctx.assumed_role().unwrap_or_default().to_string()) },
+            )
+        }),
+    );
     engine.require_roles("delete-tenant", ["admin", "operator"]);
     Ok(engine)
 }
@@ -48,13 +53,16 @@ async fn missing_auth_is_denied_terminally() -> Result<()> {
     let runs = Arc::new(AtomicU32::new(0));
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     let counter = runs.clone();
-    engine.register("delete-tenant", move |_ctx: DurableContext, (): ()| {
-        let counter = counter.clone();
-        async move {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(String::new())
-        }
-    });
+    engine.register(
+        "delete-tenant",
+        workflow_fn(move |_ctx, (): ()| {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(String::new())
+            })
+        }),
+    );
     engine.require_roles("delete-tenant", ["admin", "operator"]);
     engine.launch().await?;
 
@@ -112,9 +120,10 @@ async fn wrong_roles_are_denied() -> Result<()> {
 #[tokio::test]
 async fn queued_denial_finalizes_instead_of_looping() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("guarded", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "guarded",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.require_roles("guarded", ["admin"]);
     engine.register_queue(WorkflowQueue::new("authz-q"));
     engine.launch().await?;
@@ -157,9 +166,10 @@ async fn queued_denial_finalizes_instead_of_looping() -> Result<()> {
 #[tokio::test]
 async fn undeclared_workflows_are_unrestricted() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("open", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "open",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
     engine
         .start::<(), ()>("open", (), WorkflowOptions::with_id("authz-open"))
@@ -173,9 +183,10 @@ async fn undeclared_workflows_are_unrestricted() -> Result<()> {
 #[tokio::test]
 async fn declaration_for_unknown_workflow_is_rejected_at_launch() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("real", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "real",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.require_roles("no-such-workflow", ["admin"]);
     let err = engine.launch().await.expect_err("typo declaration");
     assert!(err.to_string().contains("no-such-workflow"), "{err}");

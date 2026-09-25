@@ -1,0 +1,12 @@
+error[E0521]: borrowed data escapes outside of function
+ --> tests/compile_fail/spawn_pending_step.rs:6:5
+  |
+5 | async fn wf(ctx: &DurableContext, _: ()) -> Result<i64> {
+  |             ---  - let's call the lifetime of this reference `'1`
+  |             |
+  |             `ctx` is a reference that is only valid in the function body
+6 |     tokio::spawn(ctx.step("x", |_| async { Ok::<_, Error>(1) }))
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     `ctx` escapes the function body here
+  |     argument requires that `'1` must outlive `'static`

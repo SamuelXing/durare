@@ -24,7 +24,7 @@
 //! bottom hold on every commit:
 //!
 //! ```
-//! use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+//! use durare::{BoxFuture, DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicU32, Ordering};
 //!
@@ -47,7 +47,7 @@
 //! }
 //!
 //! #[durare::workflow]
-//! async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+//! async fn process_order(ctx: &DurableContext, order_id: String) -> Result<String> {
 //!     // Reads like ordinary async code; each step checkpoints once.
 //!     let charge_id = charge_card(&ctx, order_id).await?;
 //!     send_receipt(&ctx, charge_id.clone()).await?;
@@ -221,9 +221,9 @@ pub use debounce::{Debouncer, DebouncerClient};
 #[doc(hidden)]
 pub use engine::WorkflowResult;
 pub use engine::{
-    erase, BoxFuture, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig,
-    EngineMetrics, HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef,
-    WorkflowFn, WorkflowHandler, WorkflowOptions, WorkflowRegistration,
+    erase, workflow_fn, BoxFuture, DeduplicationPolicy, DurableEngine, DurableEngineBuilder,
+    EngineConfig, EngineMetrics, HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage,
+    WorkflowDef, WorkflowFn, WorkflowHandler, WorkflowOptions, WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by

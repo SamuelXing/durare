@@ -19,7 +19,7 @@ async fn to_upper(ctx: &DurableContext, s: String) -> Result<String> {
 }
 
 #[durare::workflow]
-async fn pipeline(ctx: DurableContext, start: i64) -> Result<String> {
+async fn pipeline(ctx: &DurableContext, start: i64) -> Result<String> {
     let a = add_one(&ctx, start).await?;
     let b = add_one(&ctx, a).await?;
     to_upper(&ctx, format!("n{b}")).await
