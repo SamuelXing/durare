@@ -34,7 +34,8 @@
 //! | `Utc::now()`, `SystemTime::now()`, `Instant::now()` | a later run reads a different time | [`ctx.now()`](DurableContext::now) |
 //! | `Uuid::new_v4()`, `rand::random()` | a later run draws a different value | [`ctx.uuid()`](DurableContext::uuid) / [`ctx.random()`](DurableContext::random) |
 //! | iterating a `HashMap` / `HashSet` | order is randomized per map, so a loop issues its steps in a different order | a `BTreeMap` / `BTreeSet`, or sort the keys first |
-//! | `tokio::spawn` of durable work | a position is claimed where the call is **written**, but a spawned task writes its calls into the same counter from another task, so a replay interleaves them differently | keep durable calls on the workflow's own task; run them concurrently with `join!` / `try_join!`, which is deterministic because positions follow the source |
+//! | `tokio::spawn` of durable work | a position is claimed where the call is **written**, but a spawned task writes its calls into the same counter from another task, so a replay interleaves them differently | keep durable calls on the workflow's own task; run them concurrently with `join!` / `try_join!` (see the note below it) |
+//! | a durable call built *after* an `.await` inside a `join!` branch | `join!` rotates which branch it polls first, so which branch reaches its call first is decided by wake-up order, not by the source | build the durable calls first and join the built calls, so the positions are claimed before anything is polled |
 //! | `tokio::select!` over durable calls | positions are fine — every branch is built before any is polled — but only the winner runs, and which one wins turns on real timing, so a replay can pick a different branch and leave the loser's position with nothing recorded at it | race plain async work with [`ctx.select`](DurableContext::select), which records the winner, or give each branch a child workflow |
 //! | `FuturesUnordered`, `buffer_unordered`, any "handle them as they finish" loop | the first run observes real I/O latencies; a replay serves every step from its checkpoint at once, so the completion order — and anything derived from it, including which durable call is reached next — differs | collect with `join!` / `try_join!` and process in a fixed order, or give each branch a child workflow |
 //! | reading env vars, config, files, or the network | the value can differ between runs | read it inside a [step](DurableContext::step) |
@@ -58,12 +59,47 @@
 //! # }
 //! ```
 //!
-//! One rule you have to keep yourself: a [durable
-//! select](DurableContext::select) must not open durable operations inside its
-//! branches. The whole race is checkpointed as one operation, so a losing branch
-//! advances the sequence counter with no recorded outcome to match, and nothing
-//! checks for it at the call — the divergence surfaces later, as an
-//! [`Error::UnexpectedStep`] on some unrelated step, or not at all.
+//! # A durable call belongs to the workflow body
+//!
+//! Every rule above is one you keep yourself, with `UnexpectedStep` as a
+//! backstop. This one the engine checks at the call: a durable operation may not
+//! be created inside another durable operation's body, and may not be awaited in
+//! a body other than the one it was built in.
+//!
+//! A step body, a transaction body and a [durable select](DurableContext::select)
+//! branch are all bodies. They do not run on a replay — the outer operation is
+//! served from its record instead — so a durable call inside one claims a
+//! position on the first run that no replay claims again, and every later call
+//! shifts onto it. Under a different name that surfaces as an
+//! [`Error::UnexpectedStep`] somewhere unrelated, on code that did not change;
+//! under the same name it is not detectable at all, and the outer call is served
+//! the inner call's result.
+//!
+//! Both are refused where they happen, before the counter moves, as
+//! [`Error::NestedDurableCall`] and [`Error::DurableCallCrossedBody`]. The calls
+//! around a refused one keep the positions they would have had.
+//!
+//! ```no_run
+//! # use durare::{DurableContext, Error, Result};
+//! # async fn charge(ctx: &DurableContext) -> Result<i64> { Ok(0) }
+//! # async fn fetch() -> i64 { 0 }
+//! # async fn workflow(ctx: DurableContext) -> Result<()> {
+//! // WRONG: `inner` is created while `outer`'s body is being polled.
+//! let inner_ctx = ctx.clone();
+//! ctx.step("outer", || async move {
+//!     inner_ctx.step("inner", || async { Ok::<_, Error>(1) }).await
+//! }).await?;
+//!
+//! // RIGHT: the body does plain work; the durable calls are siblings.
+//! let a = ctx.step("a", || async { Ok::<_, Error>(fetch().await) }).await?;
+//! let b = ctx.step("b", || async { Ok::<_, Error>(fetch().await) }).await?;
+//! # let _ = (a, b);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! What a body may do is call ordinary functions, as deeply as it likes. The
+//! rule is about durable calls, not about nesting code.
 //!
 //! # Durable-safe data
 //!

@@ -9,11 +9,56 @@ use serde_json::Value;
 use std::future::{poll_fn, Future};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 use tracing::Instrument;
+
+tokio::task_local! {
+    /// The durable body whose poll is in progress on this task.
+    ///
+    /// Set by [`in_body`] around a step closure, a transaction body and the
+    /// polling of `select`'s branches — and around nothing else. It is a
+    /// task-local *scope*, so it is set when that body's poll begins and
+    /// restored when the poll returns, however it returns: ready, pending, an
+    /// early `?`, a drop mid-poll, or a panic unwinding through it. Nothing has
+    /// to clear it, which is the point: a flag that outlives one poll cannot
+    /// tell a body that is *running* from a body that is merely *in flight*,
+    /// and would refuse a sibling call the workflow body makes in between.
+    static CURRENT_BODY: BodyMarker;
+}
+
+/// Identifies one run of one durable body.
+///
+/// Opaque and never compared across executions — it exists only so that a
+/// durable call can tell "polled inside the body I was built in" from "polled
+/// inside some other body". A retry of a step is a new body and gets a new
+/// marker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct BodyMarker(u64);
+
+static NEXT_BODY_MARKER: AtomicU64 = AtomicU64::new(0);
+
+impl BodyMarker {
+    fn fresh() -> Self {
+        Self(NEXT_BODY_MARKER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// The body being polled on this task, or `None` in the workflow body itself.
+fn current_body() -> Option<BodyMarker> {
+    CURRENT_BODY.try_with(|marker| *marker).ok()
+}
+
+/// Runs a durable body under a fresh marker.
+///
+/// Wraps only the user's future. The operation's own machinery — the replay
+/// lookup, the checkpoint write — stays outside, so an operation never trips
+/// its own check.
+async fn in_body<F: Future>(body: F) -> F::Output {
+    CURRENT_BODY.scope(BodyMarker::fresh(), body).await
+}
 
 /// Predicate deciding whether a step error is retryable — see
 /// [`StepOptions::retry_if`]. Returning `false` stops retries at once.
@@ -199,6 +244,32 @@ impl DurableContext {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Claim the next position for `operation`, refusing to claim one inside
+    /// another durable operation's body.
+    ///
+    /// The refusal happens before the counter moves, so the calls around a
+    /// refused one keep the positions they would have had — the failure is as
+    /// deterministic as the code that caused it, and a replay refuses in the
+    /// same place.
+    fn claim_position(&self, operation: &'static str) -> Result<i32> {
+        self.refuse_inside_body(operation)?;
+        Ok(self.next_seq())
+    }
+
+    /// The check itself, for the two durable calls that take their position at
+    /// poll time rather than at construction ([`patch`](Self::patch) and
+    /// [`deprecate_patch`](Self::deprecate_patch)) and so cannot go through
+    /// [`claim_position`](Self::claim_position).
+    fn refuse_inside_body(&self, operation: &'static str) -> Result<()> {
+        if current_body().is_some() {
+            return Err(Error::NestedDurableCall {
+                workflow_id: self.workflow_id.clone(),
+                operation: operation.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// What both nesting checks report.
     const NESTED_TRANSACTION: &'static str =
         "cannot start a transaction inside another transaction";
@@ -269,6 +340,7 @@ impl DurableContext {
     /// takes the old path, and its existing checkpoints stay aligned because the
     /// marker only consumes a step slot on the new path.
     pub async fn patch(&self, name: &str) -> Result<bool> {
+        self.refuse_inside_body("patch")?;
         let seq = self.current_step_id();
         let marker = format!("{PATCH_PREFIX}{name}");
         let patched = match self.provider.get_step_name(&self.workflow_id, seq).await? {
@@ -301,6 +373,7 @@ impl DurableContext {
     /// nothing. Once no running workflow carries the marker, the call can be
     /// deleted entirely.
     pub async fn deprecate_patch(&self, name: &str) -> Result<()> {
+        self.refuse_inside_body("deprecate_patch")?;
         let seq = self.current_step_id();
         let marker = format!("{PATCH_PREFIX}{name}");
         if self
@@ -368,11 +441,14 @@ impl DurableContext {
         // serialize fails without moving the counter.
         let input_json = match serde_json::to_value(input) {
             Ok(input_json) => input_json,
-            Err(e) => return PendingStep::failed(e.into()),
+            Err(e) => return PendingStep::failed("start_workflow", e.into()),
         };
         let name = name.to_owned();
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("start_workflow") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("start_workflow", e),
+        };
+        PendingStep::new("start_workflow", async move {
             // Replay: re-attach to the child already started at this step. A
             // different workflow name recorded here means the parent is
             // non-deterministic — re-attaching would hand back the wrong child.
@@ -476,10 +552,13 @@ impl DurableContext {
         F: FnOnce() -> Fut + Send + 'a,
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
-        let seq = self.next_seq();
+        let seq = match self.claim_position("step") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("step", e),
+        };
         let span = self.op_span("step", name, seq);
         let name = name.to_owned();
-        PendingStep::new(async move {
+        PendingStep::new("step", async move {
             let out = async {
                 if let Some(stored) = self.replay_or_guard::<T>(seq, &name).await? {
                     return Ok(stored);
@@ -534,9 +613,12 @@ impl DurableContext {
         F: FnMut() -> Fut + Send + 'a,
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
-        let seq = self.next_seq();
+        let seq = match self.claim_position("step") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("step", e),
+        };
         let span = self.op_span("step", &opts.name, seq);
-        PendingStep::new(async move {
+        PendingStep::new("step", async move {
             let out = async {
                 if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
                     return Ok(stored);
@@ -644,11 +726,14 @@ impl DurableContext {
         // same nesting error, with their positions already claimed — the flag
         // cannot tell re-entrancy from concurrency. Unchanged by this rule.)
         if self.in_transaction.load(Ordering::SeqCst) {
-            return PendingStep::failed(Error::app(Self::NESTED_TRANSACTION));
+            return PendingStep::failed("transaction", Error::app(Self::NESTED_TRANSACTION));
         }
-        let seq = self.next_seq();
+        let seq = match self.claim_position("transaction") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("transaction", e),
+        };
         let span = self.op_span("transaction", &opts.name, seq);
-        PendingStep::new(async move {
+        PendingStep::new("transaction", async move {
             let _guard = self.begin_transaction()?;
             let started = chrono::Utc::now().timestamp_millis();
             // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
@@ -793,7 +878,7 @@ impl DurableContext {
     {
         let _guard = self.begin_transaction()?;
 
-        let seq = self.next_seq();
+        let seq = self.claim_position("transaction")?;
         let span = self.op_span("transaction", &opts.name, seq);
         let out = self
             .run_datasource_transaction(ds, &opts, &f, seq)
@@ -983,7 +1068,7 @@ impl DurableContext {
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
-        match f(&mut *tx).await {
+        match in_body(f(&mut *tx)).await {
             Ok(v) => {
                 let value = serde_json::to_value(v)?;
                 // A body that ended our transaction via raw SQL would make the
@@ -1160,7 +1245,7 @@ impl DurableContext {
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
-        match f(&mut *tx).await {
+        match in_body(f(&mut *tx)).await {
             Ok(v) => {
                 let value = serde_json::to_value(v)?;
                 // Ending our transaction via raw SQL would split the writes
@@ -1280,11 +1365,24 @@ impl DurableContext {
     /// returns the same winner without re-running anything. On a tie the lowest
     /// index wins.
     ///
-    /// The branches must be **plain async work** — do not call
-    /// [`step`](Self::step), [`start_workflow`](Self::start_workflow), or other
-    /// durable operations inside them. The whole race is checkpointed as one
-    /// operation and, on replay, the branches are not polled at all, so any
-    /// durable calls nested inside would desynchronize the step sequence.
+    /// The branches are **plain async work**: a branch is a durable body, so a
+    /// durable operation created in one is refused with
+    /// [`Error::NestedDurableCall`] and one built outside and awaited in one with
+    /// [`Error::DurableCallCrossedBody`]. On a replay the branches are not polled
+    /// at all — the recorded winner is returned — so a durable call inside a
+    /// branch would claim a position on the first run that no replay claims
+    /// again, and every later operation would shift onto it. Race the plain work
+    /// here and put the durable operations around the race; for a race between
+    /// recorded operations, give each branch a child workflow.
+    ///
+    /// This is a step whose body is a race, and the step contract applies to it
+    /// in full. The winner's own side effect is [at-least-once]: if the process
+    /// stops after a branch completed but before this operation's row commits,
+    /// the whole race runs again on recovery and a different branch may win.
+    /// Losing branches are dropped, which cancels their futures but does not
+    /// undo whatever they did before that, and does not stop tasks they spawned.
+    ///
+    /// [at-least-once]: crate::durability#the-at-least-once-window
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
@@ -1311,10 +1409,16 @@ impl DurableContext {
         // Refused before the position is claimed, so a race that cannot run
         // moves no counter and the calls around it keep their positions.
         if branches.is_empty() {
-            return PendingStep::failed(Error::app("select requires at least one branch"));
+            return PendingStep::failed(
+                "select",
+                Error::app("select requires at least one branch"),
+            );
         }
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("select") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("select", e),
+        };
+        PendingStep::new("select", async move {
             if let Some(stored) = self
                 .replay_or_guard::<(usize, T)>(seq, "DBOS.select")
                 .await?
@@ -1326,14 +1430,14 @@ impl DurableContext {
             // Poll the branches in index order on this one task; the first ready wins
             // (lowest index on a tie). The losers are dropped — and so cancelled —
             // when `branches` goes out of scope.
-            let (index, value) = poll_fn(|cx| {
+            let (index, value) = in_body(poll_fn(|cx| {
                 for (i, branch) in branches.iter_mut().enumerate() {
                     if let Poll::Ready(value) = branch.as_mut().poll(cx) {
                         return Poll::Ready((i, value));
                     }
                 }
                 Poll::Pending
-            })
+            }))
             .await;
 
             self.checkpoint(seq, "DBOS.select", (index, value), Some(started))
@@ -1501,8 +1605,11 @@ impl DurableContext {
     #[doc(alias = "timer")]
     #[doc(alias = "delay")]
     pub fn sleep(&self, dur: Duration) -> PendingStep<'_, ()> {
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("sleep") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("sleep", e),
+        };
+        PendingStep::new("sleep", async move {
             let wake_at = self.durable_wake_at(seq, dur).await?;
             let now = chrono::Utc::now();
             if wake_at > now {
@@ -1604,8 +1711,11 @@ impl DurableContext {
         T: Serialize + DeserializeOwned + Send + 'a,
         P: FnOnce() -> T + Send + 'a,
     {
-        let seq = self.next_seq();
-        PendingStep::new(self.durable_value_at(seq, name, produce))
+        let seq = match self.claim_position("durable value") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("durable value", e),
+        };
+        PendingStep::new("durable value", self.durable_value_at(seq, name, produce))
     }
 
     /// [`durable_value`](Self::durable_value)'s run, once the position is claimed.
@@ -1680,12 +1790,15 @@ impl DurableContext {
         // serialize fails without moving the counter.
         let encoded = match serde_json::to_value(message) {
             Ok(encoded) => encoded,
-            Err(e) => return PendingStep::failed(e.into()),
+            Err(e) => return PendingStep::failed("send", e.into()),
         };
         let destination_id = destination_id.to_owned();
         let topic = topic.to_owned();
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("send") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("send", e),
+        };
+        PendingStep::new("send", async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
                 return Ok(());
             }
@@ -1725,8 +1838,11 @@ impl DurableContext {
         attributes: Option<serde_json::Map<String, Value>>,
     ) -> PendingStep<'_, ()> {
         let id = id.to_owned();
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("set_workflow_attributes") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("set_workflow_attributes", e),
+        };
+        PendingStep::new("set_workflow_attributes", async move {
             if let Some(_done) = self
                 .replay_or_guard::<Value>(seq, "DBOS.updateWorkflowAttributes")
                 .await?
@@ -1770,10 +1886,13 @@ impl DurableContext {
         // without consuming a checkpoint slot.
         let rows = match crate::engine::prepare_bulk(messages) {
             Ok(rows) => rows,
-            Err(e) => return PendingStep::failed(e),
+            Err(e) => return PendingStep::failed("send_bulk", e),
         };
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("send_bulk") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("send_bulk", e),
+        };
+        PendingStep::new("send_bulk", async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send_bulk").await? {
                 return Ok(());
             }
@@ -1826,9 +1945,12 @@ impl DurableContext {
         timeout: Duration,
     ) -> PendingStep<'a, Option<T>> {
         let topic = topic.to_owned();
-        let seq = self.next_seq();
+        let seq = match self.claim_position("recv") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("recv", e),
+        };
         let deadline_seq = self.next_seq();
-        PendingStep::new(async move {
+        PendingStep::new("recv", async move {
             if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
                 return Ok(stored);
             }
@@ -1901,11 +2023,14 @@ impl DurableContext {
         // call one slot along.
         let encoded = match serde_json::to_value(value) {
             Ok(encoded) => encoded,
-            Err(e) => return PendingStep::failed(e.into()),
+            Err(e) => return PendingStep::failed("set_event", e.into()),
         };
         let key = key.to_owned();
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("set_event") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("set_event", e),
+        };
+        PendingStep::new("set_event", async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.setEvent").await? {
                 return Ok(());
             }
@@ -1957,9 +2082,12 @@ impl DurableContext {
     ) -> PendingStep<'a, Option<T>> {
         let target_workflow_id = target_workflow_id.to_owned();
         let key = key.to_owned();
-        let seq = self.next_seq();
+        let seq = match self.claim_position("get_event") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("get_event", e),
+        };
         let deadline_seq = self.next_seq();
-        PendingStep::new(async move {
+        PendingStep::new("get_event", async move {
             if let Some(stored) = self
                 .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
                 .await?
@@ -2049,11 +2177,14 @@ impl DurableContext {
     pub fn write_stream<T: Serialize>(&self, key: &str, value: T) -> PendingStep<'_, ()> {
         let encoded = match serde_json::to_value(value) {
             Ok(encoded) => encoded,
-            Err(e) => return PendingStep::failed(e.into()),
+            Err(e) => return PendingStep::failed("write_stream", e.into()),
         };
         let key = key.to_owned();
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("write_stream") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("write_stream", e),
+        };
+        PendingStep::new("write_stream", async move {
             if self
                 .replay_or_guard::<Value>(seq, "DBOS.writeStream")
                 .await?
@@ -2085,8 +2216,11 @@ impl DurableContext {
     /// errors.
     pub fn close_stream(&self, key: &str) -> PendingStep<'_, ()> {
         let key = key.to_owned();
-        let seq = self.next_seq();
-        PendingStep::new(async move {
+        let seq = match self.claim_position("close_stream") {
+            Ok(seq) => seq,
+            Err(e) => return PendingStep::failed("close_stream", e),
+        };
+        PendingStep::new("close_stream", async move {
             if self
                 .replay_or_guard::<Value>(seq, "DBOS.closeStream")
                 .await?
@@ -2271,7 +2405,7 @@ fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
 /// checkpoint the failure — instead of unwinding the whole workflow. A step that
 /// panics is treated as a failed step, subject to its retry policy.
 async fn run_step_catching<T>(name: &str, fut: impl Future<Output = Result<T>>) -> Result<T> {
-    match AssertUnwindSafe(fut).catch_unwind().await {
+    match AssertUnwindSafe(in_body(fut)).catch_unwind().await {
         Ok(result) => result,
         Err(payload) => Err(Error::app(format!(
             "step `{name}` panicked: {}",
@@ -2312,20 +2446,27 @@ async fn run_step_catching<T>(name: &str, fut: impl Future<Output = Result<T>>) 
 #[must_use = "this durable call has already claimed its position; awaiting it is what runs it"]
 pub struct PendingStep<'a, T> {
     running: Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
+    /// The operation this is, for the error if it is polled in the wrong place.
+    operation: &'static str,
+    /// The body that was being polled when this was built — `None` for the
+    /// ordinary case, a call built in the workflow body itself.
+    built_in: Option<BodyMarker>,
 }
 
 impl<'a, T> PendingStep<'a, T> {
     /// Wraps the run of a call whose position has already been claimed.
-    fn new(running: impl Future<Output = Result<T>> + Send + 'a) -> Self {
+    fn new(operation: &'static str, running: impl Future<Output = Result<T>> + Send + 'a) -> Self {
         Self {
             running: Box::pin(running),
+            operation,
+            built_in: current_body(),
         }
     }
 
     /// A call that failed before it could run, and so never claimed a position.
     /// Returned in place of a claim, never after one.
-    fn failed(e: Error) -> Self {
-        Self::new(async move { Err(e) })
+    fn failed(operation: &'static str, e: Error) -> Self {
+        Self::new(operation, async move { Err(e) })
     }
 }
 
@@ -2333,6 +2474,15 @@ impl<T> Future for PendingStep<'_, T> {
     type Output = Result<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        // Checked on *every* poll, not just the first: this type is `Unpin`, so
+        // a call polled once in the workflow body can still be moved into a
+        // step body afterwards. A call built where it is polled sees the same
+        // marker both times; anything else crossed a boundary.
+        if current_body() != self.built_in {
+            return Poll::Ready(Err(Error::DurableCallCrossedBody(
+                self.operation.to_owned(),
+            )));
+        }
         self.running.as_mut().poll(cx)
     }
 }

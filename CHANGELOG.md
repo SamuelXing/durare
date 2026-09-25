@@ -8,6 +8,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: a durable call may not be created inside another durable
+  operation's body, and may not be awaited in a body other than the one it was
+  built in.** A step body, a transaction body and a `select` branch are all
+  bodies. Creating a durable call while one is being polled is
+  `Error::NestedDurableCall`; awaiting a call across that boundary is
+  `Error::DurableCallCrossedBody`. Both are refused at the call, before the
+  position counter moves, so the calls around a refused one keep the positions
+  they would have had.
+
+  A body does not run on a replay: the outer operation is served from its
+  record. So a durable call inside one claimed a position on the first run that
+  no replay claims again, and every later call shifted onto it. Under a
+  different name that surfaced as an `UnexpectedStep` somewhere unrelated, on
+  code that had not changed; under the same name nothing detected it and the
+  outer call was served the inner call's recorded value. The `select`
+  documentation asked callers to keep this rule themselves and nothing checked
+  it; a step inside a step silently shifted every later position.
+
+  The check is a task-local scope around the body's poll, not a flag held for
+  the body's lifetime: a lifetime flag cannot tell a body that is *running* from
+  one that is merely *in flight*, and would refuse a sibling call the workflow
+  body makes while another step is parked mid-await. The scope is restored
+  however a poll ends, including an early `?` and a panic unwinding through it.
+
+  Bodies may still call ordinary functions as deeply as they like. What changes
+  is durable calls: do the body's work plainly, and keep the durable operations
+  as siblings in the workflow body. `ctx.select`'s documentation now also states
+  what it always did but never said: it is a step whose body is a race, so the
+  winner's effect is at-least-once, a dropped loser may already have had effects,
+  and dropping a branch does not stop tasks it spawned.
+
 - **Breaking: a durable call claims its position where it is written, not where
   it is first polled.** `ctx.step`, `step_with`, `sleep`, `send`, `send_bulk`,
   `recv`, `set_event`, `get_event`, `write_stream`, `close_stream`, `now`,
