@@ -32,7 +32,7 @@ async fn charge(ctx: &DurableContext, month: u32, cents: i64) -> Result<i64> {
 }
 
 #[durare::workflow]
-async fn subscription(ctx: DurableContext, months: u32) -> Result<i64> {
+async fn subscription(ctx: &DurableContext, months: u32) -> Result<i64> {
     let mut total = 0;
     for m in 1..=months {
         total += charge(&ctx, m, 999).await?;

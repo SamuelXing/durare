@@ -60,7 +60,7 @@ struct CanonicalOut {
 /// The durare analog of the SDKs' `canonicalWorkflow`: publish an event, write a
 /// stream, consume a message, and echo everything back.
 #[durare::workflow(name = "canonicalWorkflow")]
-async fn canonical_workflow(ctx: DurableContext, args: CanonicalArgs) -> Result<CanonicalOut> {
+async fn canonical_workflow(ctx: &DurableContext, args: CanonicalArgs) -> Result<CanonicalOut> {
     ctx.set_event(
         "interop_status",
         json!({"text": args.text, "num": args.num, "flag": args.flag}),

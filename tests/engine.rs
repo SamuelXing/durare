@@ -2,7 +2,7 @@
 //! lifecycle. All backend-free (in-memory provider).
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
     STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,15 +15,20 @@ use std::time::Duration;
 async fn start_is_non_blocking() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 
-    engine.register("slow", |ctx: DurableContext, _: ()| async move {
-        // A durable step that takes a beat, so the handle is observably PENDING
-        // before the workflow finishes.
-        ctx.step("work", || async {
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            Ok::<_, Error>(42_i64)
-        })
-        .await
-    });
+    engine.register(
+        "slow",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                // A durable step that takes a beat, so the handle is observably PENDING
+                // before the workflow finishes.
+                ctx.step("work", |_| async {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    Ok::<_, Error>(42_i64)
+                })
+                .await
+            })
+        }),
+    );
 
     let handle = engine
         .start::<_, i64>("slow", (), WorkflowOptions::with_id("wf-slow"))
@@ -49,20 +54,25 @@ async fn step_retries_until_success() -> Result<()> {
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 
-    engine.register("flaky", |ctx: DurableContext, _: ()| async move {
-        let opts = StepOptions::new("sometimes_fails")
-            .max_retries(2)
-            .base_interval(Duration::from_millis(1));
-        ctx.step_with(opts, || async {
-            let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-            if n < 2 {
-                Err(Error::app("transient"))
-            } else {
-                Ok::<_, Error>("ok".to_string())
-            }
-        })
-        .await
-    });
+    engine.register(
+        "flaky",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = StepOptions::new("sometimes_fails")
+                    .max_retries(2)
+                    .base_interval(Duration::from_millis(1));
+                ctx.step_with(opts, |_| async {
+                    let n = ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        Err(Error::app("transient"))
+                    } else {
+                        Ok::<_, Error>("ok".to_string())
+                    }
+                })
+                .await
+            })
+        }),
+    );
 
     let out: String = engine
         .start("flaky", (), WorkflowOptions::with_id("wf-flaky"))
@@ -84,13 +94,18 @@ async fn step_retries_until_success() -> Result<()> {
 async fn step_retries_exhausted_propagates_error() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 
-    engine.register("always_fails", |ctx: DurableContext, _: ()| async move {
-        let opts = StepOptions::new("nope")
-            .max_retries(1)
-            .base_interval(Duration::from_millis(1));
-        ctx.step_with(opts, || async { Err::<(), _>(Error::app("boom")) })
-            .await
-    });
+    engine.register(
+        "always_fails",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = StepOptions::new("nope")
+                    .max_retries(1)
+                    .base_interval(Duration::from_millis(1));
+                ctx.step_with(opts, |_| async { Err::<(), _>(Error::app("boom")) })
+                    .await
+            })
+        }),
+    );
 
     let res: Result<()> = engine
         .start("always_fails", (), WorkflowOptions::with_id("wf-fail"))
@@ -112,30 +127,40 @@ async fn step_retry_predicate_stops_on_permanent_error() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
 
     // "permanent" is a validation error the predicate refuses to retry.
-    engine.register("permanent", |ctx: DurableContext, _: ()| async move {
-        let opts = StepOptions::new("check")
-            .max_retries(5)
-            .base_interval(Duration::from_millis(1))
-            .retry_if(|e: &Error| !e.to_string().contains("permanent"));
-        ctx.step_with(opts, || async {
-            PERMANENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-            Err::<(), _>(Error::app("permanent: bad input"))
-        })
-        .await
-    });
+    engine.register(
+        "permanent",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = StepOptions::new("check")
+                    .max_retries(5)
+                    .base_interval(Duration::from_millis(1))
+                    .retry_if(|e: &Error| !e.to_string().contains("permanent"));
+                ctx.step_with(opts, |_| async {
+                    PERMANENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(Error::app("permanent: bad input"))
+                })
+                .await
+            })
+        }),
+    );
 
     // "transient" is retried under the same predicate until attempts run out.
-    engine.register("transient", |ctx: DurableContext, _: ()| async move {
-        let opts = StepOptions::new("call")
-            .max_retries(3)
-            .base_interval(Duration::from_millis(1))
-            .retry_if(|e: &Error| !e.to_string().contains("permanent"));
-        ctx.step_with(opts, || async {
-            TRANSIENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-            Err::<(), _>(Error::app("temporary glitch"))
-        })
-        .await
-    });
+    engine.register(
+        "transient",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = StepOptions::new("call")
+                    .max_retries(3)
+                    .base_interval(Duration::from_millis(1))
+                    .retry_if(|e: &Error| !e.to_string().contains("permanent"));
+                ctx.step_with(opts, |_| async {
+                    TRANSIENT_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(Error::app("temporary glitch"))
+                })
+                .await
+            })
+        }),
+    );
 
     let permanent: Result<()> = engine
         .start("permanent", (), WorkflowOptions::with_id("wf-perm"))
@@ -167,9 +192,10 @@ async fn step_retry_predicate_stops_on_permanent_error() -> Result<()> {
 #[tokio::test]
 async fn launch_and_shutdown_drain() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("quick", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "quick",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
 
     engine.launch().await?;
     let handle = engine
@@ -186,13 +212,18 @@ async fn launch_and_shutdown_drain() -> Result<()> {
 #[tokio::test]
 async fn workflow_timeout_cancels() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("slow", |ctx: DurableContext, _: ()| async move {
-        ctx.step("long", || async {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            Ok::<_, Error>(1_i64)
-        })
-        .await
-    });
+    engine.register(
+        "slow",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("long", |_| async {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok::<_, Error>(1_i64)
+                })
+                .await
+            })
+        }),
+    );
 
     let mut opts = WorkflowOptions::with_id("wf-timeout");
     opts.timeout = Some(Duration::from_millis(80));

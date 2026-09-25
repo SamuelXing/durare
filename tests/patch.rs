@@ -2,7 +2,7 @@
 //! to new code and pre-patch workflows to old code, recording a marker step.
 
 use durare::{
-    DurableContext, DurableEngine, InMemoryProvider, Result, StateProvider, WorkflowOptions,
+    workflow_fn, DurableEngine, InMemoryProvider, Result, StateProvider, WorkflowOptions,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -12,9 +12,10 @@ use std::sync::Arc;
 #[tokio::test]
 async fn patch_new_workflow_takes_new_path() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("wf", |ctx: DurableContext, _: ()| async move {
-        ctx.patch("feature").await
-    });
+    engine.register(
+        "wf",
+        workflow_fn(|ctx, _: ()| Box::pin(async move { ctx.patch("feature").await })),
+    );
 
     let patched: bool = engine
         .start("wf", (), WorkflowOptions::with_id("fresh"))
@@ -42,9 +43,10 @@ async fn patch_pre_patch_workflow_takes_old_path() -> Result<()> {
         .await?;
 
     let mut engine = DurableEngine::new(provider).await?;
-    engine.register("wf", |ctx: DurableContext, _: ()| async move {
-        ctx.patch("feature").await
-    });
+    engine.register(
+        "wf",
+        workflow_fn(|ctx, _: ()| Box::pin(async move { ctx.patch("feature").await })),
+    );
 
     let patched: bool = engine
         .start::<_, bool>("wf", (), WorkflowOptions::with_id("old"))

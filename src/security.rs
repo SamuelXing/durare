@@ -101,7 +101,7 @@
 //! # use std::sync::Arc;
 //! # async fn run() -> Result<()> {
 //! # let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-//! engine.register("delete-tenant", |_ctx: DurableContext, tenant: String| async move {
+//! engine.register("delete-tenant", |_ctx: &DurableContext, tenant: String| async move {
 //!     Ok::<_, Error>(tenant)
 //! });
 //! engine.require_roles("delete-tenant", ["admin"]);

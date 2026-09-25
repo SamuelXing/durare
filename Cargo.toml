@@ -108,6 +108,8 @@ fail = "0.5"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+# Compile-fail cases proving the borrowed context cannot escape a workflow body.
+trybuild = "1.0"
 # A local websocket server for the conductor client tests.
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

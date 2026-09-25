@@ -27,7 +27,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use durare::{params, DurableContext, DurableEngine, Error, PostgresProvider, WorkflowOptions};
+use durare::{workflow_fn, params, DurableEngine, Error, PostgresProvider, WorkflowOptions};
 use hdrhistogram::Histogram;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,14 +128,14 @@ fn mib(bytes: usize) -> f64 {
 /// schema), and `bench_sleeper` (durably parked, for memory measurements).
 /// Shared by the `steps`, `concurrent`, and `serve` modes.
 fn register_bench(engine: &mut DurableEngine) {
-    engine.register("bench_sleeper", |ctx: DurableContext, _: ()| async move {
+    engine.register("bench_sleeper", workflow_fn(|ctx, _: ()| { Box::pin(async move {
         ctx.sleep(Duration::from_secs(3600)).await?;
         Ok::<_, Error>(())
-    });
+    }) }));
     // The benchmark workflow: `n` sequential transactions, each a read-then-write
     // on a shared counter row — matching upstream's benchmarkWorkflow, whose
     // benchmarkTransaction reads a greet_count and writes it back incremented.
-    engine.register("bench_steps", |ctx: DurableContext, n: i64| async move {
+    engine.register("bench_steps", workflow_fn(|ctx, n: i64| { Box::pin(async move {
         let mut last = 0i64;
         for _ in 0..n {
             last = ctx
@@ -159,10 +159,10 @@ fn register_bench(engine: &mut DurableEngine) {
                 .await?;
         }
         Ok::<_, Error>(last)
-    });
+    }) }));
 
     // One-time schema setup as a transaction (DDL is transactional on Postgres).
-    engine.register("bench_setup", |ctx: DurableContext, _: ()| async move {
+    engine.register("bench_setup", workflow_fn(|ctx, _: ()| { Box::pin(async move {
         ctx.transaction::<(), _>("setup", |tx| {
             Box::pin(async move {
                 tx.execute(
@@ -182,7 +182,7 @@ fn register_bench(engine: &mut DurableEngine) {
         })
         .await?;
         Ok::<_, Error>(())
-    });
+    }) }));
 }
 
 async fn steps_workload(url: &str, steps: i64, iterations: usize) -> Result<()> {

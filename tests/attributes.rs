@@ -4,7 +4,7 @@
 //! in-memory backend emulating containment for tests.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, ListFilter, Result, WorkflowOptions,
 };
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
@@ -22,9 +22,10 @@ fn attrs(v: Value) -> Map<String, Value> {
 #[tokio::test]
 async fn attributes_set_at_start_and_filtered_by_containment() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
 
     for (id, a) in [
@@ -96,9 +97,10 @@ async fn attributes_set_at_start_and_filtered_by_containment() -> Result<()> {
 #[tokio::test]
 async fn attributes_replace_clear_and_missing_id() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
     engine
         .start::<(), ()>(
@@ -146,15 +148,21 @@ async fn attributes_replace_clear_and_missing_id() -> Result<()> {
 #[tokio::test]
 async fn attributes_are_not_inherited_by_children() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("child", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
-    engine.register("parent", |ctx: DurableContext, (): ()| async move {
-        ctx.start_workflow::<(), ()>("child", (), WorkflowOptions::with_id("attr-child"))
-            .await?
-            .await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "child",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.start_workflow::<(), ()>("child", (), WorkflowOptions::with_id("attr-child"))
+                    .await?
+                    .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.launch().await?;
     engine
         .start::<(), ()>(
@@ -188,20 +196,25 @@ async fn attributes_are_not_inherited_by_children() -> Result<()> {
 #[tokio::test]
 async fn ctx_set_attributes_records_one_step() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("tagger", |ctx: DurableContext, (): ()| async move {
-        let id = ctx.workflow_id().to_string();
-        ctx.set_workflow_attributes(
-            &id,
-            Some(
-                serde_json::json!({"phase": "done"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "tagger",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                let id = ctx.workflow_id().to_string();
+                ctx.set_workflow_attributes(
+                    &id,
+                    Some(
+                        serde_json::json!({"phase": "done"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.launch().await?;
     engine
         .start::<(), ()>("tagger", (), WorkflowOptions::with_id("self-tag"))
@@ -239,9 +252,10 @@ async fn sqlite_stores_attributes_but_rejects_the_filter() -> Result<()> {
     let url = format!("sqlite://{}", path.display());
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
     engine
         .start::<(), ()>(
@@ -293,9 +307,10 @@ async fn pg_attributes_containment_end_to_end() -> Result<()> {
     let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_attrs").await;
 
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
 
     for (id, a) in [

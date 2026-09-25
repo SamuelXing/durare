@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased (prototype: borrowed context)
+
+### Breaking
+
+- `DurableContext` is lent to a workflow body as `&DurableContext` and is no
+  longer `Clone`. A handler is an `async fn(&DurableContext, I) -> Result<O>`;
+  a closure handler goes through `workflow_fn(|ctx, i| Box::pin(async move { .. }))`.
+  Moving durable work into `tokio::spawn`/`spawn_local` is now a compile error.
+- Step bodies take a per-attempt `StepCtx` by value:
+  `ctx.step("x", |step| async move { .. })`. `StepCtx` carries `step_id`,
+  `attempt`, `max_attempts` and a cancellation token stub, and no durable
+  capability.
+- A transaction body can no longer capture the context (`transaction`: the body
+  is `'static`; `transaction_on`: rustc cannot prove the `AsyncFn` future
+  `Send`), so nesting a transaction is refused at compile time.
+
 ## [Unreleased]
 
 ### Changed

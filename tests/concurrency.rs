@@ -2,7 +2,7 @@
 //! `ctx.step` is already durable (each step checkpoints independently), and
 //! `ctx.select` durably races branches and returns the first to complete.
 
-use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{workflow_fn, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,13 +13,18 @@ use std::time::Duration;
 #[tokio::test]
 async fn concurrent_steps_via_try_join() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("fanout", |ctx: DurableContext, _: ()| async move {
-        let (a, b) = tokio::try_join!(
-            ctx.step("a", || async { Ok::<_, Error>(10_i64) }),
-            ctx.step("b", || async { Ok::<_, Error>(32_i64) }),
-        )?;
-        Ok::<_, Error>(a + b)
-    });
+    engine.register(
+        "fanout",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let (a, b) = tokio::try_join!(
+                    ctx.step("a", |_| async { Ok::<_, Error>(10_i64) }),
+                    ctx.step("b", |_| async { Ok::<_, Error>(32_i64) }),
+                )?;
+                Ok::<_, Error>(a + b)
+            })
+        }),
+    );
 
     let out: i64 = engine
         .start("fanout", (), WorkflowOptions::with_id("f"))
@@ -41,16 +46,21 @@ async fn concurrent_steps_via_try_join() -> Result<()> {
 #[tokio::test]
 async fn select_returns_first_to_complete() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("racer", |ctx: DurableContext, _: ()| async move {
-        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
-            Box::pin(async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                1
-            }),
-            Box::pin(async { 2 }),
-        ];
-        ctx.select(branches).await
-    });
+    engine.register(
+        "racer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        1
+                    }),
+                    Box::pin(async { 2 }),
+                ];
+                ctx.select(branches).await
+            })
+        }),
+    );
 
     let (index, value): (usize, i64) = engine
         .start("racer", (), WorkflowOptions::with_id("r"))
@@ -71,13 +81,18 @@ async fn select_returns_first_to_complete() -> Result<()> {
 #[tokio::test]
 async fn many_concurrent_workflows_stay_isolated() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("square", |ctx: DurableContext, n: i64| async move {
-        // A checkpointed step, so each workflow records its own operation output.
-        let r = ctx
-            .step("sq", move || async move { Ok::<_, Error>(n * n) })
-            .await?;
-        Ok::<_, Error>(r)
-    });
+    engine.register(
+        "square",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                // A checkpointed step, so each workflow records its own operation output.
+                let r = ctx
+                    .step("sq", move |_| async move { Ok::<_, Error>(n * n) })
+                    .await?;
+                Ok::<_, Error>(r)
+            })
+        }),
+    );
     let engine = Arc::new(engine);
 
     const N: i64 = 200;
@@ -109,10 +124,15 @@ async fn many_concurrent_workflows_stay_isolated() -> Result<()> {
 #[tokio::test]
 async fn select_with_no_branches_errors() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("empty", |ctx: DurableContext, _: ()| async move {
-        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![];
-        ctx.select(branches).await
-    });
+    engine.register(
+        "empty",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![];
+                ctx.select(branches).await
+            })
+        }),
+    );
 
     let res = engine
         .start::<_, (usize, i64)>("empty", (), WorkflowOptions::with_id("e"))

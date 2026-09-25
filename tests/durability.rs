@@ -1,7 +1,7 @@
 //! Backend-free tests using the in-memory provider.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
     WorkflowOptions, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,15 +17,20 @@ async fn step_runs_once_across_replays() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider).await?;
 
-    engine.register("charge", |ctx: DurableContext, _: ()| async move {
-        let amount = ctx
-            .step("charge_card", || async {
-                CHARGES.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(4999_i64)
+    engine.register(
+        "charge",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let amount = ctx
+                    .step("charge_card", |_| async {
+                        CHARGES.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(4999_i64)
+                    })
+                    .await?;
+                Ok::<_, Error>(amount)
             })
-            .await?;
-        Ok::<_, Error>(amount)
-    });
+        }),
+    );
 
     // First execution runs the step.
     let a: i64 = engine
@@ -60,19 +65,24 @@ async fn caught_step_failure_replays_without_rerunning() -> Result<()> {
     let mut engine = DurableEngine::new(provider).await?;
 
     // Errors on the first closure run, would succeed on any later run.
-    engine.register("flaky_caught", |ctx: DurableContext, _: ()| async move {
-        let r: Result<i64> = ctx
-            .step("maybe", || async {
-                let n = RUNS.fetch_add(1, Ordering::SeqCst);
-                if n == 0 {
-                    Err(Error::app("transient"))
-                } else {
-                    Ok(7)
-                }
+    engine.register(
+        "flaky_caught",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let r: Result<i64> = ctx
+                    .step("maybe", |_| async {
+                        let n = RUNS.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            Err(Error::app("transient"))
+                        } else {
+                            Ok(7)
+                        }
+                    })
+                    .await;
+                Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
             })
-            .await;
-        Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
-    });
+        }),
+    );
 
     let a: String = engine
         .start("flaky_caught", (), WorkflowOptions::with_id("wf-step-err"))
@@ -110,15 +120,20 @@ async fn multi_step_results_are_stable() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider).await?;
 
-    engine.register("pipeline", |ctx: DurableContext, start: i64| async move {
-        let a = ctx
-            .step("double", || async { Ok::<_, Error>(start * 2) })
-            .await?;
-        let b = ctx
-            .step("plus_one", || async { Ok::<_, Error>(a + 1) })
-            .await?;
-        Ok::<_, Error>(b)
-    });
+    engine.register(
+        "pipeline",
+        workflow_fn(|ctx, start: i64| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("double", |_| async { Ok::<_, Error>(start * 2) })
+                    .await?;
+                let b = ctx
+                    .step("plus_one", |_| async { Ok::<_, Error>(a + 1) })
+                    .await?;
+                Ok::<_, Error>(b)
+            })
+        }),
+    );
 
     let out: i64 = engine
         .start("pipeline", 10_i64, WorkflowOptions::with_id("wf-2"))
@@ -154,16 +169,21 @@ async fn durable_sleep_is_not_repeated_on_replay() -> Result<()> {
 
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider).await?;
-    engine.register("napper", move |ctx: DurableContext, _: ()| async move {
-        ctx.sleep(nap).await?;
-        // A checkpointed step after the sleep, to prove the body resumed past it.
-        ctx.step("after_nap", || async {
-            AFTER_SLEEP.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, Error>(1_i64)
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "napper",
+        workflow_fn(move |ctx, _: ()| {
+            Box::pin(async move {
+                ctx.sleep(nap).await?;
+                // A checkpointed step after the sleep, to prove the body resumed past it.
+                ctx.step("after_nap", |_| async {
+                    AFTER_SLEEP.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(1_i64)
+                })
+                .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     // First execution actually waits out the nap and records the wake instant.
     let t0 = Instant::now();
@@ -211,12 +231,17 @@ async fn durable_now_uuid_random_are_stable_across_replays() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider).await?;
 
-    engine.register("clocked", |ctx: DurableContext, _: ()| async move {
-        let now = ctx.now().await?.timestamp_micros();
-        let id = ctx.uuid().await?;
-        let r = ctx.random().await?;
-        Ok::<_, Error>((now, id, r))
-    });
+    engine.register(
+        "clocked",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let now = ctx.now().await?.timestamp_micros();
+                let id = ctx.uuid().await?;
+                let r = ctx.random().await?;
+                Ok::<_, Error>((now, id, r))
+            })
+        }),
+    );
 
     let first = engine
         .start::<(), (i64, String, f64)>("clocked", (), WorkflowOptions::with_id("wf-1"))
@@ -249,11 +274,16 @@ async fn durable_uuid_calls_in_one_workflow_are_distinct() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider).await?;
 
-    engine.register("two_ids", |ctx: DurableContext, _: ()| async move {
-        let a = ctx.uuid().await?;
-        let b = ctx.uuid().await?;
-        Ok::<_, Error>((a, b))
-    });
+    engine.register(
+        "two_ids",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a = ctx.uuid().await?;
+                let b = ctx.uuid().await?;
+                Ok::<_, Error>((a, b))
+            })
+        }),
+    );
 
     let (a, b) = engine
         .start::<(), (String, String)>("two_ids", (), WorkflowOptions::with_id("wf"))
@@ -276,12 +306,17 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
 
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("panicky", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "panicky",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("boom on the first attempt");
+                }
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     // First execution panics: the owning caller sees an error, but the row is
     // left recoverable (PENDING), not terminally failed.
@@ -341,12 +376,17 @@ async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
 
     let provider = Arc::new(InMemoryProvider::new());
     let register = |engine: &mut DurableEngine| {
-        engine.register("crash-once", |_ctx: DurableContext, _: ()| async move {
-            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("boom on the first attempt");
-            }
-            Ok::<_, Error>(())
-        });
+        engine.register(
+            "crash-once",
+            workflow_fn(|_ctx, _: ()| {
+                Box::pin(async move {
+                    if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("boom on the first attempt");
+                    }
+                    Ok::<_, Error>(())
+                })
+            }),
+        );
     };
 
     // First "process": start a workflow that panics on its first attempt, so the
@@ -379,12 +419,17 @@ async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
     // recover_on_launch.
     let mut builder = DurableEngine::builder(provider.clone());
     builder.recover_on_launch(true);
-    builder.register("crash-once", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
-        Ok::<_, Error>(())
-    });
+    builder.register(
+        "crash-once",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("boom on the first attempt");
+                }
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     let engine = builder.build().await?;
     engine.launch().await?;
 
@@ -424,12 +469,17 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     {
         let mut engine = DurableEngine::new(provider.clone()).await?;
-        engine.register("crash-once-opt", |_ctx: DurableContext, _: ()| async move {
-            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("boom on the first attempt");
-            }
-            Ok::<_, Error>(())
-        });
+        engine.register(
+            "crash-once-opt",
+            workflow_fn(|_ctx, _: ()| {
+                Box::pin(async move {
+                    if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("boom on the first attempt");
+                    }
+                    Ok::<_, Error>(())
+                })
+            }),
+        );
         let _ = engine
             .start::<(), ()>("crash-once-opt", (), WorkflowOptions::with_id("wf-opt-out"))
             .await?
@@ -439,12 +489,17 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
 
     // launch() with the default (recovery off) leaves the pending row untouched.
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("crash-once-opt", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "crash-once-opt",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("boom on the first attempt");
+                }
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.launch().await?;
     // Give any (unexpected) background recovery a chance to run.
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -492,16 +547,21 @@ async fn shutdown_drains_a_launch_recovered_run() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     {
         let mut engine = DurableEngine::new(provider.clone()).await?;
-        engine.register("drain-probe", |_ctx: DurableContext, _: ()| async move {
-            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("boom on the first attempt");
-            }
-            RUNNING.store(true, Ordering::SeqCst);
-            // Long enough that a shutdown which doesn't drain would return
-            // while this run is still going.
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            Ok::<_, Error>(())
-        });
+        engine.register(
+            "drain-probe",
+            workflow_fn(|_ctx, _: ()| {
+                Box::pin(async move {
+                    if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("boom on the first attempt");
+                    }
+                    RUNNING.store(true, Ordering::SeqCst);
+                    // Long enough that a shutdown which doesn't drain would return
+                    // while this run is still going.
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    Ok::<_, Error>(())
+                })
+            }),
+        );
         let _ = engine
             .start::<(), ()>("drain-probe", (), WorkflowOptions::with_id("wf-drain"))
             .await?
@@ -512,14 +572,19 @@ async fn shutdown_drains_a_launch_recovered_run() -> Result<()> {
     // Second "process" opts in; launch() re-dispatches the run in the background.
     let mut builder = DurableEngine::builder(provider.clone());
     builder.recover_on_launch(true);
-    builder.register("drain-probe", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
-        RUNNING.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        Ok::<_, Error>(())
-    });
+    builder.register(
+        "drain-probe",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("boom on the first attempt");
+                }
+                RUNNING.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     let engine = builder.build().await?;
     engine.launch().await?;
 
@@ -561,20 +626,25 @@ async fn step_panic_is_caught_and_retried() -> Result<()> {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("retry_panic", |ctx: DurableContext, _: ()| async move {
-        ctx.step_with(
-            StepOptions::new("flaky")
-                .max_retries(3)
-                .base_interval(Duration::from_millis(1)),
-            || async {
-                if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                    panic!("first attempt panics");
-                }
-                Ok::<_, Error>(42_i64)
-            },
-        )
-        .await
-    });
+    engine.register(
+        "retry_panic",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step_with(
+                    StepOptions::new("flaky")
+                        .max_retries(3)
+                        .base_interval(Duration::from_millis(1)),
+                    |_| async {
+                        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+                            panic!("first attempt panics");
+                        }
+                        Ok::<_, Error>(42_i64)
+                    },
+                )
+                .await
+            })
+        }),
+    );
 
     let out: i64 = engine
         .start::<(), i64>("retry_panic", (), WorkflowOptions::with_id("wf-retry"))

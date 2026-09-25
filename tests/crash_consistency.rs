@@ -22,7 +22,7 @@
 //! `DATABASE_URL` is set.
 
 use durare::{
-    DurableContext, DurableEngine, EngineConfig, Error, PostgresProvider, Result, SqliteProvider,
+    workflow_fn, DurableEngine, EngineConfig, Error, PostgresProvider, Result, SqliteProvider,
     StateProvider, WorkflowOptions, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::collections::HashMap;
@@ -91,32 +91,35 @@ impl Backend {
 /// Register the three-step workflow on `engine`. `armed` holds the boundary
 /// the *next* execution should crash at (`None` = run to completion).
 fn register(engine: &mut DurableEngine, name: &str, tag: String, armed: Arc<Mutex<Option<Crash>>>) {
-    engine.register(name, move |ctx: DurableContext, _: ()| {
-        let tag = tag.clone();
-        let armed = armed.clone();
-        async move {
-            let crash = *armed.lock().unwrap();
-            bump(format!("{tag}/body"));
-            if crash == Some(Crash::Entry) {
-                die().await;
-            }
-            for i in 1u8..=3 {
-                let effect = format!("{tag}/s{i}");
-                ctx.step(&format!("s{i}"), || async {
-                    bump(effect);
-                    if crash == Some(Crash::InStep(i)) {
-                        die().await;
-                    }
-                    Ok::<_, Error>(())
-                })
-                .await?;
-                if crash == Some(Crash::AfterStep(i)) {
+    engine.register(
+        name,
+        workflow_fn(move |ctx, _: ()| {
+            let tag = tag.clone();
+            let armed = armed.clone();
+            Box::pin(async move {
+                let crash = *armed.lock().unwrap();
+                bump(format!("{tag}/body"));
+                if crash == Some(Crash::Entry) {
                     die().await;
                 }
-            }
-            Ok::<_, Error>("done".to_string())
-        }
-    });
+                for i in 1u8..=3 {
+                    let effect = format!("{tag}/s{i}");
+                    ctx.step(&format!("s{i}"), |_| async {
+                        bump(effect);
+                        if crash == Some(Crash::InStep(i)) {
+                            die().await;
+                        }
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
+                    if crash == Some(Crash::AfterStep(i)) {
+                        die().await;
+                    }
+                }
+                Ok::<_, Error>("done".to_string())
+            })
+        }),
+    );
 }
 
 /// The effect counts that must exist *before* the crashed engine is dropped —

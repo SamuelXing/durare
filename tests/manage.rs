@@ -2,7 +2,7 @@
 //! and version-gated recovery. Backend-free (in-memory provider).
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, Result,
+    workflow_fn, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, Result,
     StateProvider, StepAggregateQuery, WorkflowAggregate, WorkflowAggregateQuery, WorkflowOptions,
     WorkflowStatus, STATUS_CANCELLED, STATUS_ENQUEUED, STATUS_PENDING, STATUS_SUCCESS,
 };
@@ -15,9 +15,10 @@ use std::time::Duration;
 #[tokio::test]
 async fn retrieve_and_list() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("add", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "add",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
 
     engine
         .start::<_, i64>("add", 1_i64, WorkflowOptions::with_id("wf-a"))
@@ -72,9 +73,10 @@ async fn retrieve_and_list() -> Result<()> {
 async fn direct_run_started_at_equals_created_at() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine
         .start::<_, ()>("noop", (), WorkflowOptions::with_id("d1"))
         .await?
@@ -100,18 +102,23 @@ async fn cancel_then_resume() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
 
     // Workflow: record step 0, then (on first run) observe cancellation at step 1.
-    engine.register("two_step", |ctx: DurableContext, _: ()| async move {
-        let a = ctx
-            .step("first", || async {
-                STEP_RUNS.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(1_i64)
+    engine.register(
+        "two_step",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("first", |_| async {
+                        STEP_RUNS.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(1_i64)
+                    })
+                    .await?;
+                let b = ctx
+                    .step("second", |_| async { Ok::<_, Error>(a + 1) })
+                    .await?;
+                Ok::<_, Error>(b)
             })
-            .await?;
-        let b = ctx
-            .step("second", || async { Ok::<_, Error>(a + 1) })
-            .await?;
-        Ok::<_, Error>(b)
-    });
+        }),
+    );
     // Resume re-queues the workflow for a dispatcher, so the engine must be live.
     engine.launch().await?;
 
@@ -175,18 +182,23 @@ async fn fork_reuses_checkpoints() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
 
-    engine.register("pipeline", |ctx: DurableContext, _: ()| async move {
-        let a = ctx
-            .step("first", || async { Ok::<_, Error>(10_i64) })
-            .await?;
-        let b = ctx
-            .step("second", || async {
-                SECOND_RUNS.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(a + 5)
+    engine.register(
+        "pipeline",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("first", |_| async { Ok::<_, Error>(10_i64) })
+                    .await?;
+                let b = ctx
+                    .step("second", |_| async {
+                        SECOND_RUNS.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(a + 5)
+                    })
+                    .await?;
+                Ok::<_, Error>(b)
             })
-            .await?;
-        Ok::<_, Error>(b)
-    });
+        }),
+    );
     // Fork re-queues the new workflow for a dispatcher, so the engine must be live.
     engine.launch().await?;
 
@@ -240,15 +252,18 @@ async fn fork_reuses_checkpoints() -> Result<()> {
 async fn list_filters_or_match_and_was_forked_from() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("alpha", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("beta", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("gamma", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "alpha",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "beta",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "gamma",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.launch().await?;
 
     engine
@@ -333,10 +348,15 @@ async fn recover_is_version_gated() -> Result<()> {
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new_with_version(provider.clone(), "v2").await?;
-    engine.register("w", |_ctx: DurableContext, _: ()| async move {
-        RUNS.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "w",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     // One PENDING workflow of the current version, one of an old version.
     for (id, ver) in [("wf-cur", "v2"), ("wf-old", "v1")] {
@@ -389,12 +409,14 @@ async fn recover_caps_attempts() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register(
         "always_panic_ish",
-        |ctx: DurableContext, _: ()| async move {
-            // Never completes successfully: errors every attempt so it stays
-            // recoverable... except we cap it.
-            ctx.step("boom", || async { Err::<(), _>(Error::app("nope")) })
-                .await
-        },
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                // Never completes successfully: errors every attempt so it stays
+                // recoverable... except we cap it.
+                ctx.step("boom", |_| async { Err::<(), _>(Error::app("nope")) })
+                    .await
+            })
+        }),
     );
 
     provider
@@ -456,9 +478,10 @@ async fn recover_caps_attempts() -> Result<()> {
 async fn cancel_removes_from_queue() -> Result<()> {
     use durare::WorkflowQueue;
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(WorkflowQueue::new("q").base_polling_interval(Duration::from_millis(10)));
 
     // Enqueue but cancel before launching the dispatcher.
@@ -478,9 +501,10 @@ async fn cancel_removes_from_queue() -> Result<()> {
 async fn bulk_cancel_and_resume() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     // Resume re-queues workflows for a dispatcher, so the engine must be live.
     engine.launch().await?;
 
@@ -590,15 +614,21 @@ async fn bulk_delete_with_children() -> Result<()> {
 #[tokio::test]
 async fn list_filters_parentage_and_load_flags() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("child", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 10)
-    });
-    engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let h = ctx
-            .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
-            .await?;
-        h.result().await
-    });
+    engine.register(
+        "child",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 10) })),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let h = ctx
+                    .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
+                    .await?;
+                h.result().await
+            })
+        }),
+    );
     let out: i64 = engine
         .start("parent", (), WorkflowOptions::with_id("p"))
         .await?
@@ -654,9 +684,10 @@ async fn list_filters_parentage_and_load_flags() -> Result<()> {
 #[tokio::test]
 async fn list_filters_completed_and_dequeued_time() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine
         .start::<_, ()>("noop", (), WorkflowOptions::with_id("w"))
         .await?
@@ -701,12 +732,14 @@ async fn list_filters_completed_and_dequeued_time() -> Result<()> {
 #[tokio::test]
 async fn workflow_aggregates_group_and_filter() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("ok", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
-    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
-        Err::<(), _>(Error::app("nope"))
-    });
+    engine.register(
+        "ok",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
+    engine.register(
+        "boom",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Err::<(), _>(Error::app("nope")) })),
+    );
 
     // Two successes, one failure.
     engine
@@ -820,9 +853,10 @@ async fn workflow_aggregates_group_and_filter() -> Result<()> {
 #[tokio::test]
 async fn workflow_aggregates_completed_and_dequeued_filter() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("ok", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "ok",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine
         .start::<_, ()>("ok", (), WorkflowOptions::with_id("w"))
         .await?
@@ -893,16 +927,23 @@ async fn workflow_aggregates_completed_and_dequeued_filter() -> Result<()> {
 #[tokio::test]
 async fn step_aggregates_count_and_duration() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("work", |ctx: DurableContext, _: ()| async move {
-        ctx.step("fast", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.step("slow", || async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            Ok::<_, Error>(2_i64)
-        })
-        .await?;
-        ctx.step("fast", || async { Ok::<_, Error>(3_i64) }).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("fast", |_| async { Ok::<_, Error>(1_i64) })
+                    .await?;
+                ctx.step("slow", |_| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, Error>(2_i64)
+                })
+                .await?;
+                ctx.step("fast", |_| async { Ok::<_, Error>(3_i64) })
+                    .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine
         .start::<_, ()>("work", (), WorkflowOptions::with_id("w"))
         .await?
@@ -1011,9 +1052,10 @@ async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
     use durare::WorkflowQueue;
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("double", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 2)
-    });
+    engine.register(
+        "double",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 2) })),
+    );
     engine.register_queue(
         WorkflowQueue::new("fork-q").base_polling_interval(Duration::from_millis(10)),
     );
@@ -1068,13 +1110,18 @@ async fn fork_routes_to_named_queue_and_inherits_version() -> Result<()> {
 async fn renamed_step_on_replay_fails_as_unexpected_step() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("evolved", |ctx: DurableContext, _: ()| async move {
-        // The (changed) code runs a step named differently from the recorded one.
-        let v = ctx
-            .step("renamed", || async { Ok::<_, Error>(1_i64) })
-            .await?;
-        Ok::<_, Error>(v)
-    });
+    engine.register(
+        "evolved",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                // The (changed) code runs a step named differently from the recorded one.
+                let v = ctx
+                    .step("renamed", |_| async { Ok::<_, Error>(1_i64) })
+                    .await?;
+                Ok::<_, Error>(v)
+            })
+        }),
+    );
     engine.launch().await?;
 
     // Seed a PENDING run whose step 0 was checkpointed under the OLD name.
@@ -1118,15 +1165,21 @@ async fn renamed_step_on_replay_fails_as_unexpected_step() -> Result<()> {
 async fn changed_child_on_replay_fails_as_unexpected_step() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let h = ctx
-            .start_workflow::<_, i64>("child-b", (), WorkflowOptions::default())
-            .await?;
-        Ok::<_, Error>(h.id().to_string())
-    });
-    engine.register("child-b", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(0_i64)
-    });
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let h = ctx
+                    .start_workflow::<_, i64>("child-b", (), WorkflowOptions::default())
+                    .await?;
+                Ok::<_, Error>(h.id().to_string())
+            })
+        }),
+    );
+    engine.register(
+        "child-b",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(0_i64) })),
+    );
     engine.launch().await?;
 
     // Seed a PENDING parent whose step 0 recorded a child under a DIFFERENT name.
@@ -1162,9 +1215,10 @@ async fn resume_routes_to_named_queue() -> Result<()> {
     use durare::WorkflowQueue;
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("bounce", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "bounce",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     engine.register_queue(
         WorkflowQueue::new("resume-q").base_polling_interval(Duration::from_millis(10)),
     );
@@ -1203,24 +1257,34 @@ async fn resume_routes_to_named_queue() -> Result<()> {
 async fn child_auth_inherits_per_field() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        // Override ONLY the assumed role; user and roles must come from the parent.
-        let h = ctx
-            .start_workflow::<_, i64>(
-                "child",
-                (),
-                WorkflowOptions::default().assumed_role("auditor"),
-            )
-            .await?;
-        h.result().await?;
-        Ok::<_, Error>(h.id().to_string())
-    });
-    engine.register("child", |ctx: DurableContext, _: ()| async move {
-        assert_eq!(ctx.authenticated_user(), Some("alice"));
-        assert_eq!(ctx.assumed_role(), Some("auditor"));
-        assert_eq!(ctx.authenticated_roles(), ["admin", "user"]);
-        Ok::<_, Error>(0_i64)
-    });
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                // Override ONLY the assumed role; user and roles must come from the parent.
+                let h = ctx
+                    .start_workflow::<_, i64>(
+                        "child",
+                        (),
+                        WorkflowOptions::default().assumed_role("auditor"),
+                    )
+                    .await?;
+                h.result().await?;
+                Ok::<_, Error>(h.id().to_string())
+            })
+        }),
+    );
+    engine.register(
+        "child",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                assert_eq!(ctx.authenticated_user(), Some("alice"));
+                assert_eq!(ctx.assumed_role(), Some("auditor"));
+                assert_eq!(ctx.authenticated_roles(), ["admin", "user"]);
+                Ok::<_, Error>(0_i64)
+            })
+        }),
+    );
     engine.launch().await?;
 
     let h = engine

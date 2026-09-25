@@ -49,18 +49,18 @@
 //!
 //! ```no_run
 //! # use durare::{DurableContext, Error, Result};
-//! # async fn workflow(ctx: DurableContext) -> Result<()> {
+//! # async fn workflow(ctx: &DurableContext) -> Result<()> {
 //! // WRONG: fresh randomness outside a step. A replay draws a different
 //! // value, the branch flips, and the step sequence diverges.
 //! let lucky = uuid::Uuid::new_v4().as_u128() % 2 == 0;
 //!
 //! // RIGHT: record it once; every replay sees the same value.
-//! let lucky = ctx.step("draw_lottery", || async {
+//! let lucky = ctx.step("draw_lottery", |_| async {
 //!     Ok::<_, Error>(uuid::Uuid::new_v4().as_u128() % 2 == 0)
 //! }).await?;
 //!
 //! if lucky {
-//!     ctx.step("apply_discount", || async { Ok::<_, Error>(()) }).await?;
+//!     ctx.step("apply_discount", |_| async { Ok::<_, Error>(()) }).await?;
 //! }
 //! # Ok(())
 //! # }

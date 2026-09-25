@@ -47,7 +47,7 @@
 //!
 //! ```no_run
 //! # use durare::{DurableContext, Result};
-//! # async fn workflow(ctx: DurableContext) -> Result<()> {
+//! # async fn workflow(ctx: &DurableContext) -> Result<()> {
 //! // WRONG: a fresh read each run; a replay sees a different instant, and any
 //! // branch on it can flip, diverging the step sequence.
 //! let _started = chrono::Utc::now();
@@ -118,12 +118,12 @@
 //! # use std::sync::OnceLock;
 //! # struct Deps { api_base: String }
 //! # static DEPS: OnceLock<Deps> = OnceLock::new();
-//! # async fn charge(ctx: DurableContext, amount: u64) -> Result<()> {
+//! # async fn charge(ctx: &DurableContext, amount: u64) -> Result<()> {
 //! // Set once at startup, in `main`, before the engine launches:
 //! //     DEPS.set(Deps { api_base: "https://api.example.com".into() }).ok();
 //! //
 //! // Read inside a step — where side effects belong:
-//! let _receipt = ctx.step("charge", || async {
+//! let _receipt = ctx.step("charge", |_| async {
 //!     let deps = DEPS.get().expect("deps set at startup");
 //!     // ... use deps.api_base to make the call ...
 //!     Ok::<String, Error>(format!("{}/charge/{amount}", deps.api_base))

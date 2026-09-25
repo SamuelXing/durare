@@ -468,7 +468,7 @@ checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "durare"
-version = "0.3.3"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.21.7",

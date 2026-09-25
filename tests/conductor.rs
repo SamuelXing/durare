@@ -4,8 +4,8 @@
 #![cfg(feature = "conductor")]
 
 use durare::{
-    AlertHandler, Conductor, ConductorConfig, DurableContext, DurableEngine, Error,
-    InMemoryProvider, Result, ScheduleOptions, WorkflowOptions, WorkflowQueue,
+    workflow_fn, AlertHandler, Conductor, ConductorConfig, DurableEngine, Error, InMemoryProvider,
+    Result, ScheduleOptions, WorkflowOptions, WorkflowQueue,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -196,12 +196,17 @@ async fn conductor_handles_workflow_management() -> Result<()> {
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("work", |ctx: DurableContext, msg: String| async move {
-        let r = ctx
-            .step("s1", || async { Ok::<_, Error>(format!("{msg}!")) })
-            .await?;
-        Ok::<_, Error>(r)
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, msg: String| {
+            Box::pin(async move {
+                let r = ctx
+                    .step("s1", |_| async { Ok::<_, Error>(format!("{msg}!")) })
+                    .await?;
+                Ok::<_, Error>(r)
+            })
+        }),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
     let h = engine
@@ -285,9 +290,10 @@ async fn conductor_resume_routes_to_named_queue() -> Result<()> {
 
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("bounce", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "bounce",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
 
@@ -376,9 +382,10 @@ async fn conductor_handles_schedule_management() -> Result<()> {
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("sched_wf", |_ctx: DurableContext, ts: String| async move {
-        Ok::<_, Error>(ts)
-    });
+    engine.register(
+        "sched_wf",
+        workflow_fn(|_ctx, ts: String| Box::pin(async move { Ok::<_, Error>(ts) })),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
     // Cron fires Jan 1 00:00:00 each year — never during the test, but the
@@ -504,12 +511,17 @@ async fn conductor_handles_registry_and_aggregates() -> Result<()> {
 
     let mut engine =
         DurableEngine::new_with_version(Arc::new(InMemoryProvider::new()), "2.0.0").await?;
-    engine.register("work", |ctx: DurableContext, msg: String| async move {
-        let r = ctx
-            .step("s1", || async { Ok::<_, Error>(format!("{msg}!")) })
-            .await?;
-        Ok::<_, Error>(r)
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, msg: String| {
+            Box::pin(async move {
+                let r = ctx
+                    .step("s1", |_| async { Ok::<_, Error>(format!("{msg}!")) })
+                    .await?;
+                Ok::<_, Error>(r)
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("myq").worker_concurrency(3));
     let engine = Arc::new(engine);
     engine.launch().await?; // registers application version 2.0.0
@@ -622,13 +634,18 @@ async fn conductor_handles_events_and_streams() -> Result<()> {
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("producer", |ctx: DurableContext, _: String| async move {
-        ctx.set_event("status", "done").await?;
-        ctx.write_stream("log", "line1").await?;
-        ctx.write_stream("log", "line2").await?;
-        ctx.close_stream("log").await?;
-        Ok::<_, Error>("ok".to_string())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: String| {
+            Box::pin(async move {
+                ctx.set_event("status", "done").await?;
+                ctx.write_stream("log", "line1").await?;
+                ctx.write_stream("log", "line2").await?;
+                ctx.close_stream("log").await?;
+                Ok::<_, Error>("ok".to_string())
+            })
+        }),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
     let h = engine
@@ -723,12 +740,17 @@ async fn conductor_handles_metrics_and_retention() -> Result<()> {
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("work", |ctx: DurableContext, msg: String| async move {
-        let r = ctx
-            .step("s1", || async { Ok::<_, Error>(format!("{msg}!")) })
-            .await?;
-        Ok::<_, Error>(r)
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, msg: String| {
+            Box::pin(async move {
+                let r = ctx
+                    .step("s1", |_| async { Ok::<_, Error>(format!("{msg}!")) })
+                    .await?;
+                Ok::<_, Error>(r)
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     let engine = Arc::new(engine);
     engine.launch().await?;
@@ -849,16 +871,21 @@ async fn conductor_exports_and_imports_workflow() -> Result<()> {
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("producer", |ctx: DurableContext, n: i64| async move {
-        let doubled = ctx
-            .step("double", || async { Ok::<_, Error>(n * 2) })
-            .await?;
-        ctx.set_event("status", "done").await?;
-        ctx.write_stream("log", "line1").await?;
-        ctx.write_stream("log", "line2").await?;
-        ctx.close_stream("log").await?;
-        Ok::<_, Error>(doubled)
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                let doubled = ctx
+                    .step("double", |_| async { Ok::<_, Error>(n * 2) })
+                    .await?;
+                ctx.set_event("status", "done").await?;
+                ctx.write_stream("log", "line1").await?;
+                ctx.write_stream("log", "line2").await?;
+                ctx.close_stream("log").await?;
+                Ok::<_, Error>(doubled)
+            })
+        }),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
     engine
@@ -1188,9 +1215,10 @@ async fn conductor_filters_and_reports_attributes() -> Result<()> {
     });
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
     for (id, attrs) in [

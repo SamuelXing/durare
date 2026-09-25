@@ -19,7 +19,7 @@ use serde_json::Value;
 /// use durare::{DurableContext, Result, ScheduledInput};
 ///
 /// #[durare::workflow(schedule = "0 0 * * * *")]
-/// async fn hourly(_ctx: DurableContext, tick: ScheduledInput) -> Result<()> {
+/// async fn hourly(_ctx: &DurableContext, tick: ScheduledInput) -> Result<()> {
 ///     println!("fired for {}", tick.scheduled_time);
 ///     Ok(())
 /// }

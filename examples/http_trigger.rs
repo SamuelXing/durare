@@ -35,9 +35,9 @@ use std::sync::Arc;
 /// Stand-in for a payment API that must never run twice for one order.
 static CHARGES: AtomicU32 = AtomicU32::new(0);
 
-async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+async fn process_order(ctx: &DurableContext, order_id: String) -> Result<String> {
     let charge = ctx
-        .step("charge", || async {
+        .step("charge", |_| async {
             CHARGES.fetch_add(1, Ordering::SeqCst);
             Ok::<_, Error>(format!("ch_{order_id}"))
         })

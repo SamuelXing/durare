@@ -56,6 +56,40 @@ fn internal_queue() -> WorkflowQueue {
 /// An `async fn` item needs none of this; see [`WorkflowHandler`].
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Name the borrowed-context signature for a closure-shaped workflow body.
+///
+/// An `async fn(&DurableContext, I) -> Result<O>` item registers directly. A
+/// closure cannot: its return type cannot depend on the lifetime of its `ctx`
+/// argument, so `|ctx, x| async move { ctx.step(..).await }` has no type on
+/// stable Rust, and neither has one annotated `-> BoxFuture<'_, _>` (the `'_`
+/// in a closure's return type is a fresh lifetime, not the argument's). Passing
+/// the closure through this adapter gives it the higher-ranked signature it
+/// needs, and the compiler then infers `ctx` and the return type for it:
+///
+/// ```no_run
+/// # use durare::{workflow_fn, DurableContext, DurableEngine, Error, InMemoryProvider};
+/// # async fn demo(engine: &mut DurableEngine) {
+/// engine.register("greet", workflow_fn(|ctx, name: String| Box::pin(async move {
+///     let hello = ctx.step("hello", |_| async move { Ok::<_, Error>(format!("Hello, {name}")) }).await?;
+///     Ok::<_, Error>(hello)
+/// })));
+/// # }
+/// ```
+///
+/// The adapter returns the closure unchanged — it exists only to fix the
+/// closure's signature — so a capture-free closure stays `Copy` and can be
+/// registered more than once.
+///
+/// The `Box::pin` is the one piece of scaffolding that remains: an unboxed
+/// closure body would need the unstable `closure_lifetime_binder` to name the
+/// borrow. `#[durare::workflow]` on an `async fn` needs none of this.
+pub fn workflow_fn<I, O, F>(f: F) -> F
+where
+    F: for<'a> Fn(&'a DurableContext, I) -> BoxFuture<'a, Result<O>> + Send + Sync + 'static,
+{
+    f
+}
+
 /// A type-erased workflow handler: borrows the run's context and takes JSON
 /// input, returns JSON output. The future lives no longer than the borrow, so
 /// the engine can own the context for exactly the duration of the run.
@@ -155,11 +189,11 @@ inventory::collect!(WorkflowRegistration);
 /// wrong input type is a compile error:
 ///
 /// ```
-/// use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+/// use durare::{BoxFuture, DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 /// use std::sync::Arc;
 ///
 /// #[durare::workflow]
-/// async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+/// async fn process_order(ctx: &DurableContext, order_id: String) -> Result<String> {
 ///     Ok(format!("receipt for {order_id}"))
 /// }
 ///
@@ -1875,7 +1909,7 @@ impl DurableEngine {
     /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
     /// # use std::sync::Arc;
     /// # #[durare::workflow]
-    /// # async fn greet(ctx: DurableContext, name: String) -> Result<String> {
+    /// # async fn greet(ctx: &DurableContext, name: String) -> Result<String> {
     /// #     Ok(format!("hello, {name}"))
     /// # }
     /// # #[tokio::main(flavor = "current_thread")]
@@ -1995,7 +2029,7 @@ impl DurableEngine {
     /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
     /// # use std::sync::Arc;
     /// # #[durare::workflow]
-    /// # async fn process_order(ctx: DurableContext, order: String) -> Result<String> {
+    /// # async fn process_order(ctx: &DurableContext, order: String) -> Result<String> {
     /// #     Ok(format!("receipt for {order}"))
     /// # }
     /// # #[tokio::main(flavor = "current_thread")]

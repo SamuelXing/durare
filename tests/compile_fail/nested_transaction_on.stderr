@@ -1,0 +1,22 @@
+error: implementation of `Send` is not general enough
+  --> tests/compile_fail/nested_transaction_on.rs:13:13
+   |
+13 | /             Box::pin(async move {
+14 | |                 let inner_ds = ds.clone();
+15 | |                 ctx.transaction_on(&ds, "outer", async move |_conn| {
+16 | |                     ctx.transaction_on(&inner_ds, "inner", async |_conn| Ok(())).await
+17 | |                 })
+18 | |                 .await
+19 | |             })
+   | |______________^ implementation of `Send` is not general enough
+   |
+  ::: src/context.rs
+   |
+   | /     {
+   | |         self.transaction_on_with(ds, TransactionOptions::new(name), f)
+   | |             .await
+   | |     }
+   | |_____- this async fn captures a value whose type is not `Send`
+   |
+   = note: `Send` would have to be implemented for the type `&'0 DurableContext`, for any lifetime `'0`...
+   = note: ...but `Send` is actually implemented for the type `&'1 DurableContext`, for some specific lifetime `'1`

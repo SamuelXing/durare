@@ -3,7 +3,7 @@
 //! enqueue, deduplication, and rate limiting.
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, RateLimiter,
+    workflow_fn, DurableEngine, Error, ErrorCode, InMemoryProvider, ListFilter, RateLimiter,
     Result, StateProvider, WorkflowOptions, WorkflowQueue, STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,9 +18,10 @@ fn test_queue(name: &str) -> WorkflowQueue {
 #[tokio::test]
 async fn enqueue_dispatches_and_completes() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("add_one", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "add_one",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     engine.register_queue(test_queue("q"));
     engine.launch().await?;
 
@@ -36,9 +37,10 @@ async fn enqueue_dispatches_and_completes() -> Result<()> {
 #[tokio::test]
 async fn enqueue_to_unregistered_queue_errors() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     let res = engine
         .start::<_, ()>("noop", (), WorkflowOptions::default().queue("nope"))
         .await;
@@ -54,13 +56,18 @@ async fn worker_concurrency_is_enforced() -> Result<()> {
     static MAX_SEEN: AtomicUsize = AtomicUsize::new(0);
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("tracked", |_ctx: DurableContext, _: ()| async move {
-        let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
-        MAX_SEEN.fetch_max(now, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(40)).await;
-        RUNNING.fetch_sub(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "tracked",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+                MAX_SEEN.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                RUNNING.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(test_queue("serial").worker_concurrency(1));
     engine.launch().await?;
 
@@ -97,13 +104,16 @@ async fn priority_orders_execution() -> Result<()> {
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     let order_wf = order.clone();
-    engine.register("record", move |_ctx: DurableContext, n: i64| {
-        let order = order_wf.clone();
-        async move {
-            order.lock().await.push(n);
-            Ok::<_, Error>(n)
-        }
-    });
+    engine.register(
+        "record",
+        workflow_fn(move |_ctx, n: i64| {
+            let order = order_wf.clone();
+            Box::pin(async move {
+                order.lock().await.push(n);
+                Ok::<_, Error>(n)
+            })
+        }),
+    );
     engine.register_queue(test_queue("prio").worker_concurrency(1).priority_enabled());
 
     // Enqueue before launch so all three are pending when dispatch begins.
@@ -132,9 +142,10 @@ async fn priority_orders_execution() -> Result<()> {
 #[tokio::test]
 async fn delayed_enqueue_waits_then_runs() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.register_queue(test_queue("later"));
     engine.launch().await?;
 
@@ -162,9 +173,10 @@ async fn delayed_enqueue_waits_then_runs() -> Result<()> {
 #[tokio::test]
 async fn set_workflow_delay_reschedules() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.register_queue(test_queue("resched"));
     engine.launch().await?;
 
@@ -207,9 +219,10 @@ async fn set_workflow_delay_reschedules() -> Result<()> {
 #[tokio::test]
 async fn delay_requires_queue() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     let opts = WorkflowOptions {
         delay: Some(Duration::from_millis(10)),
         ..Default::default()
@@ -224,9 +237,10 @@ async fn delay_requires_queue() -> Result<()> {
 #[tokio::test]
 async fn dedup_id_rejects_duplicates() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(test_queue("dedup"));
 
     let mut opts = WorkflowOptions::with_id("wf-dedup-1");
@@ -252,9 +266,10 @@ async fn dedup_id_rejects_duplicates() -> Result<()> {
 async fn dedup_return_existing_returns_the_holder() -> Result<()> {
     use durare::DeduplicationPolicy;
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(test_queue("dedup"));
 
     let first = engine
@@ -315,10 +330,15 @@ async fn rate_limit_caps_starts() -> Result<()> {
     static STARTED: AtomicUsize = AtomicUsize::new(0);
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("counted", |_ctx: DurableContext, _: ()| async move {
-        STARTED.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "counted",
+        workflow_fn(|_ctx, _: ()| {
+            Box::pin(async move {
+                STARTED.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(test_queue("limited").rate_limiter(RateLimiter {
         limit: 2,
         period: Duration::from_secs(60),
@@ -374,9 +394,10 @@ async fn list_registered_queues_is_sorted() -> Result<()> {
 #[tokio::test]
 async fn listen_queues_dispatches_only_listened() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("add_one", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "add_one",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     engine.register_queue(test_queue("listened"));
     engine.register_queue(test_queue("ignored"));
     engine.listen_queues(["listened"]);
@@ -416,9 +437,10 @@ async fn listen_queues_dispatches_only_listened() -> Result<()> {
 #[tokio::test]
 async fn queues_only_filters_to_queued_workflows() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(test_queue("q"));
     engine.launch().await?;
 
@@ -458,13 +480,18 @@ async fn partitioned_queue_concurrency_is_per_partition() -> Result<()> {
     static PEAK: AtomicUsize = AtomicUsize::new(0);
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("work", |ctx: DurableContext, _: ()| async move {
-        let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
-        PEAK.fetch_max(now, Ordering::SeqCst);
-        ctx.sleep(Duration::from_millis(80)).await?;
-        CURRENT.fetch_sub(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+                PEAK.fetch_max(now, Ordering::SeqCst);
+                ctx.sleep(Duration::from_millis(80)).await?;
+                CURRENT.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(test_queue("pq").partitioned().worker_concurrency(1));
     engine.launch().await?;
 
@@ -500,9 +527,10 @@ async fn partitioned_queue_concurrency_is_per_partition() -> Result<()> {
 #[tokio::test]
 async fn partitioned_queue_ignores_keyless_enqueue() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(test_queue("pq").partitioned());
     engine.launch().await?;
 
@@ -527,9 +555,10 @@ async fn partitioned_queue_ignores_keyless_enqueue() -> Result<()> {
 #[tokio::test]
 async fn launch_persists_the_queue_registry() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(
         test_queue("emails")
             .worker_concurrency(4)
@@ -571,7 +600,7 @@ async fn launch_persists_the_queue_registry() -> Result<()> {
 #[tokio::test]
 async fn launch_gate_self_elects_then_stragglers_do_not_clobber() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
-    let noop = |_ctx: DurableContext, _: ()| async move { Ok::<_, Error>(()) };
+    let noop = workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) }));
 
     // v-old launches first: registers itself (latest so far) and writes q=1.
     {

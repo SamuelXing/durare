@@ -3,8 +3,8 @@
 //! direct runs and queue dispatch, and the names persist on the row.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle,
-    WorkflowOptions, WorkflowQueue,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle, WorkflowOptions,
+    WorkflowQueue,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,11 +18,17 @@ async fn config_name_routes_to_matching_instance() -> Result<()> {
     engine.register_configured(
         "greet",
         "en",
-        |_ctx: DurableContext, who: String| async move { Ok::<_, Error>(format!("Hello, {who}")) },
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Hello, {who}")) })
+        }),
     );
-    engine.register_configured("greet", "fr", |_ctx: DurableContext, who: String| async move {
-        Ok::<_, Error>(format!("Bonjour, {who}"))
-    });
+    engine.register_configured(
+        "greet",
+        "fr",
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Bonjour, {who}")) })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("q"));
     engine.launch().await?;
 
@@ -90,7 +96,9 @@ async fn unknown_config_name_is_an_error() -> Result<()> {
     engine.register_configured(
         "greet",
         "en",
-        |_ctx: DurableContext, who: String| async move { Ok::<_, Error>(format!("Hello, {who}")) },
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Hello, {who}")) })
+        }),
     );
     engine.launch().await?;
 
@@ -116,9 +124,10 @@ async fn unknown_config_name_is_an_error() -> Result<()> {
 #[tokio::test]
 async fn plain_registration_unaffected_by_config_routing() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("plain", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "plain",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     engine.launch().await?;
 
     let out: i64 = engine
@@ -141,11 +150,17 @@ async fn fork_of_configured_run_routes_to_same_instance() -> Result<()> {
     engine.register_configured(
         "greet",
         "en",
-        |_ctx: DurableContext, who: String| async move { Ok::<_, Error>(format!("Hello, {who}")) },
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Hello, {who}")) })
+        }),
     );
-    engine.register_configured("greet", "fr", |_ctx: DurableContext, who: String| async move {
-        Ok::<_, Error>(format!("Bonjour, {who}"))
-    });
+    engine.register_configured(
+        "greet",
+        "fr",
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Bonjour, {who}")) })
+        }),
+    );
     engine.launch().await?;
 
     let fr: String = engine

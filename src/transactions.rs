@@ -21,7 +21,7 @@
 //! use std::sync::Arc;
 //!
 //! #[durare::workflow]
-//! async fn transfer(ctx: DurableContext, amount: i64) -> Result<i64> {
+//! async fn transfer(ctx: &DurableContext, amount: i64) -> Result<i64> {
 //!     ctx.transaction("move_funds", move |tx| Box::pin(async move {
 //!         // Demo setup — a real app would have its schema already.
 //!         tx.execute("CREATE TABLE IF NOT EXISTS accounts (name TEXT PRIMARY KEY, balance INTEGER)", &params![]).await?;
@@ -118,7 +118,7 @@
 //!
 //! ```no_run
 //! # use durare::{DurableContext, PgDataSource, Result};
-//! # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
+//! # async fn ex(ctx: &DurableContext, ds: PgDataSource) -> Result<()> {
 //! let n: i64 = ctx
 //!     .transaction_on(&ds, "record-order", async |conn| {
 //!         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
@@ -148,7 +148,7 @@
 //! ```no_run
 //! # use durare::{DurableContext, DurableEngine, PostgresProvider, Result};
 //! # use std::sync::Arc;
-//! # async fn ex(ctx: DurableContext, url: &str) -> Result<()> {
+//! # async fn ex(ctx: &DurableContext, url: &str) -> Result<()> {
 //! let provider = PostgresProvider::connect(url).await?;
 //! let ds = provider.system_datasource(); // provider's own pool — no guessing
 //! let engine = DurableEngine::new(Arc::new(provider)).await?;

@@ -4,8 +4,8 @@
 //! the basis for cross-language interop via `portable_json`.
 
 use durare::{
-    DurableContext, DurableEngine, Error, PortableWorkflowError, Result, Serializer,
-    SqliteProvider, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, PortableWorkflowError, Result, Serializer, SqliteProvider,
+    WorkflowOptions,
 };
 use std::sync::Arc;
 
@@ -20,12 +20,17 @@ async fn engine_with(url: &str, fmt: Serializer) -> Result<DurableEngine> {
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
     // A workflow whose input flows through a step into the output, so input,
     // step output, and workflow output all exercise the serializer.
-    engine.register("greet", |ctx: DurableContext, name: String| async move {
-        let msg = ctx
-            .step("build", || async { Ok::<_, Error>(format!("hi {name}")) })
-            .await?;
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "greet",
+        workflow_fn(|ctx, name: String| {
+            Box::pin(async move {
+                let msg = ctx
+                    .step("build", |_| async { Ok::<_, Error>(format!("hi {name}")) })
+                    .await?;
+                Ok::<_, Error>(msg)
+            })
+        }),
+    );
     Ok(engine)
 }
 
@@ -77,9 +82,10 @@ async fn portable_error_is_stored_as_envelope() -> Result<()> {
         .await?
         .with_serializer(Serializer::Portable);
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
-        Err::<(), _>(Error::app("kaboom"))
-    });
+    engine.register(
+        "boom",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Err::<(), _>(Error::app("kaboom")) })),
+    );
 
     let outcome = engine
         .start::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
@@ -117,14 +123,19 @@ async fn portable_typed_error_round_trips() -> Result<()> {
             .await?
             .with_serializer(Serializer::Portable);
         let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-        engine.register("validate", |_ctx: DurableContext, _: ()| async move {
-            Err::<(), _>(Error::Portable(Box::new(PortableWorkflowError {
-                name: "ValidationError".to_string(),
-                message: "bad email".to_string(),
-                code: Some(serde_json::json!(400)),
-                data: Some(serde_json::json!({"field": "email"})),
-            })))
-        });
+        engine.register(
+            "validate",
+            workflow_fn(|_ctx, _: ()| {
+                Box::pin(async move {
+                    Err::<(), _>(Error::Portable(Box::new(PortableWorkflowError {
+                        name: "ValidationError".to_string(),
+                        message: "bad email".to_string(),
+                        code: Some(serde_json::json!(400)),
+                        data: Some(serde_json::json!({"field": "email"})),
+                    })))
+                })
+            }),
+        );
         let outcome = engine
             .start::<_, ()>("validate", (), WorkflowOptions::with_id("wf-typed"))
             .await?
@@ -173,9 +184,10 @@ async fn default_error_stays_bare() -> Result<()> {
     let (url, path) = temp_db_url("err-d");
     let provider = SqliteProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("boom", |_ctx: DurableContext, _: ()| async move {
-        Err::<(), _>(Error::app("kaboom"))
-    });
+    engine.register(
+        "boom",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Err::<(), _>(Error::app("kaboom")) })),
+    );
 
     let outcome = engine
         .start::<_, ()>("boom", (), WorkflowOptions::with_id("wf-err"))
@@ -255,15 +267,20 @@ async fn nested_value_round_trips_through_step_checkpoint() -> Result<()> {
     let (url, path) = temp_db_url("nested");
     let provider = SqliteProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("report", |ctx: DurableContext, _: ()| async move {
-        let r = ctx
-            .step("build", || async {
-                BUILDS.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(sample_report())
+    engine.register(
+        "report",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let r = ctx
+                    .step("build", |_| async {
+                        BUILDS.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(sample_report())
+                    })
+                    .await?;
+                Ok::<_, Error>(r)
             })
-            .await?;
-        Ok::<_, Error>(r)
-    });
+        }),
+    );
 
     // First execution builds and checkpoints the nested value.
     let a: Report = engine

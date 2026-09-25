@@ -30,7 +30,7 @@ async fn charge_card(ctx: &DurableContext, order_id: String) -> Result<String> {
 }
 
 #[durare::workflow]
-async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+async fn process_order(ctx: &DurableContext, order_id: String) -> Result<String> {
     let charge_id = charge_card(&ctx, order_id).await?;
     ctx.sleep(Duration::from_secs(24 * 3600)).await?; // durable timer
     Ok(charge_id)

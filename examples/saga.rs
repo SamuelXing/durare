@@ -63,7 +63,7 @@ async fn cancel_flight(ctx: &DurableContext, flight_id: String) -> Result<()> {
 }
 
 #[durare::workflow]
-async fn book_trip(ctx: DurableContext, trip: Trip) -> Result<Booking> {
+async fn book_trip(ctx: &DurableContext, trip: Trip) -> Result<Booking> {
     let flight = book_flight(&ctx, trip.traveler.clone()).await?;
     let hotel = book_hotel(&ctx, trip.traveler.clone()).await?;
 

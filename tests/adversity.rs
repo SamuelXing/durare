@@ -20,7 +20,7 @@
 mod common;
 
 use durare::{
-    DurableContext, DurableEngine, EngineConfig, Error, ErrorCode, PostgresProvider, Result,
+    workflow_fn, DurableEngine, EngineConfig, Error, ErrorCode, PostgresProvider, Result,
     StateProvider, WorkflowOptions, WorkflowQueue, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::collections::HashMap;
@@ -72,17 +72,22 @@ async fn pg_queued_work_runs_exactly_once_across_executors() -> Result<()> {
     let mut engines = Vec::new();
     for i in 0..3 {
         let mut engine = fleet_engine(&url, &format!("exec-{i}-{tag}")).await?;
-        engine.register(&wf, |ctx: DurableContext, task: String| async move {
-            bump(body_runs(), &task);
-            ctx.step("work", || async {
-                // Wide enough for the other dispatchers to be polling while
-                // this run is in flight.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                bump(step_runs(), &task);
-                Ok::<_, Error>(())
-            })
-            .await
-        });
+        engine.register(
+            &wf,
+            workflow_fn(|ctx, task: String| {
+                Box::pin(async move {
+                    bump(body_runs(), &task);
+                    ctx.step("work", |_| async {
+                        // Wide enough for the other dispatchers to be polling while
+                        // this run is in flight.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        bump(step_runs(), &task);
+                        Ok::<_, Error>(())
+                    })
+                    .await
+                })
+            }),
+        );
         engine.register_queue(WorkflowQueue::new(&queue));
         engine.launch().await?;
         engines.push(engine);
@@ -143,19 +148,22 @@ async fn pg_dedup_admits_exactly_one_under_contention() -> Result<()> {
     for i in 0..3 {
         let mut engine = fleet_engine(&url, &format!("dexec-{i}-{tag}")).await?;
         let key = wf_key.clone();
-        engine.register(&wf, move |ctx: DurableContext, _: ()| {
-            let key = key.clone();
-            async move {
-                bump(body_runs(), &key);
-                // Long enough that every contender races the *active* winner,
-                // not a completed one (the dedup slot frees on completion).
-                ctx.step("hold", || async {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    Ok::<_, Error>(())
+        engine.register(
+            &wf,
+            workflow_fn(move |ctx, _: ()| {
+                let key = key.clone();
+                Box::pin(async move {
+                    bump(body_runs(), &key);
+                    // Long enough that every contender races the *active* winner,
+                    // not a completed one (the dedup slot frees on completion).
+                    ctx.step("hold", |_| async {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        Ok::<_, Error>(())
+                    })
+                    .await
                 })
-                .await
-            }
-        });
+            }),
+        );
         engine.register_queue(WorkflowQueue::new(&queue));
         engine.launch().await?;
         engines.push(engine);
@@ -234,15 +242,18 @@ async fn pg_recovery_honors_executor_ownership() -> Result<()> {
     let attempts = Arc::new(AtomicUsize::new(0));
 
     let register = |engine: &mut DurableEngine, attempts: Arc<AtomicUsize>| {
-        engine.register(&wf, move |_ctx: DurableContext, _: ()| {
-            let attempts = attempts.clone();
-            async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    panic!("boom on the first attempt");
-                }
-                Ok::<_, Error>(())
-            }
-        });
+        engine.register(
+            &wf,
+            workflow_fn(move |_ctx, _: ()| {
+                let attempts = attempts.clone();
+                Box::pin(async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        panic!("boom on the first attempt");
+                    }
+                    Ok::<_, Error>(())
+                })
+            }),
+        );
     };
 
     // Executor A runs the workflow; it panics and is left PENDING, owned by A.
@@ -341,14 +352,19 @@ async fn pg_version_gate_routes_under_contention() -> Result<()> {
             .app_version(ver.as_str())
             .executor_id(exec.as_str());
         let mut engine = DurableEngine::with_config(Arc::new(provider), config).await?;
-        engine.register(&wf, |ctx: DurableContext, task: String| async move {
-            bump(body_runs(), &task);
-            ctx.step("work", || async {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                Ok::<_, Error>(())
-            })
-            .await
-        });
+        engine.register(
+            &wf,
+            workflow_fn(|ctx, task: String| {
+                Box::pin(async move {
+                    bump(body_runs(), &task);
+                    ctx.step("work", |_| async {
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        Ok::<_, Error>(())
+                    })
+                    .await
+                })
+            }),
+        );
         engine.register_queue(WorkflowQueue::new(&queue));
         engine.launch().await?;
         engines.push(engine);
@@ -444,21 +460,24 @@ async fn pg_duplicate_executor_id_double_runs_with_recover_on_launch() -> Result
     let entries = Arc::new(AtomicUsize::new(0));
 
     let register = |engine: &mut DurableEngine, entries: Arc<AtomicUsize>| {
-        engine.register(&wf, move |ctx: DurableContext, _: ()| {
-            let entries = entries.clone();
-            async move {
-                // First execution (engine A): checkpoint one step, then stall
-                // while still live. Second execution (engine B's recovery):
-                // run to completion.
-                let first = entries.fetch_add(1, Ordering::SeqCst) == 0;
-                ctx.step("s1", || async { Ok::<_, Error>(()) }).await?;
-                if first {
-                    stall().await;
-                }
-                ctx.step("s2", || async { Ok::<_, Error>(()) }).await?;
-                Ok::<_, Error>(())
-            }
-        });
+        engine.register(
+            &wf,
+            workflow_fn(move |ctx, _: ()| {
+                let entries = entries.clone();
+                Box::pin(async move {
+                    // First execution (engine A): checkpoint one step, then stall
+                    // while still live. Second execution (engine B's recovery):
+                    // run to completion.
+                    let first = entries.fetch_add(1, Ordering::SeqCst) == 0;
+                    ctx.step("s1", |_| async { Ok::<_, Error>(()) }).await?;
+                    if first {
+                        stall().await;
+                    }
+                    ctx.step("s2", |_| async { Ok::<_, Error>(()) }).await?;
+                    Ok::<_, Error>(())
+                })
+            }),
+        );
     };
 
     // Engine A: starts the workflow and stalls mid-body — alive, in flight.
@@ -533,29 +552,32 @@ async fn pg_takeover_of_live_stalled_executor_is_bounded() -> Result<()> {
     let entries = Arc::new(AtomicUsize::new(0));
 
     let register = |engine: &mut DurableEngine, entries: Arc<AtomicUsize>, tag: String| {
-        engine.register(&wf, move |ctx: DurableContext, _: ()| {
-            let entries = entries.clone();
-            let tag = tag.clone();
-            async move {
-                let first = entries.fetch_add(1, Ordering::SeqCst) == 0;
-                let k1 = format!("stall-s1-{tag}");
-                ctx.step("s1", || async {
-                    bump(step_runs(), &k1);
+        engine.register(
+            &wf,
+            workflow_fn(move |ctx, _: ()| {
+                let entries = entries.clone();
+                let tag = tag.clone();
+                Box::pin(async move {
+                    let first = entries.fetch_add(1, Ordering::SeqCst) == 0;
+                    let k1 = format!("stall-s1-{tag}");
+                    ctx.step("s1", |_| async {
+                        bump(step_runs(), &k1);
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
+                    if first {
+                        stall().await;
+                    }
+                    let k2 = format!("stall-s2-{tag}");
+                    ctx.step("s2", |_| async {
+                        bump(step_runs(), &k2);
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
                     Ok::<_, Error>(())
                 })
-                .await?;
-                if first {
-                    stall().await;
-                }
-                let k2 = format!("stall-s2-{tag}");
-                ctx.step("s2", || async {
-                    bump(step_runs(), &k2);
-                    Ok::<_, Error>(())
-                })
-                .await?;
-                Ok::<_, Error>(())
-            }
-        });
+            }),
+        );
     };
 
     // A runs s1 (checkpointed), then stalls mid-body — alive.

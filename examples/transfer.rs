@@ -79,7 +79,7 @@ async fn balance(ctx: &DurableContext, tx: &mut Tx<'_>, name: String) -> Result<
 }
 
 #[durare::workflow]
-async fn run_transfer(ctx: DurableContext, req: Transfer) -> Result<(i64, i64)> {
+async fn run_transfer(ctx: &DurableContext, req: Transfer) -> Result<(i64, i64)> {
     setup(&ctx).await?;
     transfer(&ctx, req.from.clone(), req.to.clone(), req.cents).await?;
     Ok((balance(&ctx, req.from).await?, balance(&ctx, req.to).await?))

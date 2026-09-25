@@ -10,7 +10,7 @@
 //! `long_running_workflow_survives_a_cutoff_after_its_creation` pins down.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, ListFilter, Result, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, ListFilter, Result, WorkflowOptions,
     WorkflowQueue,
 };
 use std::sync::Arc;
@@ -123,14 +123,24 @@ async fn assert_threshold_ranks_by_completion(engine: &DurableEngine) -> Result<
 #[tokio::test]
 async fn gc_deletes_terminal_history_and_spares_in_flight_work() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("done", |ctx: DurableContext, (): ()| async move {
-        ctx.set_event("k", "v").await?;
-        Ok::<_, Error>(())
-    });
-    engine.register("waiter", |ctx: DurableContext, (): ()| async move {
-        ctx.recv::<String>("go", Duration::from_secs(30)).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "done",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.set_event("k", "v").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.recv::<String>("go", Duration::from_secs(30)).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("gc-parked"));
     engine.launch().await?;
 
@@ -197,10 +207,15 @@ async fn sqlite_gc_rows_threshold_keeps_newest_and_cascades() -> Result<()> {
     let url = format!("sqlite://{}", path.display());
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("step-wf", |ctx: DurableContext, (): ()| async move {
-        ctx.step("record", || async { Ok::<_, Error>(1) }).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "step-wf",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.step("record", |_| async { Ok::<_, Error>(1) }).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.launch().await?;
 
     for n in 0..5 {
@@ -255,9 +270,10 @@ async fn sqlite_gc_more_restrictive_bound_wins() -> Result<()> {
     let url = format!("sqlite://{}", path.display());
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
 
     for n in 0..3 {
@@ -292,9 +308,10 @@ async fn sqlite_gc_more_restrictive_bound_wins() -> Result<()> {
 #[tokio::test]
 async fn gc_edge_cases() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.launch().await?;
     engine
         .start::<(), ()>("noop", (), WorkflowOptions::default())
@@ -329,10 +346,15 @@ async fn pg_gc_deletes_terminal_history_and_cascades() -> Result<()> {
     let (admin, url, dbname) = common::hermetic_pg_db(&base, "durare_gc").await;
 
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-    engine.register("step-wf", |ctx: DurableContext, (): ()| async move {
-        ctx.step("record", || async { Ok::<_, Error>(1) }).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "step-wf",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.step("record", |_| async { Ok::<_, Error>(1) }).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new("gc-parked"));
     engine.launch().await?;
 
@@ -441,13 +463,19 @@ async fn retention_policy_sweeps_automatically() -> Result<()> {
             .sweep_interval(Duration::from_millis(200)),
     );
     let mut engine = DurableEngine::with_config(Arc::new(InMemoryProvider::new()), config).await?;
-    engine.register("done", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
-    engine.register("waiter", |ctx: DurableContext, (): ()| async move {
-        ctx.recv::<String>("go", Duration::from_secs(30)).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "done",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.recv::<String>("go", Duration::from_secs(30)).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.launch().await?;
 
     engine

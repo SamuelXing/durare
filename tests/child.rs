@@ -3,7 +3,7 @@
 //! inherits the parent's identity.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions, STATUS_SUCCESS,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions, STATUS_SUCCESS,
 };
 use std::sync::Arc;
 
@@ -12,15 +12,21 @@ use std::sync::Arc;
 #[tokio::test]
 async fn child_workflow_runs_and_links_to_parent() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("triple", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 3)
-    });
-    engine.register("parent", |ctx: DurableContext, n: i64| async move {
-        let child = ctx
-            .start_workflow::<_, i64>("triple", n, WorkflowOptions::default())
-            .await?;
-        Ok::<_, Error>(child.result().await? + 1)
-    });
+    engine.register(
+        "triple",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 3) })),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                let child = ctx
+                    .start_workflow::<_, i64>("triple", n, WorkflowOptions::default())
+                    .await?;
+                Ok::<_, Error>(child.result().await? + 1)
+            })
+        }),
+    );
 
     let out: i64 = engine
         .start("parent", 7_i64, WorkflowOptions::with_id("p1"))
@@ -42,15 +48,25 @@ async fn child_workflow_runs_and_links_to_parent() -> Result<()> {
 #[tokio::test]
 async fn child_workflow_inherits_identity() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("whoami", |ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(ctx.authenticated_user().unwrap_or("-").to_string())
-    });
-    engine.register("delegator", |ctx: DurableContext, _: ()| async move {
-        let child = ctx
-            .start_workflow::<_, String>("whoami", (), WorkflowOptions::default())
-            .await?;
-        child.result().await
-    });
+    engine.register(
+        "whoami",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(
+                async move { Ok::<_, Error>(ctx.authenticated_user().unwrap_or("-").to_string()) },
+            )
+        }),
+    );
+    engine.register(
+        "delegator",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let child = ctx
+                    .start_workflow::<_, String>("whoami", (), WorkflowOptions::default())
+                    .await?;
+                child.result().await
+            })
+        }),
+    );
 
     let opts = WorkflowOptions::with_id("boss").authenticated_user("alice");
     let handle = engine.start::<_, String>("delegator", (), opts).await?;
@@ -70,18 +86,24 @@ async fn child_workflow_inherits_identity() -> Result<()> {
 #[tokio::test]
 async fn workflow_steps_introspection_in_memory() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("kid", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("worker", |ctx: DurableContext, _: ()| async move {
-        let v = ctx
-            .step("compute", || async { Ok::<_, Error>(7_i64) })
-            .await?;
-        let child = ctx
-            .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
-            .await?;
-        child.result().await
-    });
+    engine.register(
+        "kid",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "worker",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let v = ctx
+                    .step("compute", |_| async { Ok::<_, Error>(7_i64) })
+                    .await?;
+                let child = ctx
+                    .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
+                    .await?;
+                child.result().await
+            })
+        }),
+    );
 
     engine
         .start::<_, i64>("worker", (), WorkflowOptions::with_id("w"))
@@ -119,17 +141,23 @@ async fn child_workflow_can_be_queued() -> Result<()> {
     use std::time::Duration;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("square", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * n)
-    });
-    engine.register("fan_out", |ctx: DurableContext, n: i64| async move {
-        let opts = WorkflowOptions {
-            queue: Some("kids".to_string()),
-            ..Default::default()
-        };
-        let child = ctx.start_workflow::<_, i64>("square", n, opts).await?;
-        child.result().await
-    });
+    engine.register(
+        "square",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * n) })),
+    );
+    engine.register(
+        "fan_out",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                let opts = WorkflowOptions {
+                    queue: Some("kids".to_string()),
+                    ..Default::default()
+                };
+                let child = ctx.start_workflow::<_, i64>("square", n, opts).await?;
+                child.result().await
+            })
+        }),
+    );
     engine.register_queue(
         WorkflowQueue::new("kids").base_polling_interval(Duration::from_millis(10)),
     );
@@ -159,17 +187,23 @@ async fn child_workflow_can_be_queued() -> Result<()> {
 #[tokio::test]
 async fn empty_workflow_id_is_regenerated() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("parent", |ctx: DurableContext, n: i64| async move {
-        // A child started with an explicit empty id must get the deterministic
-        // `{parent}-{seq}` id, not an empty one.
-        let child = ctx
-            .start_workflow::<_, i64>("noop", n, WorkflowOptions::with_id(""))
-            .await?;
-        child.result().await
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                // A child started with an explicit empty id must get the deterministic
+                // `{parent}-{seq}` id, not an empty one.
+                let child = ctx
+                    .start_workflow::<_, i64>("noop", n, WorkflowOptions::with_id(""))
+                    .await?;
+                child.result().await
+            })
+        }),
+    );
 
     // Top-level: an empty id regenerates a fresh, non-empty id.
     let handle = engine
