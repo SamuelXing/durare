@@ -168,3 +168,27 @@ jobs:
             echo "expected the 'at least one SQL backend' compile_error!; got a different result" >&2
             exit 1
           fi
+
+  semver:
+    name: semver (vs crates.io)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # TEMPORARY — remove once tinyvec 1.13.0 is yanked or 1.13.1 ships.
+      # See the note above the `jobs:` key.
+      - name: pin tinyvec (tinyvec#225)
+        run: cargo update -p tinyvec --precise 1.12.0
+      # Diff the public API against the latest `durare` release on crates.io and
+      # fail if the change is larger than the version bump admits: on 0.x a
+      # breaking change needs a minor bump, an additive one a patch bump. Nothing
+      # is published here; the job only holds `Cargo.toml` to the API it ships.
+      # `durare` alone — the proc-macro crate has no item surface to diff — on
+      # the default features, since that is what a plain dependency resolves to.
+      - name: cargo semver-checks
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          package: durare
+          feature-group: default-features
+          rust-toolchain: manual

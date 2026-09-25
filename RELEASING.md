@@ -49,6 +49,7 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings      # also enforces #![warn(missing_docs)]
 cargo test                                      # in-memory + sqlite; Postgres if DATABASE_URL is set
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo semver-checks check-release -p durare     # public API vs the crates.io release; needs `cargo install cargo-semver-checks`
 
 # Inspect exactly what will ship — no internal docs, CI config, or planning files:
 cargo package --list -p durare | grep -E '^\.github/|^\.cargo/|API_REVIEW|ROADMAP|PARITY' \
