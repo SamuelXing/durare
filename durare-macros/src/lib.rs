@@ -353,7 +353,7 @@ pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#attrs)*
         #vis #sig {
-            #ctx_ident.step(#name, move || async move #block)
+            #ctx_ident.step(#name, move |_step| async move #block)
         }
     };
 

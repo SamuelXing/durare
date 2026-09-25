@@ -255,7 +255,14 @@ impl AuthContext {
 /// All durable operations a workflow performs go through this context:
 /// [`DurableContext::step`] / [`DurableContext::step_with`] for checkpointed work
 /// and [`DurableContext::sleep`] for durable timers.
-#[derive(Clone)]
+///
+/// A context is a **borrowed capability**: the engine owns it for the run and
+/// lends it to the workflow body as `&DurableContext`. It is deliberately not
+/// `Clone`, and every durable call borrows it for as long as the call lives, so
+/// durable work cannot be moved into a `tokio::spawn`ed task — a task the
+/// engine could not replay in order. Concurrency *within* the body is
+/// ordinary: `tokio::join!` over several calls, helpers taking
+/// `&DurableContext`, and child workflows all work as written.
 pub struct DurableContext {
     workflow_id: String,
     provider: Arc<dyn StateProvider>,
@@ -265,11 +272,11 @@ pub struct DurableContext {
     // Monotonic step index. Because the workflow's control flow is
     // deterministic, the same code path yields the same seq on every replay,
     // which is how we match a step call to its stored checkpoint.
-    seq: Arc<AtomicI32>,
+    seq: AtomicI32,
     // Set while a transaction body is running (shared across context clones, so a
     // clone captured inside a body sees it). Guards against nesting a transaction
     // inside another — which would deadlock on the outer's write lock.
-    in_transaction: Arc<AtomicBool>,
+    in_transaction: AtomicBool,
     // `Some` in a replay verification run (`DurableEngine::verify_replay`): the
     // run serves recorded outcomes, refuses to execute anything live, and books
     // what it saw here.
@@ -290,8 +297,8 @@ impl DurableContext {
             provider: runtime.provider().clone(),
             runtime,
             auth,
-            seq: Arc::new(AtomicI32::new(0)),
-            in_transaction: Arc::new(AtomicBool::new(false)),
+            seq: AtomicI32::new(0),
+            in_transaction: AtomicBool::new(false),
             verify: None,
         }
     }
@@ -728,7 +735,7 @@ impl DurableContext {
     /// # use durare::{DurableContext, Error, Result};
     /// # async fn demo(ctx: DurableContext) -> Result<()> {
     /// let charge_id = ctx
-    ///     .step("charge_card", || async {
+    ///     .step("charge_card", |_step| async {
     ///         // Any side effect: an HTTP call, an email, a write to another system.
     ///         Ok::<_, Error>("ch_123".to_string())
     ///     })
@@ -738,8 +745,9 @@ impl DurableContext {
     /// # }
     /// ```
     ///
-    /// `f` is `FnOnce`: it is invoked at most once per call. For automatic
-    /// retries, use [`step_with`](Self::step_with).
+    /// `f` is `FnOnce`: it is invoked at most once per call, and receives a
+    /// [`StepCtx`] describing the attempt. For automatic retries, use
+    /// [`step_with`](Self::step_with).
     ///
     /// # Errors
     ///
@@ -751,7 +759,7 @@ impl DurableContext {
     pub fn step<'a, T, F, Fut>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
-        F: FnOnce() -> Fut + Send + 'a,
+        F: FnOnce(StepCtx) -> Fut + Send + 'a,
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let position = claim!(self, "step");
@@ -764,7 +772,7 @@ impl DurableContext {
                     return Ok(stored);
                 }
                 let started = chrono::Utc::now().timestamp_millis();
-                match run_step_catching(&name, in_body(f)).await {
+                match run_step_catching(&name, in_body(|| f(StepCtx::new(seq, 0, 1)))).await {
                     Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
                 }
@@ -792,7 +800,10 @@ impl DurableContext {
     /// let quote = ctx
     ///     .step_with(
     ///         StepOptions::new("fetch_quote").max_retries(5),
-    ///         || async { fetch_quote().await },
+    ///         |step| async move {
+    ///             tracing::debug!(attempt = step.attempt, "fetching quote");
+    ///             fetch_quote().await
+    ///         },
     ///     )
     ///     .await?;
     /// # let _ = quote;
@@ -810,7 +821,7 @@ impl DurableContext {
     pub fn step_with<'a, T, F, Fut>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
-        F: FnMut() -> Fut + Send + 'a,
+        F: FnMut(StepCtx) -> Fut + Send + 'a,
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let position = claim!(self, "step");
@@ -824,7 +835,7 @@ impl DurableContext {
                 // Run with retries; only the final result/error is observed, then
                 // checkpointed — a success as its output, a failure as its error.
                 let started = chrono::Utc::now().timestamp_millis();
-                match self.run_with_retries(&opts, &mut f).await {
+                match self.run_with_retries(seq, &opts, &mut f).await {
                     Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
                 }
@@ -1751,14 +1762,21 @@ impl DurableContext {
 
     /// Drive `f` to success, retrying on error per `opts` with exponential
     /// backoff. Returns the last error if all attempts are exhausted.
-    async fn run_with_retries<T, F, Fut>(&self, opts: &StepOptions, f: &mut F) -> Result<T>
+    async fn run_with_retries<T, F, Fut>(
+        &self,
+        seq: i32,
+        opts: &StepOptions,
+        f: &mut F,
+    ) -> Result<T>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(StepCtx) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         let mut attempt: u32 = 0;
+        let max_attempts = opts.max_retries + 1;
         loop {
-            match run_step_catching(&opts.name, in_body(&mut *f)).await {
+            let step = StepCtx::new(seq, attempt, max_attempts);
+            match run_step_catching(&opts.name, in_body(|| f(step))).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,
@@ -2563,6 +2581,43 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
             "step `{name}` panicked: {}",
             panic_message(&*payload)
         ))),
+    }
+}
+
+/// What a step body is told about the attempt it is running as.
+///
+/// Handed by value to the closure passed to [`DurableContext::step`] and
+/// [`DurableContext::step_with`], one per attempt. It is small and `Clone`, and
+/// it deliberately carries **no** durable capability: a step body cannot start
+/// nested steps, child workflows, or transactions through it, which is what
+/// keeps a step a leaf of the workflow.
+#[derive(Clone, Debug)]
+pub struct StepCtx {
+    /// The position this step occupies in the workflow.
+    pub step_id: i32,
+    /// Which attempt this is, counting from zero.
+    pub attempt: u32,
+    /// How many attempts the step's retry policy allows in total.
+    pub max_attempts: u32,
+    /// Signalled when the workflow is cancelled or its deadline elapses, so a
+    /// long-running body can bail out early. Stubbed: the current engine
+    /// checks cancellation between attempts, not within them.
+    pub cancelled: tokio_util::sync::CancellationToken,
+}
+
+impl StepCtx {
+    fn new(step_id: i32, attempt: u32, max_attempts: u32) -> Self {
+        Self {
+            step_id,
+            attempt,
+            max_attempts,
+            cancelled: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    /// Whether the retry policy has another attempt after this one.
+    pub fn is_last_attempt(&self) -> bool {
+        self.attempt + 1 >= self.max_attempts
     }
 }
 

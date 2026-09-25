@@ -207,7 +207,7 @@ pub use client::Client;
 #[cfg(feature = "conductor")]
 #[cfg_attr(docsrs, doc(cfg(feature = "conductor")))]
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
-pub use context::{AuthContext, DurableContext, PendingStep, RetryPredicate, StepOptions};
+pub use context::{AuthContext, DurableContext, PendingStep, RetryPredicate, StepCtx, StepOptions};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub use datasource::DataSource;
 #[cfg(feature = "postgres")]
@@ -221,9 +221,9 @@ pub use debounce::{Debouncer, DebouncerClient};
 #[doc(hidden)]
 pub use engine::WorkflowResult;
 pub use engine::{
-    erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, EngineMetrics,
-    HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef, WorkflowFn,
-    WorkflowOptions, WorkflowRegistration,
+    erase, BoxFuture, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig,
+    EngineMetrics, HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef,
+    WorkflowFn, WorkflowHandler, WorkflowOptions, WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by
