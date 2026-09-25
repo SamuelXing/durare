@@ -51,13 +51,29 @@ fn current_body() -> Option<BodyMarker> {
     CURRENT_BODY.try_with(|marker| *marker).ok()
 }
 
-/// Runs a durable body under a fresh marker.
+/// Runs a durable body under a fresh marker: the closure's own work *and* the
+/// future it returns.
 ///
-/// Wraps only the user's future. The operation's own machinery — the replay
-/// lookup, the checkpoint write — stays outside, so an operation never trips
-/// its own check.
-async fn in_body<F: Future>(body: F) -> F::Output {
-    CURRENT_BODY.scope(BodyMarker::fresh(), body).await
+/// **Not an `async fn`.** A closure does its synchronous work where it is
+/// *called*, not where the future it returns is polled, so a body written
+/// `|| { let p = ctx.step(..); async move { p.await } }` reaches `ctx.step`
+/// before anything is awaited. Calling the closure inside a synchronous scope
+/// here is what puts that work inside the body too; an `async fn` would enter
+/// the scope one step too late and let the call through.
+///
+/// Both halves share one marker, so the body is a single scope however it is
+/// written. The operation's own machinery — the replay lookup, the checkpoint
+/// write — stays outside it, so an operation never trips its own check.
+fn in_body<F, Fut>(body: F) -> impl Future<Output = Fut::Output>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future,
+{
+    let marker = BodyMarker::fresh();
+    // `sync_scope` restores the previous value on the way out, including when
+    // the closure panics, so a body that fails synchronously leaves nothing set.
+    let running = CURRENT_BODY.sync_scope(marker, body);
+    CURRENT_BODY.scope(marker, running)
 }
 
 /// Predicate deciding whether a step error is retryable — see
@@ -564,7 +580,7 @@ impl DurableContext {
                     return Ok(stored);
                 }
                 let started = chrono::Utc::now().timestamp_millis();
-                match run_step_catching(&name, f()).await {
+                match run_step_catching(&name, f).await {
                     Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
                 }
@@ -739,9 +755,15 @@ impl DurableContext {
             // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
             // a future that we move in, so the wrapper stays `Fn` (re-runnable).
             let body: TxBody = Box::new(move |tx| {
-                let fut = f(tx);
+                // `in_body`'s two phases, written out: its `impl Future` return
+                // would capture this closure's lifetime, and the future has to
+                // outlive the closure to be boxed. The marker is the same one
+                // across both, so `f`'s own work and the future it returns are
+                // one body.
+                let marker = BodyMarker::fresh();
+                let running = CURRENT_BODY.sync_scope(marker, || f(tx));
                 Box::pin(async move {
-                    let out = fut.await?;
+                    let out = CURRENT_BODY.scope(marker, running).await?;
                     Ok::<_, Error>(serde_json::to_value(out)?)
                 })
             });
@@ -1068,7 +1090,7 @@ impl DurableContext {
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
-        match in_body(f(&mut *tx)).await {
+        match in_body(|| f(&mut *tx)).await {
             Ok(v) => {
                 let value = serde_json::to_value(v)?;
                 // A body that ended our transaction via raw SQL would make the
@@ -1245,7 +1267,7 @@ impl DurableContext {
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
-        match in_body(f(&mut *tx)).await {
+        match in_body(|| f(&mut *tx)).await {
             Ok(v) => {
                 let value = serde_json::to_value(v)?;
                 // Ending our transaction via raw SQL would split the writes
@@ -1430,14 +1452,16 @@ impl DurableContext {
             // Poll the branches in index order on this one task; the first ready wins
             // (lowest index on a tie). The losers are dropped — and so cancelled —
             // when `branches` goes out of scope.
-            let (index, value) = in_body(poll_fn(|cx| {
-                for (i, branch) in branches.iter_mut().enumerate() {
-                    if let Poll::Ready(value) = branch.as_mut().poll(cx) {
-                        return Poll::Ready((i, value));
+            let (index, value) = in_body(|| {
+                poll_fn(|cx| {
+                    for (i, branch) in branches.iter_mut().enumerate() {
+                        if let Poll::Ready(value) = branch.as_mut().poll(cx) {
+                            return Poll::Ready((i, value));
+                        }
                     }
-                }
-                Poll::Pending
-            }))
+                    Poll::Pending
+                })
+            })
             .await;
 
             self.checkpoint(seq, "DBOS.select", (index, value), Some(started))
@@ -1552,7 +1576,7 @@ impl DurableContext {
     {
         let mut attempt: u32 = 0;
         loop {
-            match run_step_catching(&opts.name, f()).await {
+            match run_step_catching(&opts.name, &mut *f).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,
@@ -2404,8 +2428,12 @@ fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
 /// it flows through the normal failure path — retry (per [`StepOptions`]), then
 /// checkpoint the failure — instead of unwinding the whole workflow. A step that
 /// panics is treated as a failed step, subject to its retry policy.
-async fn run_step_catching<T>(name: &str, fut: impl Future<Output = Result<T>>) -> Result<T> {
-    match AssertUnwindSafe(in_body(fut)).catch_unwind().await {
+async fn run_step_catching<T, F, Fut>(name: &str, body: F) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    match AssertUnwindSafe(in_body(body)).catch_unwind().await {
         Ok(result) => result,
         Err(payload) => Err(Error::app(format!(
             "step `{name}` panicked: {}",

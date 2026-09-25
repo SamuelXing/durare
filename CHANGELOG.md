@@ -26,6 +26,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   documentation asked callers to keep this rule themselves and nothing checked
   it; a step inside a step silently shifted every later position.
 
+  A body is the closure's own work *and* the future it returns. A closure does
+  its work where it is called, so `|| { let p = ctx.step(..); async move { .. } }`
+  reaches `ctx.step` before anything is awaited; the scope is entered around the
+  call itself, not only around the future, and covers `transaction` bodies as
+  well as steps, `select` branches and `transaction_on`.
+
   The check is a task-local scope around the body's poll, not a flag held for
   the body's lifetime: a lifetime flag cannot tell a body that is *running* from
   one that is merely *in flight*, and would refuse a sibling call the workflow

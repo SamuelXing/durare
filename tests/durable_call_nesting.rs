@@ -40,8 +40,8 @@
 //! [`select`]: durare::DurableContext::select
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, StateProvider,
-    WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
+    params, DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result,
+    SqliteProvider, StateProvider, WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -377,5 +377,83 @@ async fn a_body_that_errors_or_panics_leaves_the_scope_clean() -> Result<()> {
         ],
         "a failed body records its failure and the next call proceeds normally"
     );
+    Ok(())
+}
+
+/// A closure does its own work where it is **called**, not where the future it
+/// returns is polled. A body written this way reaches `ctx.step` before anything
+/// is awaited, so a scope entered only around the returned future would let the
+/// inner call through: it claims a position, and the outer step's body does not
+/// run on a replay to claim it again.
+///
+/// This is the shape the official SDK documents as "the closure runs where the
+/// attempt does". Building the call and dropping it is enough to move the
+/// counter, and nothing reports that — which is why the assertion here is the
+/// position of the call that follows.
+#[tokio::test]
+async fn a_call_created_by_the_closure_before_its_future_is_refused() -> Result<()> {
+    let recorded = positions(|ctx| async move {
+        ctx.step("outer", {
+            let inner = ctx.clone();
+            move || {
+                // Runs at the call, before anything below is polled.
+                drop(inner.step("hidden", || async { Ok::<_, Error>(1_i64) }));
+                async { Ok::<_, Error>(0_i64) }
+            }
+        })
+        .await?;
+        ctx.step("after", || async { Ok::<_, Error>(2_i64) }).await
+    })
+    .await?;
+
+    assert_eq!(
+        recorded,
+        [(0, "outer".to_string()), (1, "after".to_string())],
+        "`hidden` was refused before it claimed anything, so `after` takes the \
+         position behind `outer` rather than the one after it"
+    );
+    Ok(())
+}
+
+/// The same rule inside a plain `transaction` body, which the provider runs
+/// rather than the workflow awaiting it in place.
+///
+/// Transactions need a SQL backend, so this one runs on SQLite. The closure's
+/// own work and the future it returns share one scope, so a call built in either
+/// half is refused and the counter does not move.
+#[tokio::test]
+async fn a_call_created_in_a_transaction_body_is_refused() -> Result<()> {
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-nesting-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    engine.register(WORKFLOW, |ctx: DurableContext, _: ()| async move {
+        let inner = ctx.clone();
+        ctx.transaction("tx", move |tx| {
+            drop(inner.step("hidden", || async { Ok::<_, Error>(1_i64) }));
+            Box::pin(async move {
+                tx.execute("SELECT 1", &params![]).await?;
+                Ok(0_i64)
+            })
+        })
+        .await?;
+        ctx.step("after", || async { Ok::<_, Error>(2_i64) }).await
+    });
+    engine
+        .start::<_, i64>(WORKFLOW, (), WorkflowOptions::with_id(ID))
+        .await?
+        .result()
+        .await?;
+
+    assert_eq!(
+        recorded(&engine).await?,
+        [(0, "tx".to_string()), (1, "after".to_string())],
+        "the call built inside the transaction body claimed no position"
+    );
+    drop(engine);
+    for ext in ["", "-wal", "-shm"] {
+        std::fs::remove_file(format!("{}{ext}", path.display())).ok();
+    }
     Ok(())
 }
