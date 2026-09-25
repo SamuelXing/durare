@@ -201,7 +201,7 @@ pub use client::Client;
 #[cfg(feature = "conductor")]
 #[cfg_attr(docsrs, doc(cfg(feature = "conductor")))]
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
-pub use context::{AuthContext, DurableContext, RetryPredicate, StepOptions};
+pub use context::{AuthContext, DurableContext, PendingStep, RetryPredicate, StepOptions};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub use datasource::DataSource;
 #[cfg(feature = "postgres")]

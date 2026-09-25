@@ -34,7 +34,9 @@
 //! | `Utc::now()`, `SystemTime::now()`, `Instant::now()` | a later run reads a different time | [`ctx.now()`](DurableContext::now) |
 //! | `Uuid::new_v4()`, `rand::random()` | a later run draws a different value | [`ctx.uuid()`](DurableContext::uuid) / [`ctx.random()`](DurableContext::random) |
 //! | iterating a `HashMap` / `HashSet` | order is randomized per map, so a loop issues its steps in a different order | a `BTreeMap` / `BTreeSet`, or sort the keys first |
-//! | `tokio::spawn`, task races, threads | interleaving is not reproducible, so which step runs first changes | keep the body sequential; run steps concurrently with `join!` / `try_join!` (each step's position is fixed when it is created, so a join is deterministic) |
+//! | `tokio::spawn` of durable work | a position is claimed where the call is **written**, but a spawned task writes its calls into the same counter from another task, so a replay interleaves them differently | keep durable calls on the workflow's own task; run them concurrently with `join!` / `try_join!`, which is deterministic because positions follow the source |
+//! | `tokio::select!` over durable calls | positions are fine — every branch is built before any is polled — but only the winner runs, and which one wins turns on real timing, so a replay can pick a different branch and leave the loser's position with nothing recorded at it | race plain async work with [`ctx.select`](DurableContext::select), which records the winner, or give each branch a child workflow |
+//! | `FuturesUnordered`, `buffer_unordered`, any "handle them as they finish" loop | the first run observes real I/O latencies; a replay serves every step from its checkpoint at once, so the completion order — and anything derived from it, including which durable call is reached next — differs | collect with `join!` / `try_join!` and process in a fixed order, or give each branch a child workflow |
 //! | reading env vars, config, files, or the network | the value can differ between runs | read it inside a [step](DurableContext::step) |
 //! | side effects in `Drop` | drop timing and order are not part of the recorded log | put the effect in a step |
 //!
@@ -56,11 +58,12 @@
 //! # }
 //! ```
 //!
-//! One rule the engine enforces up front rather than after the fact: a [durable
+//! One rule you have to keep yourself: a [durable
 //! select](DurableContext::select) must not open durable operations inside its
-//! branches — the losing branch would advance the sequence counter with no
-//! recorded outcome to match. A durable op inside a select is a descriptive
-//! runtime error, not silent corruption.
+//! branches. The whole race is checkpointed as one operation, so a losing branch
+//! advances the sequence counter with no recorded outcome to match, and nothing
+//! checks for it at the call — the divergence surfaces later, as an
+//! [`Error::UnexpectedStep`] on some unrelated step, or not at all.
 //!
 //! # Durable-safe data
 //!
