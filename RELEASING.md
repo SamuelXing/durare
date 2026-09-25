@@ -2,7 +2,7 @@
 
 `durare` is a two-crate workspace: the proc-macro crate **`durare-macros`** and
 the library **`durare`**, which depends on it via a caret requirement
-(`version = "0.1"`). The two are **versioned independently** — each release
+(`version = "0.2"`). The two are **versioned independently** — each release
 bumps and publishes only the crate(s) that actually changed (the
 tokio / tokio-macros model). A docs-only or library-only release touches
 `durare` alone; `durare-macros` keeps its version and is not republished, and
@@ -30,8 +30,8 @@ Bump `[package] version` in the manifest of each crate that changed:
 - `durare-macros/Cargo.toml` for a `durare-macros` (proc-macro) change
 
 Leave the caret dependency `durare-macros = { path = "durare-macros", version =
-"0.1" }` alone unless a new library release *requires* a newer macro version —
-the caret already admits any `0.1.x`. Keep `rust-version` (MSRV) accurate in the
+"0.2" }` alone unless a new library release *requires* a newer macro version —
+the caret already admits any `0.2.x`. Keep `rust-version` (MSRV) accurate in the
 touched manifests if the floor moved; CI has a job pinned to it.
 
 ### 2. Update the changelog
