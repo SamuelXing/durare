@@ -109,9 +109,9 @@ fn now_ms() -> i64 {
 
 /// The internal debouncer workflow: collect pushed-back inputs until the delay
 /// elapses with no new input, then start the target once with the latest input.
-pub(crate) async fn internal_debouncer(ctx: DurableContext, input: DebouncerInput) -> Result<()> {
+pub(crate) async fn internal_debouncer(ctx: &DurableContext, input: DebouncerInput) -> Result<()> {
     let start = ctx
-        .step("DBOS.debounce.startTime", || async {
+        .step("DBOS.debounce.startTime", |_| async {
             Ok::<_, Error>(now_ms())
         })
         .await?;
@@ -128,7 +128,7 @@ pub(crate) async fn internal_debouncer(ctx: DurableContext, input: DebouncerInpu
 
     loop {
         let now = ctx
-            .step("DBOS.debounce.loopTime", || async {
+            .step("DBOS.debounce.loopTime", |_| async {
                 Ok::<_, Error>(now_ms())
             })
             .await?;
