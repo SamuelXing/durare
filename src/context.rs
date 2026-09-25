@@ -199,13 +199,26 @@ impl DurableContext {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// What both nesting checks report.
+    const NESTED_TRANSACTION: &'static str =
+        "cannot start a transaction inside another transaction";
+
+    /// The nesting rule on its own, leaving the flag alone. A transaction that
+    /// cannot run must not move the counter, so this is what a call checks
+    /// before claiming its position; [`begin_transaction`](Self::begin_transaction)
+    /// then takes the flag when the call is actually polled.
+    fn check_outside_transaction(&self) -> Result<()> {
+        if self.in_transaction.load(Ordering::SeqCst) {
+            return Err(Error::app(Self::NESTED_TRANSACTION));
+        }
+        Ok(())
+    }
+
     /// Set the in-transaction flag, refusing a nested transaction (it would
     /// deadlock on the outer's write lock). The guard clears the flag on drop.
     fn begin_transaction(&self) -> Result<TxFlagGuard<'_>> {
         if self.in_transaction.swap(true, Ordering::SeqCst) {
-            return Err(Error::app(
-                "cannot start a transaction inside another transaction",
-            ));
+            return Err(Error::app(Self::NESTED_TRANSACTION));
         }
         Ok(TxFlagGuard(&self.in_transaction))
     }
@@ -637,6 +650,13 @@ impl DurableContext {
             + Sync
             + 'static,
     {
+        // Refused before the position is claimed, so a transaction that cannot
+        // run moves no counter. Only the check happens here: taking the flag at
+        // construction would refuse two transactions built together and awaited
+        // one after the other, which is ordinary code under this rule.
+        if let Err(e) = self.check_outside_transaction() {
+            return PendingStep::new(async move { Err(e) });
+        }
         let seq = self.next_seq();
         let span = self.op_span("transaction", &opts.name, seq);
         PendingStep::new(async move {

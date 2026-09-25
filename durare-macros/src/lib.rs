@@ -7,7 +7,9 @@
 //!   type-checked reference rather than a string.
 //! - [`macro@step`] wraps an async fn's body in a durable
 //!   `ctx.step(...)` checkpoint, so a step reads like an ordinary `async fn`
-//!   call — no closure, no `Box::pin`, no `Ok::<_, Error>` annotation.
+//!   call — no closure, no `Box::pin`, no `Ok::<_, Error>` annotation. The fn it
+//!   emits returns a `durare::PendingStep`, so the call claims its position
+//!   where it is written, like every durable call written by hand.
 //! - [`macro@transaction`] does the same for `ctx.transaction(...)`: the body's
 //!   SQL writes and the checkpoint commit together, without the
 //!   `|tx| Box::pin(async move { ... })` wrapper.
@@ -16,7 +18,9 @@ use heck::ToUpperCamelCase;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, FnArg, Ident, ItemFn, LitStr, ReturnType, Token};
+use syn::{
+    parse_macro_input, parse_quote, FnArg, Ident, ItemFn, LitStr, ReturnType, Signature, Token,
+};
 
 /// Parsed `#[workflow(...)]` arguments. Supports a bare name literal
 /// (`#[workflow("orders.process")]`) and/or keyed args
@@ -156,6 +160,29 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Rewrite a durable fn's signature so the call claims its position where it is
+/// written: a plain `fn` returning a `durare::PendingStep`, not an `async fn`
+/// whose body — and so whose position — waits for the first poll.
+///
+/// The `Ok` type is projected at the type level rather than parsed out of the
+/// return type's tokens, so any `Result` alias works, as in [`macro@workflow`].
+/// The returned lifetime is elided to the fn's one input lifetime, which is the
+/// context's, so the context must be the only reference the fn takes.
+fn pending_signature(sig: &Signature, macro_name: &str) -> syn::Result<Signature> {
+    let ReturnType::Type(_, ret) = &sig.output else {
+        return Err(syn::Error::new_spanned(
+            sig,
+            format!("a `#[{macro_name}]` fn must return `Result<T>`"),
+        ));
+    };
+    let mut pending = sig.clone();
+    pending.asyncness = None;
+    pending.output = parse_quote! {
+        -> durare::PendingStep<'_, <#ret as durare::WorkflowResult>::Ok>
+    };
+    Ok(pending)
+}
+
 /// Parsed `#[step(...)]` arguments: an optional name override — a bare literal
 /// (`#[step("charge")]`) or `name = "..."` — defaulting to the function name.
 struct StepArgs {
@@ -208,6 +235,15 @@ impl Parse for StepArgs {
 /// or `#[step(name = "...")]`. The first parameter is the context the step
 /// checkpoints into (usually `ctx: &DurableContext`); the rest are the step's
 /// arguments.
+///
+/// What it emits is a plain `fn` returning a
+/// `durare::PendingStep` rather than an `async fn`, so the call
+/// claims its step position where it is written and not where it is first
+/// polled — the rule every durable call on a `DurableContext` follows. Calls
+/// still read as `charge(&ctx, 1299).await?`; what changes is that building one
+/// and never awaiting it spends the position anyway, which `#[must_use]` warns
+/// about. The context must be the fn's only reference parameter, since the
+/// `PendingStep` borrows it.
 #[proc_macro_attribute]
 pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -240,13 +276,16 @@ pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let attrs = &func.attrs;
     let vis = &func.vis;
-    let sig = &func.sig;
     let block = &func.block;
+    let sig = match pending_signature(&func.sig, "step") {
+        Ok(sig) => sig,
+        Err(e) => return e.to_compile_error().into(),
+    };
 
     let expanded = quote! {
         #(#attrs)*
         #vis #sig {
-            #ctx_ident.step(#name, || async move #block).await
+            #ctx_ident.step(#name, move || async move #block)
         }
     };
 
@@ -318,6 +357,11 @@ fn param_ident(arg: &FnArg) -> Option<&Ident> {
 /// serialization conflict, its body runs more than once, so each argument is
 /// re-`clone`d per attempt — arguments must be [`Clone`]. The step name defaults
 /// to the fn name; override with `#[transaction("name")]`.
+///
+/// Like [`macro@step`], what it emits is a plain `fn` returning a
+/// `durare::PendingStep`, so the transaction claims its position
+/// where it is written; the context must be the fn's only reference parameter
+/// once `tx` is dropped from the signature.
 #[proc_macro_attribute]
 pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
@@ -385,6 +429,10 @@ pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let block = &func.block;
+    let sig = match pending_signature(&sig, "transaction") {
+        Ok(sig) => sig,
+        Err(e) => return e.to_compile_error().into(),
+    };
 
     let expanded = quote! {
         #(#attrs)*
@@ -393,7 +441,7 @@ pub fn transaction(attr: TokenStream, item: TokenStream) -> TokenStream {
             #ctx_ident.transaction(#name, move |#tx_ident| {
                 #( let #arg_idents = #arg_idents.clone(); )*
                 ::std::boxed::Box::pin(async move #block)
-            }).await
+            })
         }
 
         // The `tx` parameter is dropped from the signature above (the runtime

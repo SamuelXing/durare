@@ -153,3 +153,94 @@ async fn a_built_call_that_is_dropped_has_spent_its_position() -> Result<()> {
     );
     Ok(())
 }
+
+#[durare::step]
+async fn macro_first(ctx: &DurableContext, n: i64) -> Result<i64> {
+    Ok(n + 1)
+}
+
+#[durare::step]
+async fn macro_second(ctx: &DurableContext, n: i64) -> Result<i64> {
+    Ok(n + 2)
+}
+
+/// `#[durare::step]` emits a `PendingStep`-returning `fn` rather than an
+/// `async fn`, so a macro-written call obeys the same rule as one written by
+/// hand — the macros are the preferred way to write a step, and an exception
+/// there would be an exception for most code.
+#[tokio::test]
+async fn a_macro_written_call_claims_its_position_where_it_is_written() -> Result<()> {
+    let seen = positions(|ctx| async move {
+        let first = macro_first(&ctx, 1);
+        let second = macro_second(&ctx, 2);
+        // Awaited back to front, as in the hand-written case above.
+        second.await?;
+        first.await?;
+        Ok(0)
+    })
+    .await?;
+    assert_eq!(seen, ["macro_first", "macro_second"]);
+    Ok(())
+}
+
+/// A transaction that is refused for nesting never runs, so it must leave the
+/// counter where it found it: the call that follows takes the next position,
+/// not the one after a hole.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_refused_nested_transaction_leaves_the_counter_alone() -> Result<()> {
+    use durare::SqliteProvider;
+    use std::time::Duration;
+
+    let path = std::env::temp_dir().join(format!("durare-nested-seq-{}.db", uuid::Uuid::new_v4()));
+    let provider =
+        Arc::new(SqliteProvider::connect(&format!("sqlite://{}", path.display())).await?);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("probe", |ctx: DurableContext, _: ()| async move {
+        let nested_ctx = ctx.clone();
+        ctx.transaction::<(), _>("outer", move |_tx| {
+            let nested_ctx = nested_ctx.clone();
+            Box::pin(async move {
+                let refused = nested_ctx
+                    .transaction::<(), _>("inner", |_tx| Box::pin(async { Ok(()) }))
+                    .await
+                    .expect_err("a transaction inside a transaction is refused");
+                assert!(
+                    refused.to_string().contains("inside another transaction"),
+                    "{refused}"
+                );
+                Ok(())
+            })
+        })
+        .await?;
+        ctx.step("after", || async { Ok::<_, Error>(1_i64) })
+            .await?;
+        Ok::<_, Error>(0_i64)
+    });
+    engine.launch().await?;
+    engine
+        .start::<_, i64>("probe", (), WorkflowOptions::with_id("wf"))
+        .await?
+        .result()
+        .await?;
+
+    let name_at = |seq: i32| {
+        let provider = provider.clone();
+        async move {
+            provider
+                .get_step_result("wf", seq)
+                .await
+                .map(|r| r.map(|r| r.name))
+        }
+    };
+    assert_eq!(name_at(0).await?, Some("outer".to_string()));
+    assert_eq!(
+        name_at(1).await?,
+        Some("after".to_string()),
+        "the refused nested transaction must not have spent position 1"
+    );
+
+    engine.shutdown(Duration::from_secs(1)).await?;
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}

@@ -14,7 +14,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `uuid`, `random`, `set_workflow_attributes`, `start_workflow`, `select`,
   `transaction` and `transaction_with` are plain `fn`s returning a
   `PendingStep`, which is a `Future` — so `ctx.step(..).await?` reads exactly as
-  it did and no call site changes.
+  it did and no call site changes. `#[durare::step]` and
+  `#[durare::transaction]` emit such a `fn` rather than an `async fn`, so a
+  macro-written call follows the same rule; the context must be the only
+  reference the annotated fn takes.
 
   A position is the `(workflow_id, seq)` key a checkpoint is written under, and
   a replay finds a recorded result only by asking for the position the first run
@@ -35,6 +38,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claimed only if a database read says so, and `ctx.transaction_on` /
   `transaction_on_with`, whose `AsyncFn` body cannot be required to return a
   `Send` future on stable Rust (`async_fn_traits`).
+
+  **Upgrading renumbers work already in flight.** A workflow whose durable calls
+  were polled in an order other than the one they are written in was recorded
+  under the old numbering; recovering it under this version asks for different
+  positions, which fails the workflow with `UnexpectedStep` or — where two calls
+  share a name — replays the wrong one's result. By default this cannot happen,
+  because `app_version` is a hash of the executable and a rebuilt binary does
+  not claim the old version's workflows. It does happen if you pin
+  `app_version`, through `EngineConfig::app_version` or `DBOS__APPVERSION`, so
+  that a new deployment recovers the previous one's work. Pinned deployments
+  should drain in-flight workflows before rolling this version out, or move the
+  pin to a new value and let the old build finish what it started.
 
 - **Breaking:** `ctx.transaction_on` / `transaction_on_with` take an async
   closure — `async |conn| { … }` — instead of a closure returning a boxed
