@@ -34,17 +34,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 
+mod common;
+
 const WORKFLOW: &str = "probe";
 const ID: &str = "wf";
 
-/// The `(position, operation)` pairs a workflow recorded, in position order.
+/// The `(position, operation)` pairs the workflow recorded, in position order.
 async fn recorded(engine: &DurableEngine) -> Result<Vec<(i32, String)>> {
-    Ok(engine
-        .get_workflow_steps(ID)
-        .await?
-        .into_iter()
-        .map(|step| (step.step_id, step.name))
-        .collect())
+    common::recorded(engine, ID).await
 }
 
 /// Runs `body` once and reports what it recorded, in position order.
@@ -53,13 +50,8 @@ where
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<i64>> + Send + 'static,
 {
-    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register(WORKFLOW, move |ctx: DurableContext, _: ()| body(ctx));
-    engine
-        .start::<_, i64>(WORKFLOW, (), WorkflowOptions::with_id(ID))
-        .await?
-        .result()
-        .await?;
+    let provider: Arc<dyn StateProvider> = Arc::new(InMemoryProvider::new());
+    let engine = common::run_body(&provider, WORKFLOW, ID, body).await?;
     recorded(&engine).await
 }
 
@@ -408,9 +400,7 @@ async fn a_call_created_by_the_closure_before_its_future_is_refused() -> Result<
 /// half is refused and the counter does not move.
 #[tokio::test]
 async fn a_call_created_in_a_transaction_body_is_refused() -> Result<()> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("durare-nesting-{}.db", uuid::Uuid::new_v4()));
-    let url = format!("sqlite://{}", path.display());
+    let (url, path) = common::temp_db_url("nesting");
 
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     engine.register(WORKFLOW, |ctx: DurableContext, _: ()| async move {
@@ -437,8 +427,6 @@ async fn a_call_created_in_a_transaction_body_is_refused() -> Result<()> {
         "the call built inside the transaction body claimed no position"
     );
     drop(engine);
-    for ext in ["", "-wal", "-shm"] {
-        std::fs::remove_file(format!("{}{ext}", path.display())).ok();
-    }
+    common::remove_sqlite_files(&path);
     Ok(())
 }

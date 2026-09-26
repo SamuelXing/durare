@@ -1,3 +1,4 @@
+use crate::replay::Divergence;
 use crate::serialize::PortableWorkflowError;
 use thiserror::Error;
 
@@ -46,6 +47,9 @@ pub enum ErrorCode {
     /// Another live execution of the same workflow id checkpointed this step
     /// first; this execution no longer owns the workflow.
     WorkflowConflict,
+    /// A recorded workflow no longer replays its history under the current
+    /// code (see [`DurableEngine::verify_replay`](crate::DurableEngine::verify_replay)).
+    ReplayDiverged,
     /// An error raised by user code.
     Application,
 }
@@ -193,6 +197,20 @@ pub enum Error {
     )]
     WorkflowConflict(String),
 
+    /// A recorded workflow no longer replays its history under the current code:
+    /// what [`ReplayReport::into_result`](crate::ReplayReport::into_result)
+    /// returns for a report that does not pass, and what a durable call refused
+    /// during [`verify_replay`](crate::DurableEngine::verify_replay) returns.
+    /// Distinct from [`App`](Self::App) so a CI step can tell a divergence from
+    /// a failure in its own code.
+    #[error("workflow `{workflow_id}` no longer replays its recorded history: {divergence}")]
+    ReplayDiverged {
+        /// The workflow whose history the code no longer replays.
+        workflow_id: String,
+        /// The first place the re-run and the history disagreed.
+        divergence: Divergence,
+    },
+
     /// An error raised by user code inside a step or workflow, with an optional
     /// underlying `source` so `{:?}` and error-reporting tools can walk the
     /// cause chain. The `source` is a live, in-process detail — a checkpointed
@@ -316,6 +334,7 @@ impl Error {
                 ErrorCode::NestedDurableCall
             }
             Error::WorkflowConflict(_) => ErrorCode::WorkflowConflict,
+            Error::ReplayDiverged { .. } => ErrorCode::ReplayDiverged,
             Error::App { .. } | Error::Portable(_) => ErrorCode::Application,
         }
     }
@@ -421,6 +440,19 @@ mod tests {
         assert_eq!(
             Error::unexpected_step("wf", 3, "new", "old").code(),
             ErrorCode::UnexpectedStep
+        );
+        let diverged = Error::ReplayDiverged {
+            workflow_id: "wf".into(),
+            divergence: Divergence::Extra {
+                position: 2,
+                operation: "c".into(),
+            },
+        };
+        assert_eq!(diverged.code(), ErrorCode::ReplayDiverged);
+        assert_eq!(
+            diverged.to_string(),
+            "workflow `wf` no longer replays its recorded history: step 2: the code now \
+             issues `c`, which the recorded history does not have"
         );
     }
 

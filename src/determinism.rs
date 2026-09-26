@@ -106,6 +106,23 @@
 //! What a body may do is call ordinary functions, as deeply as it likes. The
 //! rule is about durable calls, not about nesting code.
 //!
+//! # Checking a change before you ship it
+//!
+//! Every rule above is about the body you are writing. The other half of the
+//! problem is the runs already recorded: a workflow function is pinned to the
+//! operations its own runs issued, and an edit to it is what the half-finished
+//! runs in flight discover, at recovery time. [`DurableEngine::verify_replay`]
+//! asks that question before the deploy — it re-runs one recorded workflow's
+//! function against the code in the binary, executing nothing, and reports the
+//! first durable operation the two disagree about; [`ReplayReport::into_result`]
+//! makes it a `?` in a test or a CI step.
+//!
+//! It is a check, not a proof, and it is worth knowing what it cannot see: it
+//! observes the *sequence* of durable operations, so non-determinism that leaves
+//! that sequence alone — a clock read no branch turns on, a `HashMap` whose
+//! iteration happens to come out in the recorded order — passes it. The rules
+//! above remain yours to keep.
+//!
 //! # Durable-safe data
 //!
 //! Every value that crosses a durable boundary — a workflow's input and output,
@@ -192,4 +209,4 @@
 //! even across a replay.
 
 #[allow(unused_imports)]
-use crate::{DurableContext, Error, Serializer};
+use crate::{Divergence, DurableContext, DurableEngine, Error, ReplayReport, Serializer};

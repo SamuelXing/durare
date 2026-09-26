@@ -2,6 +2,7 @@ use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{panic_message, Error, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
+use crate::replay::{Divergence, Verification};
 use crate::tx::{TransactionOptions, Tx, TxBody};
 use futures_util::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
@@ -269,6 +270,17 @@ pub struct DurableContext {
     // clone captured inside a body sees it). Guards against nesting a transaction
     // inside another — which would deadlock on the outer's write lock.
     in_transaction: Arc<AtomicBool>,
+    // `Some` in a replay verification run (`DurableEngine::verify_replay`): the
+    // run serves recorded outcomes, refuses to execute anything live, and books
+    // what it saw here.
+    //
+    // One field rather than a flag beside a cell, because they are one fact:
+    // there is no such thing as a verification run without somewhere to report
+    // to, and no report to fill outside one. Whether this is a verification is
+    // read off the `Option`, which copies with the clone; only the report it
+    // points at is shared, which is the point — a divergence a clone runs into
+    // has to be visible to the verifier.
+    verify: Option<Arc<Verification>>,
 }
 
 impl DurableContext {
@@ -280,6 +292,27 @@ impl DurableContext {
             auth,
             seq: Arc::new(AtomicI32::new(0)),
             in_transaction: Arc::new(AtomicBool::new(false)),
+            verify: None,
+        }
+    }
+
+    /// A context for a **replay verification** run
+    /// ([`DurableEngine::verify_replay`](crate::DurableEngine::verify_replay)):
+    /// every durable operation is served from its record, and the first one with
+    /// nothing recorded at its position stops the run instead of executing.
+    ///
+    /// Nothing else about the run differs — same counter, same identity, same
+    /// provider — because the point is to reach the same positions in the same
+    /// order as a real replay would.
+    pub(crate) fn new_verifying(
+        workflow_id: String,
+        runtime: Arc<Runtime>,
+        auth: AuthContext,
+        verification: Arc<Verification>,
+    ) -> Self {
+        Self {
+            verify: Some(verification),
+            ..Self::new(workflow_id, runtime, auth)
         }
     }
 
@@ -340,6 +373,94 @@ impl DurableContext {
             });
         }
         Ok(())
+    }
+
+    /// Check the operation now executing at `seq` against the name recorded
+    /// there — the comparison every path that serves a record makes.
+    ///
+    /// A different name is the classic non-deterministic replay: the recorded
+    /// outcome belongs to another operation, and returning it would be a wrong
+    /// replay rather than a failed one. A verification run books the same
+    /// comparison as its verdict — a match is one more recorded operation
+    /// reached, a mismatch is the divergence it was looking for — and then
+    /// returns the error every run returns.
+    fn check_recorded(&self, seq: i32, expected: &str, recorded: &str) -> Result<()> {
+        if recorded != expected {
+            if let Some(verify) = &self.verify {
+                verify.saw(Divergence::Mismatch {
+                    position: seq,
+                    expected: expected.to_owned(),
+                    recorded: recorded.to_owned(),
+                });
+            }
+            return Err(Error::unexpected_step(
+                &self.workflow_id,
+                seq,
+                expected,
+                recorded,
+            ));
+        }
+        self.served_record(seq);
+        Ok(())
+    }
+
+    /// Whether this is a [replay
+    /// verification](crate::DurableEngine::verify_replay) run rather than an
+    /// execution.
+    fn verifying(&self) -> bool {
+        self.verify.is_some()
+    }
+
+    /// Book one recorded operation served to a verification run, where the name
+    /// is already known to match and there is nothing to compare — the
+    /// [`patch`](Self::patch) marker paths. A no-op in a normal run.
+    fn served_record(&self, seq: i32) {
+        if let Some(verify) = &self.verify {
+            verify.served_record(seq);
+        }
+    }
+
+    /// Book position `seq` as claimed for an `operation` record this call may
+    /// never ask for — a wait's deadline. A no-op in a normal run.
+    fn reserved_record(&self, seq: i32, operation: &'static str) {
+        if let Some(verify) = &self.verify {
+            verify.reserved_record(seq, operation);
+        }
+    }
+
+    /// The point where a run that found nothing recorded at `seq` would start
+    /// doing the work itself.
+    ///
+    /// Nothing to refuse in a normal run: that position is the replay frontier,
+    /// and reaching it is how a replay becomes a live execution again. A
+    /// verification run may not execute, write, or emit anything, so this is
+    /// where it stops. Against a complete history that is a
+    /// [`Divergence::Extra`]; against one still being written it is the end of
+    /// what there is to check, booked as a fact rather than a divergence.
+    ///
+    /// The returned error is a courtesy, not the channel — a body may swallow it
+    /// (see [`Verification`]) — so what was seen is booked before it is handed
+    /// back.
+    fn refuse_live_work(&self, seq: i32, operation: &str) -> Result<()> {
+        let Some(verify) = &self.verify else {
+            return Ok(());
+        };
+        if verify.complete() {
+            let divergence = Divergence::Extra {
+                position: seq,
+                operation: operation.to_owned(),
+            };
+            verify.saw(divergence.clone());
+            return Err(Error::ReplayDiverged {
+                workflow_id: self.workflow_id.clone(),
+                divergence,
+            });
+        }
+        verify.stopped(seq, operation);
+        Err(Error::app(format!(
+            "replay verification of workflow `{}` reached the end of the recorded history at step {seq}",
+            self.workflow_id
+        )))
     }
 
     /// What the in-transaction flag reports.
@@ -423,15 +544,20 @@ impl DurableContext {
         let seq = self.current_step_id();
         let marker = format!("{PATCH_PREFIX}{name}");
         let patched = match self.provider.get_step_name(&self.workflow_id, seq).await? {
-            // Not seen before: record the marker and take the new path.
+            // Not seen before: record the marker and take the new path. The
+            // marker is a write, so a verification run stops here instead.
             None => {
+                self.refuse_live_work(seq, &marker)?;
                 self.provider
                     .record_patch(&self.workflow_id, seq, &marker)
                     .await?;
                 true
             }
             // Our own marker (a replay/recovery of a patched run): new path.
-            Some(recorded) if recorded == marker => true,
+            Some(recorded) if recorded == marker => {
+                self.served_record(seq);
+                true
+            }
             // A different step already occupies this slot (a pre-patch run): old path.
             Some(_) => false,
         };
@@ -462,6 +588,9 @@ impl DurableContext {
             .as_deref()
             == Some(marker.as_str())
         {
+            // The marker's slot is consumed, not re-recorded: read-only on every
+            // run, verification included.
+            self.served_record(seq);
             self.next_seq();
         }
         Ok(())
@@ -534,16 +663,12 @@ impl DurableContext {
                 .check_child_workflow(&self.workflow_id, seq)
                 .await?
             {
-                if recorded != name {
-                    return Err(Error::unexpected_step(
-                        &self.workflow_id,
-                        seq,
-                        &name,
-                        recorded,
-                    ));
-                }
+                self.check_recorded(seq, &name, &recorded)?;
                 return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
             }
+            // Starting a child is a side effect; a verification run stops here
+            // rather than launching one.
+            self.refuse_live_work(seq, &name)?;
 
             let child_id = opts
                 .workflow_id
@@ -802,20 +927,32 @@ impl DurableContext {
         let seq = position.seq();
         let span = self.op_span("transaction", &opts.name, seq);
         PendingStep::new(position, async move {
-            let _guard = self.begin_transaction()?;
-            let started = chrono::Utc::now().timestamp_millis();
-            // Separate the call from the `async move`: `f(tx)` borrows `f` and yields
-            // a future that we move in, so the wrapper stays `Fn` (re-runnable).
-            let body: TxBody = Box::new(move |tx| {
-                // Entered here rather than inside the `async move`: `f`'s own
-                // work happens at this call, and it is part of the body too.
-                let running = in_body(|| f(tx));
-                Box::pin(async move {
-                    let out = running.await?;
-                    Ok::<_, Error>(serde_json::to_value(out)?)
-                })
-            });
             let out = async {
+                // A transaction's own replay check runs inside the provider, in
+                // the database transaction it is about to open — too late for a
+                // verification run, which must not open one. Consult the record
+                // here first: a recorded outcome is served, and nothing recorded
+                // at this position stops the run before the body can execute.
+                if self.verifying() {
+                    if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
+                        return Ok(stored);
+                    }
+                }
+                let _guard = self.begin_transaction()?;
+                let started = chrono::Utc::now().timestamp_millis();
+                // Separate the call from the `async move`: `f(tx)` borrows `f`
+                // and yields a future that we move in, so the wrapper stays `Fn`
+                // (re-runnable).
+                let body: TxBody = Box::new(move |tx| {
+                    // Entered here rather than inside the `async move`: `f`'s
+                    // own work happens at this call, and it is part of the body
+                    // too.
+                    let running = in_body(|| f(tx));
+                    Box::pin(async move {
+                        let out = running.await?;
+                        Ok::<_, Error>(serde_json::to_value(out)?)
+                    })
+                });
                 let value = self
                     .provider
                     .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
@@ -1228,14 +1365,7 @@ impl DurableContext {
                             .ok_or_else(|| {
                                 Error::app("checkpoint row vanished after a duplicate insert")
                             })?;
-                        if rec.name != opts.name {
-                            return Err(Error::unexpected_step(
-                                &self.workflow_id,
-                                seq,
-                                &opts.name,
-                                rec.name,
-                            ));
-                        }
+                        self.check_recorded(seq, &opts.name, &rec.name)?;
                         if !matches!(&rec.outcome, StepOutcome::Output(stored) if *stored == value)
                         {
                             return Err(Error::WorkflowConflict(self.workflow_id.clone()));
@@ -1510,14 +1640,15 @@ impl DurableContext {
         })
     }
 
-    /// Shared step preamble: serve a replayed checkpoint if present, otherwise
-    /// refuse to start fresh work on a `CANCELLED` workflow. `Ok(Some(v))` means
-    /// "return `v`"; `Ok(None)` means "proceed to run the closure". `expected`
-    /// is the operation now executing: a replay that finds a *different*
-    /// operation recorded at this position fails with
-    /// [`Error::UnexpectedStep`] — the workflow is non-deterministic, and the
-    /// stored checkpoint would be the wrong step's result.
-    async fn replay_or_guard<T: DeserializeOwned>(
+    /// Consult the record at `seq` for the operation `expected`, now executing:
+    /// the one gate every durable call passes through before doing work.
+    /// `Ok(Some(v))` means "return `v`"; `Ok(None)` means "nothing recorded,
+    /// proceed". A replay that finds a *different* operation recorded at this
+    /// position fails with [`Error::UnexpectedStep`] — the workflow is
+    /// non-deterministic, and the stored checkpoint would be the wrong step's
+    /// result — and a verification run stops at the first position with nothing
+    /// recorded ([`refuse_live_work`](Self::refuse_live_work)).
+    async fn serve_recorded<T: DeserializeOwned>(
         &self,
         seq: i32,
         expected: &str,
@@ -1527,20 +1658,30 @@ impl DurableContext {
             .get_step_result(&self.workflow_id, seq)
             .await?
         {
-            if rec.name != expected {
-                return Err(Error::unexpected_step(
-                    &self.workflow_id,
-                    seq,
-                    expected,
-                    rec.name,
-                ));
-            }
+            self.check_recorded(seq, expected, &rec.name)?;
             // Mark the enclosing operation span; a no-op for callers without
             // one (the field is not declared on any other span).
             tracing::Span::current().record("dbos.step.replayed", true);
             // A recorded failure replays as its error, so a failed step is not
             // re-run (and a non-deterministic step cannot succeed on replay).
             return Ok(Some(outcome_value(rec.outcome)?));
+        }
+        // Nothing recorded here: a live run proceeds from this position, a
+        // verification run stops at it.
+        self.refuse_live_work(seq, expected)?;
+        Ok(None)
+    }
+
+    /// Shared step preamble: [`serve_recorded`](Self::serve_recorded), then
+    /// refuse to start fresh work on a `CANCELLED` workflow. `Ok(Some(v))` means
+    /// "return `v`"; `Ok(None)` means "proceed to run the closure".
+    async fn replay_or_guard<T: DeserializeOwned>(
+        &self,
+        seq: i32,
+        expected: &str,
+    ) -> Result<Option<T>> {
+        if let Some(stored) = self.serve_recorded(seq, expected).await? {
+            return Ok(Some(stored));
         }
         if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
             if status.status == STATUS_CANCELLED {
@@ -1673,59 +1814,20 @@ impl DurableContext {
         let position = claim!(self, "sleep");
         let seq = position.seq();
         PendingStep::new(position, async move {
-            let wake_at = self.durable_wake_at(seq, dur).await?;
+            let wake_at = self
+                .durable_value_at(seq, "DBOS.sleep", || wake_instant(dur))
+                .await?;
             let now = chrono::Utc::now();
-            if wake_at > now {
+            // A verification run reads the recorded wake instant and moves on.
+            // Waiting it out would stall the check for however long the timer
+            // has left — and there is nothing to wait for: no later operation
+            // runs, so none can depend on the delay having elapsed.
+            if wake_at > now && !self.verifying() {
                 let remaining = (wake_at - now).to_std().unwrap_or(Duration::ZERO);
                 tokio::time::sleep(remaining).await;
             }
             Ok(())
         })
-    }
-
-    /// Resolve the absolute wake instant for a durable timer at `seq`: the
-    /// first call records `now + dur` as a `DBOS.sleep` step; replays read the
-    /// stored instant back, so timers (and recv/get_event timeouts built on
-    /// them) never extend across crashes.
-    async fn durable_wake_at(
-        &self,
-        seq: i32,
-        dur: Duration,
-    ) -> Result<chrono::DateTime<chrono::Utc>> {
-        match self
-            .provider
-            .get_step_result(&self.workflow_id, seq)
-            .await?
-        {
-            Some(rec) => {
-                if rec.name != "DBOS.sleep" {
-                    return Err(Error::unexpected_step(
-                        &self.workflow_id,
-                        seq,
-                        "DBOS.sleep",
-                        rec.name,
-                    ));
-                }
-                outcome_value(rec.outcome)
-            }
-            None => {
-                let proposed = chrono::Utc::now()
-                    + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
-                let outcome = self
-                    .provider
-                    .record_step_result(
-                        &self.workflow_id,
-                        seq,
-                        "DBOS.sleep",
-                        serde_json::to_value(proposed)?,
-                        None,
-                        None,
-                        Some(self.runtime.executor_id()),
-                    )
-                    .await?;
-                outcome_value(outcome)
-            }
-        }
     }
 
     /// A durable wall-clock read. Records the current instant on first execution
@@ -1767,8 +1869,7 @@ impl DurableContext {
     /// Record (first execution) or replay (thereafter) a non-deterministic value
     /// under a reserved `DBOS.*` op at the next seq, so a clock/RNG/UUID read
     /// returns the same value on every replay. The shared machinery behind
-    /// [`now`](Self::now), [`uuid`](Self::uuid), and [`random`](Self::random) —
-    /// the same record-or-replay shape as [`sleep`](Self::sleep)'s wake instant.
+    /// [`now`](Self::now), [`uuid`](Self::uuid), and [`random`](Self::random).
     fn durable_value<'a, T, P>(&'a self, name: &'static str, produce: P) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
@@ -1784,45 +1885,24 @@ impl DurableContext {
         )
     }
 
-    /// [`durable_value`](Self::durable_value)'s run, once the position is claimed.
+    /// [`durable_value`](Self::durable_value)'s run, once the position is
+    /// claimed: serve the recorded value, or produce and checkpoint one. Also the
+    /// wake instant behind [`sleep`](Self::sleep) and the `recv`/`get_event`
+    /// timeouts, recorded as a `DBOS.sleep` step so a timer never extends across
+    /// a crash.
+    ///
+    /// No cancellation check, unlike [`replay_or_guard`](Self::replay_or_guard):
+    /// reading the clock or minting an id is not work a cancelled workflow is
+    /// refused.
     async fn durable_value_at<T, P>(&self, seq: i32, name: &str, produce: P) -> Result<T>
     where
         T: Serialize + DeserializeOwned,
         P: FnOnce() -> T,
     {
-        match self
-            .provider
-            .get_step_result(&self.workflow_id, seq)
-            .await?
-        {
-            Some(rec) => {
-                if rec.name != name {
-                    return Err(Error::unexpected_step(
-                        &self.workflow_id,
-                        seq,
-                        name,
-                        rec.name,
-                    ));
-                }
-                outcome_value(rec.outcome)
-            }
-            None => {
-                let value = produce();
-                let outcome = self
-                    .provider
-                    .record_step_result(
-                        &self.workflow_id,
-                        seq,
-                        name,
-                        serde_json::to_value(&value)?,
-                        None,
-                        None,
-                        Some(self.runtime.executor_id()),
-                    )
-                    .await?;
-                outcome_value(outcome)
-            }
+        if let Some(value) = self.serve_recorded(seq, name).await? {
+            return Ok(value);
         }
+        self.checkpoint(seq, name, produce(), None).await
     }
 
     /// Durably send a message to another workflow on `topic`. Recorded as a
@@ -2009,6 +2089,10 @@ impl DurableContext {
         let seq = position.seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(position, async move {
+            // Construction reserves positions; only a polled wait accounts for
+            // its deadline during verification. Do this before the replay gate,
+            // which may stop at an in-flight wait with only a deadline recorded.
+            self.reserved_record(deadline_seq, "DBOS.sleep");
             if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
                 return Ok(stored);
             }
@@ -2027,7 +2111,10 @@ impl DurableContext {
                 // poll until a message arrives or the deadline passes.
                 let deadline = match deadline {
                     Some(d) => d,
-                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+                    None => *deadline.insert(
+                        self.durable_value_at(deadline_seq, "DBOS.sleep", || wake_instant(timeout))
+                            .await?,
+                    ),
                 };
                 let now = chrono::Utc::now();
                 if now >= deadline {
@@ -2142,6 +2229,10 @@ impl DurableContext {
         let seq = position.seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(position, async move {
+            // Construction reserves positions; only a polled wait accounts for
+            // its deadline during verification. Do this before the replay gate,
+            // which may stop at an in-flight wait with only a deadline recorded.
+            self.reserved_record(deadline_seq, "DBOS.sleep");
             if let Some(stored) = self
                 .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
                 .await?
@@ -2173,7 +2264,10 @@ impl DurableContext {
 
                 let deadline = match deadline {
                     Some(d) => d,
-                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+                    None => *deadline.insert(
+                        self.durable_value_at(deadline_seq, "DBOS.sleep", || wake_instant(timeout))
+                            .await?,
+                    ),
                 };
                 let now = chrono::Utc::now();
                 if now >= deadline {
@@ -2448,6 +2542,14 @@ fn completion_row_matches(
 /// error (so a replayed failed step returns the same error without re-running).
 fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
     Ok(serde_json::from_value(outcome.into_value_result()?)?)
+}
+
+/// The absolute instant a durable timer started now would fire at. A duration
+/// too large for `chrono` counts as zero, so an absurd timeout fires at once
+/// rather than failing the workflow.
+fn wake_instant(dur: Duration) -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+        + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
 /// Await a step's future, converting a panic in the step body into an error so

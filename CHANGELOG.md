@@ -121,6 +121,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `DurableEngine::verify_replay(workflow_id)`: re-runs a recorded workflow's
+  function against the code in this binary and reports the first durable
+  operation the two disagree about — the pre-deploy check for an edited
+  workflow body, which the runs still in flight would otherwise discover at
+  recovery time. The pass runs nothing: every operation is served from its
+  record and the first one with nothing recorded at its position stops the
+  run, so no body executes and nothing is written. It returns a `ReplayReport`
+  (`recorded` / `matched` counts, whether the history is `complete`) with the
+  first `Divergence`: `Mismatch`, `Extra`, `Missing` or `Failed`; `passes()`
+  and `into_result()` make it a `?` in a test or a CI step, the latter with the
+  new `Error::ReplayDiverged` variant (`ErrorCode::ReplayDiverged`), so a CI
+  caller can tell a divergence from a failure in its own code. A workflow that
+  is still running has a history that legitimately ends early, so `Extra` is
+  never reported against one. What the check cannot see is in the determinism
+  guide.
+
 - `PostgresProvider::from_pool_with_schema(pool, schema)`: a caller-owned
   pool with the system tables pinned to an explicit schema — created on
   `init`, every system query schema-qualified — closing the hole where

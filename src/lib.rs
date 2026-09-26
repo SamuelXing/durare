@@ -104,6 +104,11 @@
 //!   ([`start_workflow`](DurableContext::start_workflow)), durable
 //!   [`select`](DurableContext::select), code evolution with
 //!   [`patch`](DurableContext::patch).
+//! - **Replay verification** — [`verify_replay`](DurableEngine::verify_replay)
+//!   re-runs a recorded workflow against the current code and reports the first
+//!   durable operation the two disagree about ([`ReplayReport`],
+//!   [`Divergence`]), writing and executing nothing: the pre-deploy check for a
+//!   changed workflow body.
 //! - **Management and operations** — list / cancel / resume / fork, timeouts,
 //!   [`Debouncer`], the registry-less [`Client`] for other processes,
 //!   [`AdminServer`] (feature `admin`), [`Conductor`] (feature `conductor`).
@@ -188,6 +193,7 @@ mod memory;
 mod postgres;
 mod provider;
 mod queue;
+mod replay;
 mod schedule;
 mod serialize;
 #[cfg(feature = "sqlite")]
@@ -236,6 +242,7 @@ pub use provider::{
     STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
+pub use replay::{Divergence, ReplayReport};
 pub use schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, ScheduledInput,
     WorkflowSchedule,

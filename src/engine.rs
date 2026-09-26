@@ -8,6 +8,7 @@ use crate::provider::{
     STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
+use crate::replay::{History, ReplayReport, Verification};
 use crate::schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
 };
@@ -2151,6 +2152,126 @@ impl DurableEngine {
     /// an unknown workflow or one that has run no steps.
     pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
         self.provider.get_workflow_steps(workflow_id).await
+    }
+
+    /// Re-run a recorded workflow's function against the code in this binary and
+    /// report whether it still issues the same durable operations, in the same
+    /// order — the pre-deploy check for a workflow whose body has changed.
+    ///
+    /// A replay serves each durable operation from the record at its position,
+    /// so a workflow function is pinned to the sequence of operations it issued
+    /// on its first execution. Editing that function is therefore the one change
+    /// an ordinary test suite cannot judge: the new code passes its own tests,
+    /// and the runs already in flight fail at recovery time, half-finished, on
+    /// the first position whose recorded name no longer matches. Point this at
+    /// the unfinished (or recently finished) workflows of the version you are
+    /// replacing and the answer arrives before the deploy instead of after it:
+    ///
+    /// ```no_run
+    /// # use durare::{DurableEngine, ListFilter, STATUS_PENDING};
+    /// # async fn preflight(engine: &DurableEngine) -> durare::Result<()> {
+    /// let in_flight = ListFilter {
+    ///     status: vec![STATUS_PENDING.to_string()],
+    ///     ..Default::default()
+    /// };
+    /// for wf in engine.list_workflows(&in_flight).await? {
+    ///     engine.verify_replay(&wf.id).await?.into_result()?;
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// A workflow that is still running can be verified too, and often should
+    /// be — those are the runs a deploy has to carry. Its history is a prefix,
+    /// though, so reaching the end of it stops the re-run and is not a
+    /// divergence: a [`Mismatch`](crate::Divergence::Mismatch),
+    /// [`Missing`](crate::Divergence::Missing) or
+    /// [`Failed`](crate::Divergence::Failed) can be reported against one, an
+    /// [`Extra`](crate::Divergence::Extra) cannot; see
+    /// [`ReplayReport::complete`].
+    ///
+    /// # It runs nothing
+    ///
+    /// Verification is read-only. Every durable operation is served from its
+    /// record; the first one with nothing recorded at its position stops the run
+    /// instead of executing. No step body runs, no child workflow starts, no
+    /// message is sent, no checkpoint, status row, or executor id is written. A
+    /// recorded timer is read rather than waited out, so a
+    /// [`sleep`](DurableContext::sleep) with hours left on it does not hold the
+    /// check up. Code *between* the durable operations does run — that is what
+    /// issues the operations, and the whole question is which ones it issues.
+    ///
+    /// # What it does not catch
+    ///
+    /// It re-runs the function, so what it sees is the sequence of durable
+    /// operations. That bounds it in three ways:
+    ///
+    /// - Non-determinism that does not change the sequence is invisible. A body
+    ///   that reads the clock, iterates a `HashMap`, or branches on an
+    ///   environment variable passes as long as the operations come out the same
+    ///   this time — and a coin-flip that happens to land the recorded way
+    ///   passes too. The [determinism guide](crate::determinism) is still the
+    ///   rulebook; this is a check, not a proof.
+    /// - A durable call made from a `tokio::spawn`ed task is not attributed to
+    ///   the body that spawned it. The nesting guard's task-local does not reach
+    ///   a spawned task either, and for the same reason: the position it claims
+    ///   belongs to whichever task got there first.
+    /// - It judges one recorded history. Another workflow of the same name, down
+    ///   a different branch, can still diverge — verify the runs you are about
+    ///   to carry across the deploy, not one of them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::UnknownWorkflow`] if `workflow_id` does not exist, or if its
+    /// recorded name is not registered on this engine. A panic in the workflow
+    /// body is caught and goes into the report: as
+    /// [`Failed`](crate::Divergence::Failed) when nothing else diverged, and
+    /// otherwise not at all, since a divergence is the better explanation for a
+    /// body that panicked on an operation it did not get.
+    pub async fn verify_replay(&self, workflow_id: &str) -> Result<ReplayReport> {
+        let status = self
+            .provider
+            .get_workflow_status(workflow_id)
+            .await?
+            .ok_or_else(|| Error::UnknownWorkflow(workflow_id.to_string()))?;
+        let rt = self.runtime();
+        let handler = rt
+            .workflows
+            .get(&registry_key(&status.name, status.config_name.as_deref()))
+            .cloned()
+            .ok_or_else(|| Error::UnknownWorkflow(status.name.clone()))?;
+        let recorded = self.get_workflow_steps(workflow_id).await?;
+
+        // A history is complete only if the run reached its own end. `CANCELLED`
+        // and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` are terminal for the row but not
+        // for the body: it was stopped from the outside, wherever it had got to,
+        // so its history ends early exactly like a running workflow's and the
+        // operations it does not hold are not the code's fault.
+        let complete = matches!(status.status.as_str(), STATUS_SUCCESS | STATUS_ERROR);
+
+        let verification = Arc::new(Verification::new(complete));
+        let ctx = DurableContext::new_verifying(
+            workflow_id.to_string(),
+            rt,
+            AuthContext::from_status(&status),
+            verification.clone(),
+        );
+        // Panics are caught the way a real execution catches them, so a body
+        // that panics on an operation it was refused is reported rather than
+        // taken out on the caller.
+        let outcome = AssertUnwindSafe(handler(ctx, status.input))
+            .catch_unwind()
+            .await;
+
+        Ok(verification.report(
+            History {
+                id: workflow_id,
+                name: &status.name,
+                status: &status.status,
+                recorded: &recorded,
+            },
+            outcome,
+        ))
     }
 
     /// All `(key, value)` events a workflow has set (`set_event`), ordered by key.
