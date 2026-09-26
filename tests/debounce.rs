@@ -2,7 +2,7 @@
 //! a single delayed run with the latest input.
 
 use durare::{
-    Client, DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle,
+    workflow_fn, Client, DurableEngine, Error, InMemoryProvider, Result, WorkflowHandle,
     WorkflowOptions,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,10 +13,15 @@ use std::time::Duration;
 async fn debounce_coalesces_to_latest_input() -> Result<()> {
     static RUNS: AtomicUsize = AtomicUsize::new(0);
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("notify", |_ctx: DurableContext, msg: String| async move {
-        RUNS.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "notify",
+        workflow_fn(|_ctx, msg: String| {
+            Box::pin(async move {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(msg)
+            })
+        }),
+    );
     engine.launch().await?;
 
     let delay = Duration::from_millis(250);
@@ -60,10 +65,15 @@ async fn debounce_from_client_coalesces_to_latest_input() -> Result<()> {
     // Engine and client share one provider; the engine runs the collector/target.
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("notify", |_ctx: DurableContext, msg: String| async move {
-        RUNS.fetch_add(1, Ordering::SeqCst);
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "notify",
+        workflow_fn(|_ctx, msg: String| {
+            Box::pin(async move {
+                RUNS.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(msg)
+            })
+        }),
+    );
     engine.launch().await?;
 
     let client = Client::new(provider.clone());
@@ -99,14 +109,19 @@ async fn debounce_from_client_coalesces_to_latest_input() -> Result<()> {
 #[tokio::test]
 async fn debounce_threads_target_options() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("notify", |ctx: DurableContext, msg: String| async move {
-        // Echo the identity the target sees, proving auth threaded through.
-        Ok::<_, Error>(format!(
-            "{}:{}",
-            ctx.authenticated_user().unwrap_or(""),
-            msg
-        ))
-    });
+    engine.register(
+        "notify",
+        workflow_fn(|ctx, msg: String| {
+            Box::pin(async move {
+                // Echo the identity the target sees, proving auth threaded through.
+                Ok::<_, Error>(format!(
+                    "{}:{}",
+                    ctx.authenticated_user().unwrap_or(""),
+                    msg
+                ))
+            })
+        }),
+    );
     engine.launch().await?;
 
     let opts = WorkflowOptions::default()

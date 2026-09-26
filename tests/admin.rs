@@ -3,7 +3,7 @@
 //! (Connection: close) keeps the test dependency-free.
 
 use durare::{
-    AdminServer, DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions,
+    workflow_fn, AdminServer, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,9 +35,10 @@ async fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, 
 #[tokio::test]
 async fn admin_server_endpoints() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("echo", |_ctx: DurableContext, msg: String| async move {
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, msg: String| Box::pin(async move { Ok::<_, Error>(msg) })),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
 
@@ -156,9 +157,10 @@ async fn admin_server_endpoints() -> Result<()> {
 #[tokio::test]
 async fn admin_fork_endpoint_returns_new_id() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("echo", |_ctx: DurableContext, msg: String| async move {
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, msg: String| Box::pin(async move { Ok::<_, Error>(msg) })),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
 
@@ -237,9 +239,10 @@ fn local_non_loopback_v4() -> Option<std::net::Ipv4Addr> {
 #[tokio::test]
 async fn admin_garbage_collect_endpoint_deletes_history() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("echo", |_ctx: DurableContext, msg: String| async move {
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, msg: String| Box::pin(async move { Ok::<_, Error>(msg) })),
+    );
     let engine = Arc::new(engine);
     engine.launch().await?;
     engine

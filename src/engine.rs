@@ -48,12 +48,83 @@ fn internal_queue() -> WorkflowQueue {
     q
 }
 
-/// A type-erased workflow handler: takes a context + JSON input, returns JSON output.
-pub type WorkflowFn = Arc<
-    dyn Fn(DurableContext, Value) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>>
-        + Send
-        + Sync,
->;
+/// A boxed, `Send` future that borrows for `'a`.
+///
+/// Used by [`workflow_fn`] to give a closure handler a return type tied to its
+/// context argument. Named async functions register directly without boxing at
+/// the call site.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Name the borrowed-context signature for a closure-shaped workflow body.
+///
+/// An `async fn(&DurableContext, I) -> Result<O>` item registers directly. A
+/// closure cannot: its return type cannot depend on the lifetime of its `ctx`
+/// argument, so `|ctx, x| async move { ctx.step(..).await }` has no type on
+/// stable Rust, and neither has one annotated `-> BoxFuture<'_, _>` (the `'_`
+/// in a closure's return type is a fresh lifetime, not the argument's). Passing
+/// the closure through this adapter gives it the higher-ranked signature it
+/// needs, and the compiler then infers `ctx` and the return type for it:
+///
+/// ```no_run
+/// # use durare::{workflow_fn, DurableContext, DurableEngine, Error, InMemoryProvider};
+/// # async fn demo(engine: &mut DurableEngine) {
+/// engine.register("greet", workflow_fn(|ctx, name: String| Box::pin(async move {
+///     let hello = ctx.step("hello", |_| async move { Ok::<_, Error>(format!("Hello, {name}")) }).await?;
+///     Ok::<_, Error>(hello)
+/// })));
+/// # }
+/// ```
+///
+/// The adapter returns the closure unchanged — it exists only to fix the
+/// closure's signature — so a capture-free closure stays `Copy` and can be
+/// registered more than once.
+///
+/// `Box::pin` supplies a return type whose borrow can vary with the argument
+/// lifetime. `#[durare::workflow]` on an `async fn` needs no adapter.
+pub fn workflow_fn<I, O, F>(f: F) -> F
+where
+    F: for<'a> Fn(&'a DurableContext, I) -> BoxFuture<'a, Result<O>> + Send + Sync + 'static,
+{
+    f
+}
+
+/// A type-erased workflow handler: borrows the run's context and takes JSON
+/// input, returns JSON output. The future lives no longer than the borrow, so
+/// the engine can own the context for exactly the duration of the run.
+pub type WorkflowFn =
+    Arc<dyn for<'a> Fn(&'a DurableContext, Value) -> BoxFuture<'a, Result<Value>> + Send + Sync>;
+
+/// A workflow body: something callable as `(&DurableContext, Input) ->
+/// impl Future<Output = Result<Output>>` whose future borrows the context.
+///
+/// Implemented for every `async fn(&DurableContext, I) -> Result<O>` item, for
+/// closures whose return type is written as [`BoxFuture`], and for `async`
+/// closures that capture nothing. The lifetime parameter is what lets the
+/// returned future borrow its context argument — a plain `Fn(&DurableContext, I)
+/// -> Fut` bound cannot say that — and [`erase`] asks for it at every lifetime
+/// (`for<'a> WorkflowHandler<'a, I, O>`).
+///
+/// Lending async closures that borrow their captures do not implement the `Fn`
+/// bound used here. Stable Rust cannot express a general `Send` bound on the
+/// `AsyncFn` family's returned future. Use a named async function or
+/// [`workflow_fn`] with a boxed future for captured dependencies.
+pub trait WorkflowHandler<'a, I, O>: Send + Sync + 'static {
+    /// The future one call returns; borrows the context for `'a`.
+    type Fut: Future<Output = Result<O>> + Send + 'a;
+    /// Run the body against a borrowed context.
+    fn call(&self, ctx: &'a DurableContext, input: I) -> Self::Fut;
+}
+
+impl<'a, I, O, F, Fut> WorkflowHandler<'a, I, O> for F
+where
+    F: Fn(&'a DurableContext, I) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<O>> + Send + 'a,
+{
+    type Fut = Fut;
+    fn call(&self, ctx: &'a DurableContext, input: I) -> Fut {
+        self(ctx, input)
+    }
+}
 
 /// The registry key for a workflow: plain `name`, or an instance-qualified
 /// `name/config` when a non-empty config name is present. Keeps un-configured
@@ -66,25 +137,24 @@ pub(crate) fn registry_key(name: &str, config_name: Option<&str>) -> String {
     }
 }
 
-/// Erase a typed `async fn(DurableContext, Input) -> Result<Output>` into the
+/// Erase a typed `async fn(&DurableContext, Input) -> Result<Output>` into the
 /// JSON-in / JSON-out [`WorkflowFn`] the engine stores.
 ///
 /// This is the single place input/output (de)serialization happens. Both
 /// [`DurableEngine::register`] and the `#[durare::workflow]` macro funnel through
 /// it, so the manual and auto-registered paths behave identically.
-pub fn erase<I, O, F, Fut>(f: F) -> WorkflowFn
+pub fn erase<I, O, F>(f: F) -> WorkflowFn
 where
     I: DeserializeOwned + Send + 'static,
     O: Serialize + Send + 'static,
-    F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<O>> + Send + 'static,
+    F: for<'a> WorkflowHandler<'a, I, O>,
 {
     let f = Arc::new(f);
     Arc::new(move |ctx, input_json| {
         let f = f.clone();
         Box::pin(async move {
             let input: I = serde_json::from_value(input_json)?;
-            let output: O = f(ctx, input).await?;
+            let output: O = f.call(ctx, input).await?;
             Ok(serde_json::to_value(output)?)
         })
     })
@@ -117,11 +187,11 @@ inventory::collect!(WorkflowRegistration);
 /// wrong input type is a compile error:
 ///
 /// ```
-/// use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+/// use durare::{BoxFuture, DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 /// use std::sync::Arc;
 ///
 /// #[durare::workflow]
-/// async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+/// async fn process_order(ctx: &DurableContext, order_id: String) -> Result<String> {
 ///     Ok(format!("receipt for {order_id}"))
 /// }
 ///
@@ -732,12 +802,11 @@ pub struct DurableEngineBuilder {
 
 impl DurableEngineBuilder {
     /// Register a workflow handler under `name`. See [`DurableEngine::register`].
-    pub fn register<I, O, F, Fut>(&mut self, name: &str, f: F) -> &mut Self
+    pub fn register<I, O, F>(&mut self, name: &str, f: F) -> &mut Self
     where
         I: DeserializeOwned + Send + 'static,
         O: Serialize + Send + 'static,
-        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O>> + Send + 'static,
+        F: for<'a> WorkflowHandler<'a, I, O>,
     {
         self.workflows.push((name.to_string(), erase(f)));
         self
@@ -745,17 +814,11 @@ impl DurableEngineBuilder {
 
     /// Register a configured-instance handler. See
     /// [`DurableEngine::register_configured`].
-    pub fn register_configured<I, O, F, Fut>(
-        &mut self,
-        name: &str,
-        config_name: &str,
-        f: F,
-    ) -> &mut Self
+    pub fn register_configured<I, O, F>(&mut self, name: &str, config_name: &str, f: F) -> &mut Self
     where
         I: DeserializeOwned + Send + 'static,
         O: Serialize + Send + 'static,
-        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O>> + Send + 'static,
+        F: for<'a> WorkflowHandler<'a, I, O>,
     {
         self.workflows
             .push((registry_key(name, Some(config_name)), erase(f)));
@@ -1101,14 +1164,14 @@ impl DurableEngine {
 
     /// Register a workflow under `name`.
     ///
-    /// The handler is a plain async function `(DurableContext, Input) -> Result<Output>`.
-    /// `Input` and `Output` only need to be serde-serializable.
-    pub fn register<I, O, F, Fut>(&mut self, name: &str, f: F)
+    /// The handler is a plain async function `(&DurableContext, Input) -> Result<Output>`
+    /// (see [`WorkflowHandler`] for the closure forms). `Input` and `Output` only
+    /// need to be serde-serializable.
+    pub fn register<I, O, F>(&mut self, name: &str, f: F)
     where
         I: DeserializeOwned + Send + 'static,
         O: Serialize + Send + 'static,
-        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O>> + Send + 'static,
+        F: for<'a> WorkflowHandler<'a, I, O>,
     {
         self.workflows.insert(name.to_string(), erase(f));
     }
@@ -1122,12 +1185,11 @@ impl DurableEngine {
     /// to the same one. Register every instance (with the same config name) on
     /// each process start, before [`launch`](Self::launch). The instance's state
     /// is simply captured by the handler closure.
-    pub fn register_configured<I, O, F, Fut>(&mut self, name: &str, config_name: &str, f: F)
+    pub fn register_configured<I, O, F>(&mut self, name: &str, config_name: &str, f: F)
     where
         I: DeserializeOwned + Send + 'static,
         O: Serialize + Send + 'static,
-        F: Fn(DurableContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O>> + Send + 'static,
+        F: for<'a> WorkflowHandler<'a, I, O>,
     {
         self.workflows
             .insert(registry_key(name, Some(config_name)), erase(f));
@@ -1845,7 +1907,7 @@ impl DurableEngine {
     /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
     /// # use std::sync::Arc;
     /// # #[durare::workflow]
-    /// # async fn greet(ctx: DurableContext, name: String) -> Result<String> {
+    /// # async fn greet(ctx: &DurableContext, name: String) -> Result<String> {
     /// #     Ok(format!("hello, {name}"))
     /// # }
     /// # #[tokio::main(flavor = "current_thread")]
@@ -1965,7 +2027,7 @@ impl DurableEngine {
     /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
     /// # use std::sync::Arc;
     /// # #[durare::workflow]
-    /// # async fn process_order(ctx: DurableContext, order: String) -> Result<String> {
+    /// # async fn process_order(ctx: &DurableContext, order: String) -> Result<String> {
     /// #     Ok(format!("receipt for {order}"))
     /// # }
     /// # #[tokio::main(flavor = "current_thread")]
@@ -2259,7 +2321,7 @@ impl DurableEngine {
         // Panics are caught the way a real execution catches them, so a body
         // that panics on an operation it was refused is reported rather than
         // taken out on the caller.
-        let outcome = AssertUnwindSafe(handler(ctx, status.input))
+        let outcome = AssertUnwindSafe(handler(&ctx, status.input))
             .catch_unwind()
             .await;
 
@@ -3253,12 +3315,15 @@ async fn run_to_completion(
         },
         None => None,
     };
+    // The engine owns the context for the run and lends it to the body; the
+    // body's future cannot outlive this borrow, which is what keeps durable
+    // work from escaping into tasks the engine does not drive.
     let ctx = DurableContext::new(id.clone(), rt, auth);
     // Catch a panic in the workflow body so it can't unwind past the status
     // write below — which would strand the row PENDING with observers waiting
     // forever (finding F1). Steps catch their own panics (subject to retry);
     // this handles a panic in the workflow body itself.
-    let run = AssertUnwindSafe(handler(ctx, input)).catch_unwind();
+    let run = AssertUnwindSafe(handler(&ctx, input)).catch_unwind();
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
     // future is dropped (cancelled at its next await) and the workflow is

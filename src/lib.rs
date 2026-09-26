@@ -24,7 +24,7 @@
 //! bottom hold on every commit:
 //!
 //! ```
-//! use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+//! use durare::{BoxFuture, DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
 //! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicU32, Ordering};
 //!
@@ -47,7 +47,7 @@
 //! }
 //!
 //! #[durare::workflow]
-//! async fn process_order(ctx: DurableContext, order_id: String) -> Result<String> {
+//! async fn process_order(ctx: &DurableContext, order_id: String) -> Result<String> {
 //!     // Reads like ordinary async code; each step checkpoints once.
 //!     let charge_id = charge_card(&ctx, order_id).await?;
 //!     send_receipt(&ctx, charge_id.clone()).await?;
@@ -207,7 +207,7 @@ pub use client::Client;
 #[cfg(feature = "conductor")]
 #[cfg_attr(docsrs, doc(cfg(feature = "conductor")))]
 pub use conductor::{AlertHandler, Conductor, ConductorConfig};
-pub use context::{AuthContext, DurableContext, PendingStep, RetryPredicate, StepOptions};
+pub use context::{AuthContext, DurableContext, PendingStep, RetryPredicate, StepCtx, StepOptions};
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub use datasource::DataSource;
 #[cfg(feature = "postgres")]
@@ -221,9 +221,9 @@ pub use debounce::{Debouncer, DebouncerClient};
 #[doc(hidden)]
 pub use engine::WorkflowResult;
 pub use engine::{
-    erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, EngineMetrics,
-    HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef, WorkflowFn,
-    WorkflowOptions, WorkflowRegistration,
+    erase, workflow_fn, BoxFuture, DeduplicationPolicy, DurableEngine, DurableEngineBuilder,
+    EngineConfig, EngineMetrics, HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage,
+    WorkflowDef, WorkflowFn, WorkflowHandler, WorkflowOptions, WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by

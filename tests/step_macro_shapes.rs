@@ -8,7 +8,9 @@
 //! own lifetime instead, so these shapes go on compiling; most of this file is
 //! the test.
 
-use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
+use durare::{
+    workflow_fn, DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions,
+};
 use serde::{de::DeserializeOwned, Serialize};
 use std::sync::Arc;
 
@@ -48,17 +50,22 @@ async fn echo_txn<T: Serialize + DeserializeOwned + Send + Sync + Clone + 'stati
 #[tokio::test]
 async fn the_accepted_shapes_run_and_keep_their_positions() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("probe", |ctx: DurableContext, _: ()| async move {
-        let owned = String::from("hello world");
-        // Built in this order, awaited in the reverse.
-        let counted = count_chars(&ctx, &owned);
-        let worded = first_word(&ctx, &owned);
-        let echoed = echo(&ctx, 7_i64);
-        assert_eq!(echoed.await?, 7);
-        assert_eq!(worded.await?, "hello");
-        assert_eq!(counted.await?, 11);
-        Ok::<_, durare::Error>(0_i64)
-    });
+    engine.register(
+        "probe",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let owned = String::from("hello world");
+                // Built in this order, awaited in the reverse.
+                let counted = count_chars(ctx, &owned);
+                let worded = first_word(ctx, &owned);
+                let echoed = echo(ctx, 7_i64);
+                assert_eq!(echoed.await?, 7);
+                assert_eq!(worded.await?, "hello");
+                assert_eq!(counted.await?, 11);
+                Ok::<_, durare::Error>(0_i64)
+            })
+        }),
+    );
     engine
         .start::<_, i64>("probe", (), WorkflowOptions::with_id("wf"))
         .await?
@@ -79,5 +86,32 @@ async fn the_accepted_shapes_run_and_keep_their_positions() -> Result<()> {
             (2, "echo".to_string())
         ]
     );
+    Ok(())
+}
+
+#[durare::step]
+async fn named_step_argument(ctx: &DurableContext, _step: String) -> Result<String> {
+    Ok(_step)
+}
+
+#[tokio::test]
+async fn step_metadata_does_not_shadow_a_user_argument() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register(
+        "shadow",
+        workflow_fn(|ctx, value: String| {
+            Box::pin(async move { named_step_argument(ctx, value).await })
+        }),
+    );
+    let value = engine
+        .start::<_, String>(
+            "shadow",
+            "user value".to_owned(),
+            WorkflowOptions::with_id("shadow"),
+        )
+        .await?
+        .result()
+        .await?;
+    assert_eq!(value, "user value");
     Ok(())
 }

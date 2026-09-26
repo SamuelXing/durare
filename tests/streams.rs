@@ -2,7 +2,7 @@
 //! append-only stream that an external reader drains in order, observing the
 //! close (or the producer going inactive).
 
-use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{workflow_fn, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,13 +11,18 @@ use std::time::Duration;
 #[tokio::test]
 async fn write_close_then_read_in_order() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("producer", |ctx: DurableContext, _: ()| async move {
-        for i in 0..3_i64 {
-            ctx.write_stream("nums", i).await?;
-        }
-        ctx.close_stream("nums").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                for i in 0..3_i64 {
+                    ctx.write_stream("nums", i).await?;
+                }
+                ctx.close_stream("nums").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     engine
         .start::<_, ()>("producer", (), WorkflowOptions::with_id("p"))
@@ -50,11 +55,16 @@ async fn write_close_then_read_in_order() -> Result<()> {
 #[tokio::test]
 async fn read_stops_when_producer_finishes_without_close() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("producer", |ctx: DurableContext, _: ()| async move {
-        ctx.write_stream("s", "a".to_string()).await?;
-        ctx.write_stream("s", "b".to_string()).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.write_stream("s", "a".to_string()).await?;
+                ctx.write_stream("s", "b".to_string()).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     engine
         .start::<_, ()>("producer", (), WorkflowOptions::with_id("p2"))
@@ -73,13 +83,18 @@ async fn read_stops_when_producer_finishes_without_close() -> Result<()> {
 #[tokio::test]
 async fn snapshot_reads_available_from_offset() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("producer", |ctx: DurableContext, _: ()| async move {
-        for i in 0..3_i64 {
-            ctx.write_stream("nums", i).await?;
-        }
-        ctx.close_stream("nums").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                for i in 0..3_i64 {
+                    ctx.write_stream("nums", i).await?;
+                }
+                ctx.close_stream("nums").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine
         .start::<_, ()>("producer", (), WorkflowOptions::with_id("p3"))
         .await?
@@ -100,11 +115,16 @@ async fn snapshot_reads_available_from_offset() -> Result<()> {
 #[tokio::test]
 async fn writing_to_closed_stream_errors() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("bad", |ctx: DurableContext, _: ()| async move {
-        ctx.close_stream("s").await?;
-        ctx.write_stream("s", 1_i64).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "bad",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.close_stream("s").await?;
+                ctx.write_stream("s", 1_i64).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     let res = engine
         .start::<_, ()>("bad", (), WorkflowOptions::with_id("p4"))
@@ -121,19 +141,27 @@ async fn writing_to_closed_stream_errors() -> Result<()> {
 #[tokio::test]
 async fn workflow_reads_another_workflows_stream() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("producer", |ctx: DurableContext, _: ()| async move {
-        for i in 1..=3_i64 {
-            ctx.write_stream("nums", i).await?;
-        }
-        ctx.close_stream("nums").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                for i in 1..=3_i64 {
+                    ctx.write_stream("nums", i).await?;
+                }
+                ctx.close_stream("nums").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register(
         "consumer",
-        |ctx: DurableContext, producer_id: String| async move {
-            let (values, _closed): (Vec<i64>, bool) = ctx.read_stream(&producer_id, "nums").await?;
-            Ok::<_, Error>(values)
-        },
+        workflow_fn(|ctx, producer_id: String| {
+            Box::pin(async move {
+                let (values, _closed): (Vec<i64>, bool) =
+                    ctx.read_stream(&producer_id, "nums").await?;
+                Ok::<_, Error>(values)
+            })
+        }),
     );
 
     engine
@@ -166,15 +194,20 @@ async fn async_stream_yields_values_incrementally() -> Result<()> {
     use durare::StreamExt;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("slow_producer", |ctx: DurableContext, _: ()| async move {
-        ctx.write_stream("s", 1_i64).await?;
-        ctx.sleep(Duration::from_millis(40)).await?;
-        ctx.write_stream("s", 2_i64).await?;
-        ctx.sleep(Duration::from_millis(40)).await?;
-        ctx.write_stream("s", 3_i64).await?;
-        ctx.close_stream("s").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "slow_producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.write_stream("s", 1_i64).await?;
+                ctx.sleep(Duration::from_millis(40)).await?;
+                ctx.write_stream("s", 2_i64).await?;
+                ctx.sleep(Duration::from_millis(40)).await?;
+                ctx.write_stream("s", 3_i64).await?;
+                ctx.close_stream("s").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     let producer = engine
         .start::<_, ()>("slow_producer", (), WorkflowOptions::with_id("p6"))
@@ -218,11 +251,16 @@ async fn async_stream_drains_when_producer_finishes_without_close() -> Result<()
     use durare::StreamExt;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("p_noclose", |ctx: DurableContext, _: ()| async move {
-        ctx.write_stream("s", "a".to_string()).await?;
-        ctx.write_stream("s", "b".to_string()).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "p_noclose",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.write_stream("s", "a".to_string()).await?;
+                ctx.write_stream("s", "b".to_string()).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     // The producer is already terminal before the reader starts, so the stream
     // ends via the inactive-producer path rather than a close sentinel.
@@ -250,13 +288,18 @@ async fn async_stream_drains_when_producer_finishes_without_close() -> Result<()
 #[tokio::test]
 async fn read_drains_while_producer_runs() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("slow_producer", |ctx: DurableContext, _: ()| async move {
-        ctx.write_stream("s", 1_i64).await?;
-        ctx.sleep(Duration::from_millis(50)).await?;
-        ctx.write_stream("s", 2_i64).await?;
-        ctx.close_stream("s").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "slow_producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.write_stream("s", 1_i64).await?;
+                ctx.sleep(Duration::from_millis(50)).await?;
+                ctx.write_stream("s", 2_i64).await?;
+                ctx.close_stream("s").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     // Start the producer in the background, then block draining its stream.
     let producer = engine

@@ -2,8 +2,8 @@
 //! auto-registered (via `inventory`) only in this test binary.
 
 use durare::{
-    DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result, ScheduleFilter,
-    ScheduledInput, StateProvider,
+    workflow_fn, DurableContext, DurableEngine, InMemoryProvider, ListFilter, Result,
+    ScheduleFilter, ScheduledInput, StateProvider,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,7 @@ static RUNS: AtomicUsize = AtomicUsize::new(0);
 /// Fires every second (6-field cron: sec min hour dom mon dow). Receives the
 /// scheduled tick time and (unset here) context as its [`ScheduledInput`].
 #[durare::workflow(schedule = "* * * * * *")]
-async fn cron_tick(_ctx: DurableContext, _tick: ScheduledInput) -> Result<()> {
+async fn cron_tick(_ctx: &DurableContext, _tick: ScheduledInput) -> Result<()> {
     RUNS.fetch_add(1, Ordering::SeqCst);
     Ok(())
 }
@@ -75,9 +75,10 @@ async fn cron_fires_once_per_tick_across_executors() -> Result<()> {
 #[tokio::test]
 async fn lists_registered_and_scheduled_workflows() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("manual_noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, durare::Error>(())
-    });
+    engine.register(
+        "manual_noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, durare::Error>(()) })),
+    );
 
     let all = engine.list_registered_workflows();
     // The manual workflow is present and unscheduled.

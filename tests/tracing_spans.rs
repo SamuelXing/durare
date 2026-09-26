@@ -7,7 +7,7 @@
 //! capture sees all spans without touching global state.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
     WorkflowOptions, WorkflowQueue,
 };
 use std::collections::HashMap;
@@ -121,18 +121,20 @@ async fn workflow_and_step_spans_carry_dbos_attributes() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register(
         "traced-wf",
-        |ctx: DurableContext, greeting: String| async move {
-            let a = ctx
-                .step("compose", || async move {
-                    Ok::<_, Error>(format!("{greeting}!"))
+        workflow_fn(|ctx, greeting: String| {
+            Box::pin(async move {
+                let a = ctx
+                    .step("compose", |_| async move {
+                        Ok::<_, Error>(format!("{greeting}!"))
+                    })
+                    .await?;
+                ctx.step_with(StepOptions::new("deliver"), |_| {
+                    let a = a.clone();
+                    async move { Ok::<_, Error>(a.len() as i64) }
                 })
-                .await?;
-            ctx.step_with(StepOptions::new("deliver"), || {
-                let a = a.clone();
-                async move { Ok::<_, Error>(a.len() as i64) }
+                .await
             })
-            .await
-        },
+        }),
     );
     engine.launch().await?;
 
@@ -182,9 +184,10 @@ async fn queued_span_carries_queue_and_identity() -> Result<()> {
     let (cap, _guard) = capture();
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("queued-wf", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "queued-wf",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(WorkflowQueue::new("obs-q"));
     engine.launch().await?;
 
@@ -213,10 +216,15 @@ async fn failure_records_error_status() -> Result<()> {
     let (cap, _guard) = capture();
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("failing-wf", |ctx: DurableContext, (): ()| async move {
-        ctx.step("explode", || async { Err::<(), _>(Error::app("boom")) })
-            .await
-    });
+    engine.register(
+        "failing-wf",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.step("explode", |_| async { Err::<(), _>(Error::app("boom")) })
+                    .await
+            })
+        }),
+    );
     engine.launch().await?;
 
     let err = engine
@@ -242,15 +250,21 @@ async fn child_workflow_span_parents_under_parent() -> Result<()> {
     let (cap, _guard) = capture();
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("obs-child", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>("done".to_string())
-    });
-    engine.register("obs-parent", |ctx: DurableContext, (): ()| async move {
-        let child = ctx
-            .start_workflow::<(), String>("obs-child", (), WorkflowOptions::default())
-            .await?;
-        child.await
-    });
+    engine.register(
+        "obs-child",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>("done".to_string()) })),
+    );
+    engine.register(
+        "obs-parent",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                let child = ctx
+                    .start_workflow::<(), String>("obs-child", (), WorkflowOptions::default())
+                    .await?;
+                child.await
+            })
+        }),
+    );
     engine.launch().await?;
 
     let out: String = engine
@@ -293,18 +307,24 @@ async fn recovered_run_marks_replayed_steps() -> Result<()> {
     let url = format!("sqlite://{}", path.display());
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("obs-recover", |ctx: DurableContext, (): ()| async move {
-            ctx.step("first", || async {
-                S1_RAN.store(true, Ordering::SeqCst);
-                Ok::<_, Error>(1_i64)
-            })
-            .await?;
-            if STALL.load(Ordering::SeqCst) {
-                // The crash: this run never finishes, like a killed process.
-                std::future::pending::<()>().await;
-            }
-            ctx.step("second", || async { Ok::<_, Error>(2_i64) }).await
-        });
+        engine.register(
+            "obs-recover",
+            workflow_fn(|ctx, (): ()| {
+                Box::pin(async move {
+                    ctx.step("first", |_| async {
+                        S1_RAN.store(true, Ordering::SeqCst);
+                        Ok::<_, Error>(1_i64)
+                    })
+                    .await?;
+                    if STALL.load(Ordering::SeqCst) {
+                        // The crash: this run never finishes, like a killed process.
+                        std::future::pending::<()>().await;
+                    }
+                    ctx.step("second", |_| async { Ok::<_, Error>(2_i64) })
+                        .await
+                })
+            }),
+        );
     };
 
     // Run 1 checkpoints `first`, then stalls; dropping the engine is the crash.

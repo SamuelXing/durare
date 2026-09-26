@@ -8,7 +8,7 @@
 //! the schedule fire loop and are no-ops unless armed here.
 
 use durare::{
-    DurableContext, DurableEngine, Error, ListFilter, Result, ScheduleOptions, ScheduledInput,
+    workflow_fn, DurableEngine, Error, ListFilter, Result, ScheduleOptions, ScheduledInput,
     SqliteProvider, StateProvider, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,14 +47,16 @@ async fn tick_survives_crash_before_run() -> Result<()> {
     let register = |engine: &mut DurableEngine| {
         engine.register(
             "job",
-            |ctx: DurableContext, _at: ScheduledInput| async move {
-                ctx.step("work", || async {
-                    WORK.fetch_add(1, Ordering::SeqCst);
+            workflow_fn(|ctx, _at: ScheduledInput| {
+                Box::pin(async move {
+                    ctx.step("work", |_| async {
+                        WORK.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
                     Ok::<_, Error>(())
                 })
-                .await?;
-                Ok::<_, Error>(())
-            },
+            }),
         );
     };
 
@@ -125,21 +127,23 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
     let register = |engine: &mut DurableEngine| {
         engine.register(
             "job",
-            |ctx: DurableContext, _at: ScheduledInput| async move {
-                ctx.step("s1", || async {
-                    S1.fetch_add(1, Ordering::SeqCst);
+            workflow_fn(|ctx, _at: ScheduledInput| {
+                Box::pin(async move {
+                    ctx.step("s1", |_| async {
+                        S1.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
+                    // Crash between the two steps once s1 is checkpointed.
+                    fail::fail_point!("scheduled_job_mid_run");
+                    ctx.step("s2", |_| async {
+                        S2.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Error>(())
+                    })
+                    .await?;
                     Ok::<_, Error>(())
                 })
-                .await?;
-                // Crash between the two steps once s1 is checkpointed.
-                fail::fail_point!("scheduled_job_mid_run");
-                ctx.step("s2", || async {
-                    S2.fetch_add(1, Ordering::SeqCst);
-                    Ok::<_, Error>(())
-                })
-                .await?;
-                Ok::<_, Error>(())
-            },
+            }),
         );
     };
 
@@ -212,14 +216,16 @@ async fn tick_completes_when_crash_before_reschedule() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
     engine.register(
         "job",
-        |ctx: DurableContext, _at: ScheduledInput| async move {
-            ctx.step("work", || async {
-                WORK.fetch_add(1, Ordering::SeqCst);
+        workflow_fn(|ctx, _at: ScheduledInput| {
+            Box::pin(async move {
+                ctx.step("work", |_| async {
+                    WORK.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(())
+                })
+                .await?;
                 Ok::<_, Error>(())
             })
-            .await?;
-            Ok::<_, Error>(())
-        },
+        }),
     );
     engine
         .create_schedule("tick", "job", "* * * * * *", ScheduleOptions::new())

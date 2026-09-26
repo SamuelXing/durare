@@ -1,0 +1,12 @@
+error: lifetime may not live long enough
+  --> tests/compile_fail/transaction_metadata_borrow.rs:8:51
+   |
+ 5 |       engine.register("metadata", workflow_fn(move |ctx, (): ()| {
+   |                                                     --- has type `&'1 DurableContext`
+...
+ 8 |               ctx.transaction_on(&ds, "tx", |_conn| Box::pin(async move {
+   |  ___________________________________________________^
+ 9 | |                 tokio::task::yield_now().await;
+10 | |                 Ok(ctx.workflow_id().to_owned())
+11 | |             })).await
+   | |______________^ returning this value requires that `'1` must outlive `'static`

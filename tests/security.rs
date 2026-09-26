@@ -18,7 +18,7 @@
 //! the drop would destroy the tables the final assertions read.
 
 use durare::{
-    DurableContext, DurableEngine, Error, ListFilter, Result, ScheduleOptions, StateProvider,
+    workflow_fn, DurableEngine, Error, ListFilter, Result, ScheduleOptions, StateProvider,
     WorkflowOptions, WorkflowQueue,
 };
 use std::sync::Arc;
@@ -53,25 +53,28 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
             stream_key.clone(),
             step_name.clone(),
         );
-        engine.register(&wf_name, move |ctx: DurableContext, (): ()| {
-            let (topic, event_key, stream_key, step_name) = (
-                topic.clone(),
-                event_key.clone(),
-                stream_key.clone(),
-                step_name.clone(),
-            );
-            async move {
-                // recv consumes a persisted notification on a hostile topic …
-                let msg = ctx.recv::<String>(&topic, Duration::from_secs(10)).await?;
-                // … and the other durable ops write under hostile keys/names.
-                ctx.set_event(&event_key, EVIL).await?;
-                ctx.write_stream(&stream_key, EVIL).await?;
-                ctx.close_stream(&stream_key).await?;
-                ctx.step(&step_name, || async { Ok::<_, Error>(()) })
-                    .await?;
-                Ok::<_, Error>(msg.unwrap_or_default())
-            }
-        });
+        engine.register(
+            &wf_name,
+            workflow_fn(move |ctx, (): ()| {
+                let (topic, event_key, stream_key, step_name) = (
+                    topic.clone(),
+                    event_key.clone(),
+                    stream_key.clone(),
+                    step_name.clone(),
+                );
+                Box::pin(async move {
+                    // recv consumes a persisted notification on a hostile topic …
+                    let msg = ctx.recv::<String>(&topic, Duration::from_secs(10)).await?;
+                    // … and the other durable ops write under hostile keys/names.
+                    ctx.set_event(&event_key, EVIL).await?;
+                    ctx.write_stream(&stream_key, EVIL).await?;
+                    ctx.close_stream(&stream_key).await?;
+                    ctx.step(&step_name, |_| async { Ok::<_, Error>(()) })
+                        .await?;
+                    Ok::<_, Error>(msg.unwrap_or_default())
+                })
+            }),
+        );
     }
     engine.register_queue(WorkflowQueue::new(&queue_name).partitioned());
     engine.listen_queues([queue_name.clone()]);

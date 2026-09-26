@@ -23,7 +23,7 @@
 //! use std::time::Duration;
 //!
 //! #[durare::workflow]
-//! async fn approval(ctx: DurableContext, what: String) -> Result<String> {
+//! async fn approval(ctx: &DurableContext, what: String) -> Result<String> {
 //!     ctx.set_event("status", "waiting".to_string()).await?;
 //!     let decision = ctx
 //!         .recv::<String>("decision", Duration::from_secs(10))

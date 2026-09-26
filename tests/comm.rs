@@ -2,7 +2,7 @@
 //! safety) and set_event/get_event, on the in-memory provider.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, StateProvider, WorkflowOptions,
     WorkflowStatus, STATUS_PENDING,
 };
 use serde_json::Value;
@@ -13,10 +13,15 @@ use std::time::{Duration, Instant};
 #[tokio::test]
 async fn send_unblocks_waiting_recv() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("waiter", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("greetings", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("greetings", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
 
     let handle = engine
         .start::<_, String>("waiter", (), WorkflowOptions::with_id("wf-recv"))
@@ -33,20 +38,30 @@ async fn send_unblocks_waiting_recv() -> Result<()> {
 #[tokio::test]
 async fn recv_is_fifo() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("take_two", |ctx: DurableContext, _: ()| async move {
-        let a: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
-        let b: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(format!(
-            "{},{}",
-            a.unwrap_or_default(),
-            b.unwrap_or_default()
-        ))
-    });
-    engine.register("producer", |ctx: DurableContext, dest: String| async move {
-        ctx.send(&dest, "m1".to_string(), "t").await?;
-        ctx.send(&dest, "m2".to_string(), "t").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "take_two",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let a: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+                let b: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(format!(
+                    "{},{}",
+                    a.unwrap_or_default(),
+                    b.unwrap_or_default()
+                ))
+            })
+        }),
+    );
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, dest: String| {
+            Box::pin(async move {
+                ctx.send(&dest, "m1".to_string(), "t").await?;
+                ctx.send(&dest, "m2".to_string(), "t").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     let consumer = engine
         .start::<_, String>("take_two", (), WorkflowOptions::with_id("wf-fifo"))
@@ -67,10 +82,15 @@ async fn recv_is_fifo() -> Result<()> {
 #[tokio::test]
 async fn recv_times_out_to_none() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("impatient", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("silence", Duration::from_millis(100)).await?;
-        Ok::<_, Error>(msg.is_none())
-    });
+    engine.register(
+        "impatient",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("silence", Duration::from_millis(100)).await?;
+                Ok::<_, Error>(msg.is_none())
+            })
+        }),
+    );
 
     let started = Instant::now();
     let timed_out: bool = engine
@@ -90,10 +110,15 @@ async fn recv_times_out_to_none() -> Result<()> {
 async fn recv_replay_does_not_double_consume() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("take_one", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "take_one",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
 
     // Create the workflow row directly in PENDING so recover() executes it.
     provider
@@ -158,18 +183,25 @@ async fn send_to_missing_workflow_errors() -> Result<()> {
 #[tokio::test]
 async fn set_event_and_get_event() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("publisher", |ctx: DurableContext, _: ()| async move {
-        ctx.set_event("status", "ready").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "publisher",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.set_event("status", "ready").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register(
         "subscriber",
-        |ctx: DurableContext, target: String| async move {
-            let v: Option<String> = ctx
-                .get_event(&target, "status", Duration::from_secs(5))
-                .await?;
-            Ok::<_, Error>(v.unwrap_or_default())
-        },
+        workflow_fn(|ctx, target: String| {
+            Box::pin(async move {
+                let v: Option<String> = ctx
+                    .get_event(&target, "status", Duration::from_secs(5))
+                    .await?;
+                Ok::<_, Error>(v.unwrap_or_default())
+            })
+        }),
     );
 
     engine
@@ -204,13 +236,18 @@ async fn set_event_and_get_event() -> Result<()> {
 #[tokio::test]
 async fn set_event_keys_are_independent_and_last_write_wins() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("multi_event", |ctx: DurableContext, _: ()| async move {
-        ctx.set_event("phase", "start").await?;
-        ctx.set_event("progress", 10_i64).await?;
-        // Overwrite one key; the other must be untouched.
-        ctx.set_event("phase", "done").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "multi_event",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.set_event("phase", "start").await?;
+                ctx.set_event("progress", 10_i64).await?;
+                // Overwrite one key; the other must be untouched.
+                ctx.set_event("phase", "done").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     engine
         .start::<_, ()>("multi_event", (), WorkflowOptions::with_id("wf-ev"))
@@ -237,9 +274,10 @@ async fn set_event_keys_are_independent_and_last_write_wins() -> Result<()> {
 #[tokio::test]
 async fn get_event_times_out_to_none() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine
         .start::<_, ()>("noop", (), WorkflowOptions::with_id("wf-empty"))
         .await?
@@ -307,10 +345,15 @@ async fn send_bulk_fans_out_to_many_workflows() -> Result<()> {
     use durare::SendMessage;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("waiter", |ctx: DurableContext, topic: String| async move {
-        let msg: Option<String> = ctx.recv(&topic, Duration::from_secs(5)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, topic: String| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv(&topic, Duration::from_secs(5)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
 
     let mut handles = Vec::new();
     for n in 0..3 {
@@ -348,11 +391,16 @@ async fn send_bulk_idempotency_keys() -> Result<()> {
     use durare::SendMessage;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("sink", |ctx: DurableContext, _: ()| async move {
-        // Park so the mailbox can be inspected while the workflow is live.
-        ctx.recv::<String>("done", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "sink",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                // Park so the mailbox can be inspected while the workflow is live.
+                ctx.recv::<String>("done", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     let h = engine
         .start::<_, ()>("sink", (), WorkflowOptions::with_id("bulk-sink"))
         .await?;
@@ -393,10 +441,15 @@ async fn send_bulk_is_all_or_nothing_on_a_missing_destination() -> Result<()> {
     use durare::SendMessage;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("sink", |ctx: DurableContext, _: ()| async move {
-        ctx.recv::<String>("done", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "sink",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.recv::<String>("done", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     let h = engine
         .start::<_, ()>("sink", (), WorkflowOptions::with_id("bulk-real"))
         .await?;
@@ -427,18 +480,28 @@ async fn ctx_send_bulk_records_one_step() -> Result<()> {
     use durare::SendMessage;
 
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("fan", |ctx: DurableContext, _: ()| async move {
-        ctx.send_bulk(&[
-            SendMessage::new("bulk-rx-0", "a".to_string(), "t"),
-            SendMessage::new("bulk-rx-1", "b".to_string(), "t"),
-        ])
-        .await?;
-        Ok::<_, Error>(())
-    });
-    engine.register("rx", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "fan",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.send_bulk(&[
+                    SendMessage::new("bulk-rx-0", "a".to_string(), "t"),
+                    SendMessage::new("bulk-rx-1", "b".to_string(), "t"),
+                ])
+                .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
+    engine.register(
+        "rx",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("t", Duration::from_secs(5)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
 
     let mut receivers = Vec::new();
     for n in 0..2 {

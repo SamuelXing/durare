@@ -4,7 +4,7 @@
 //! `DurableEngine::connect` scheme-dispatches a provider from a URL.
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, WorkflowOptions,
     WorkflowQueue,
 };
 use std::sync::Arc;
@@ -17,9 +17,10 @@ async fn builder_builds_a_runnable_engine() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut b = DurableEngine::builder(provider);
     b.app_version("9.9.9");
-    b.register("add", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    b.register(
+        "add",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     let engine = b.build().await?;
     assert_eq!(engine.app_version(), "9.9.9");
     engine.launch().await?;
@@ -40,12 +41,14 @@ async fn builder_builds_a_runnable_engine() -> Result<()> {
 async fn builder_rejects_duplicate_names() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut b = DurableEngine::builder(provider);
-    b.register("dup", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(1_i64)
-    });
-    b.register("dup", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(2_i64)
-    });
+    b.register(
+        "dup",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(1_i64) })),
+    );
+    b.register(
+        "dup",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(2_i64) })),
+    );
     let Err(err) = b.build().await else {
         panic!("duplicate name must error");
     };
@@ -60,12 +63,16 @@ async fn builder_rejects_duplicate_names() -> Result<()> {
 async fn builder_configured_instances_do_not_conflict() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut b = DurableEngine::builder(provider);
-    b.register_configured("greet", "en", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>("hi".to_string())
-    });
-    b.register_configured("greet", "fr", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>("salut".to_string())
-    });
+    b.register_configured(
+        "greet",
+        "en",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>("hi".to_string()) })),
+    );
+    b.register_configured(
+        "greet",
+        "fr",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>("salut".to_string()) })),
+    );
     // Distinct config names → distinct keys → builds fine.
     let engine = b.build().await?;
     engine.shutdown(Duration::from_secs(1)).await?;
@@ -73,12 +80,16 @@ async fn builder_configured_instances_do_not_conflict() -> Result<()> {
     // Same (name, config) twice → conflict.
     let provider = Arc::new(InMemoryProvider::new());
     let mut b2 = DurableEngine::builder(provider);
-    b2.register_configured("greet", "en", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>("a".to_string())
-    });
-    b2.register_configured("greet", "en", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>("b".to_string())
-    });
+    b2.register_configured(
+        "greet",
+        "en",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>("a".to_string()) })),
+    );
+    b2.register_configured(
+        "greet",
+        "en",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>("b".to_string()) })),
+    );
     let Err(err) = b2.build().await else {
         panic!("same config twice must error");
     };
@@ -126,7 +137,7 @@ async fn builder_rejects_reserved_debouncer_workflow_name() -> Result<()> {
     let mut b = DurableEngine::builder(provider);
     b.register(
         "_dbos_debouncer",
-        |_ctx: DurableContext, _: ()| async move { Ok::<_, Error>(()) },
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
     );
     let Err(err) = b.build().await else {
         panic!("reserved workflow name must error");
@@ -140,9 +151,10 @@ async fn builder_rejects_reserved_debouncer_workflow_name() -> Result<()> {
 #[tokio::test]
 async fn connect_dispatches_by_scheme() -> Result<()> {
     let mut b = DurableEngine::connect("memory:").await?;
-    b.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    b.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     let engine = b.build().await?;
     engine.launch().await?;
     let () = engine

@@ -5,7 +5,7 @@
 //!   createdb durare_test && DATABASE_URL=postgres://localhost/durare_test cargo test --test postgres
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
+    workflow_fn, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
     PostgresProvider, RateLimiter, Result, ScheduledInput, Serializer, StateProvider,
     TransactionOptions, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
@@ -23,12 +23,17 @@ fn database_url() -> Option<String> {
 async fn engine_with(url: &str, fmt: Serializer) -> Result<DurableEngine> {
     let provider = PostgresProvider::connect(url).await?.with_serializer(fmt);
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("greet", |ctx: DurableContext, name: String| async move {
-        let msg = ctx
-            .step("build", || async { Ok::<_, Error>(format!("hi {name}")) })
-            .await?;
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        "greet",
+        workflow_fn(|ctx, name: String| {
+            Box::pin(async move {
+                let msg = ctx
+                    .step("build", |_| async { Ok::<_, Error>(format!("hi {name}")) })
+                    .await?;
+                Ok::<_, Error>(msg)
+            })
+        }),
+    );
     Ok(engine)
 }
 
@@ -77,9 +82,12 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
         async move {
             let provider = PostgresProvider::connect(&url).await?.with_serializer(fmt);
             let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-            engine.register("boom", |_ctx: DurableContext, _: ()| async move {
-                Err::<(), _>(Error::app("kaboom"))
-            });
+            engine.register(
+                "boom",
+                workflow_fn(|_ctx, _: ()| {
+                    Box::pin(async move { Err::<(), _>(Error::app("kaboom")) })
+                }),
+            );
             let outcome = engine
                 .start::<_, ()>("boom", (), WorkflowOptions::with_id(&id))
                 .await?
@@ -121,14 +129,19 @@ async fn pg_portable_error_envelope_round_trip() -> Result<()> {
             .await?
             .with_serializer(Serializer::Portable);
         let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-        engine.register("validate", |_ctx: DurableContext, _: ()| async move {
-            Err::<(), _>(Error::Portable(Box::new(PortableWorkflowError {
-                name: "ValidationError".to_string(),
-                message: "bad email".to_string(),
-                code: Some(serde_json::json!(400)),
-                data: None,
-            })))
-        });
+        engine.register(
+            "validate",
+            workflow_fn(|_ctx, _: ()| {
+                Box::pin(async move {
+                    Err::<(), _>(Error::Portable(Box::new(PortableWorkflowError {
+                        name: "ValidationError".to_string(),
+                        message: "bad email".to_string(),
+                        code: Some(serde_json::json!(400)),
+                        data: None,
+                    })))
+                })
+            }),
+        );
         let _ = engine
             .start::<_, ()>("validate", (), WorkflowOptions::with_id(&typed_id))
             .await?
@@ -170,19 +183,24 @@ async fn pg_checkpoints_a_caught_step_failure() -> Result<()> {
     let id = format!("wf-step-err-{}", uuid::Uuid::new_v4());
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("flaky_caught", |ctx: DurableContext, _: ()| async move {
-            let r: Result<i64> = ctx
-                .step("maybe", || async {
-                    let n = RUNS.fetch_add(1, Ordering::SeqCst);
-                    if n == 0 {
-                        Err(Error::app("transient"))
-                    } else {
-                        Ok(7)
-                    }
+        engine.register(
+            "flaky_caught",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let r: Result<i64> = ctx
+                        .step("maybe", |_| async {
+                            let n = RUNS.fetch_add(1, Ordering::SeqCst);
+                            if n == 0 {
+                                Err(Error::app("transient"))
+                            } else {
+                                Ok(7)
+                            }
+                        })
+                        .await;
+                    Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
                 })
-                .await;
-            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
-        });
+            }),
+        );
     };
 
     {
@@ -238,14 +256,19 @@ async fn pg_auth_context_round_trip() -> Result<()> {
     // version keeps this test's internal-queue work claimable only here.
     let ver = format!("v-auth-{tag}");
     let mut engine = DurableEngine::new_with_version(Arc::new(provider), &ver).await?;
-    engine.register("whoami", |ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(format!(
-            "{}/{}/{}",
-            ctx.authenticated_user().unwrap_or("-"),
-            ctx.assumed_role().unwrap_or("-"),
-            ctx.authenticated_roles().join(","),
-        ))
-    });
+    engine.register(
+        "whoami",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                Ok::<_, Error>(format!(
+                    "{}/{}/{}",
+                    ctx.authenticated_user().unwrap_or("-"),
+                    ctx.assumed_role().unwrap_or("-"),
+                    ctx.authenticated_roles().join(","),
+                ))
+            })
+        }),
+    );
 
     let id = format!("wf-auth-{tag}");
     let opts = WorkflowOptions::with_id(&id)
@@ -284,15 +307,25 @@ async fn pg_child_workflow() -> Result<()> {
     let tag = uuid::Uuid::new_v4();
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("child", |ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(format!("{n}:{}", ctx.authenticated_user().unwrap_or("-")))
-    });
-    engine.register("parent", |ctx: DurableContext, n: i64| async move {
-        let child = ctx
-            .start_workflow::<_, String>("child", n, WorkflowOptions::default())
-            .await?;
-        child.result().await
-    });
+    engine.register(
+        "child",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                Ok::<_, Error>(format!("{n}:{}", ctx.authenticated_user().unwrap_or("-")))
+            })
+        }),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                let child = ctx
+                    .start_workflow::<_, String>("child", n, WorkflowOptions::default())
+                    .await?;
+                child.result().await
+            })
+        }),
+    );
 
     let parent_id = format!("parent-{tag}");
     let opts = WorkflowOptions::with_id(&parent_id).authenticated_user("alice");
@@ -324,18 +357,24 @@ async fn pg_workflow_steps() -> Result<()> {
     let tag = uuid::Uuid::new_v4();
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("kid", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("worker", |ctx: DurableContext, _: ()| async move {
-        let v = ctx
-            .step("compute", || async { Ok::<_, Error>(42_i64) })
-            .await?;
-        let child = ctx
-            .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
-            .await?;
-        child.result().await
-    });
+    engine.register(
+        "kid",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "worker",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let v = ctx
+                    .step("compute", |_| async { Ok::<_, Error>(42_i64) })
+                    .await?;
+                let child = ctx
+                    .start_workflow::<_, i64>("kid", v, WorkflowOptions::default())
+                    .await?;
+                child.result().await
+            })
+        }),
+    );
 
     let id = format!("steps-{tag}");
     let _: i64 = engine
@@ -370,9 +409,10 @@ async fn pg_patch() -> Result<()> {
     let tag = uuid::Uuid::new_v4();
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("wf", |ctx: DurableContext, _: ()| async move {
-        ctx.patch("feature").await
-    });
+    engine.register(
+        "wf",
+        workflow_fn(|ctx, _: ()| Box::pin(async move { ctx.patch("feature").await })),
+    );
 
     // A brand-new workflow takes the new path and records the marker.
     let fresh = format!("patch-new-{tag}");
@@ -446,16 +486,21 @@ async fn pg_select() -> Result<()> {
     let tag = uuid::Uuid::new_v4();
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("racer", |ctx: DurableContext, _: ()| async move {
-        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
-            Box::pin(async { 7_i64 }),
-            Box::pin(async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                8_i64
-            }),
-        ];
-        ctx.select(branches).await
-    });
+    engine.register(
+        "racer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
+                    Box::pin(async { 7_i64 }),
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        8_i64
+                    }),
+                ];
+                ctx.select(branches).await
+            })
+        }),
+    );
 
     let id = format!("select-{tag}");
     let (index, value): (usize, i64) = engine
@@ -486,13 +531,18 @@ async fn pg_stream_round_trip() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("producer", |ctx: DurableContext, _: ()| async move {
-        for i in 0..3_i64 {
-            ctx.write_stream("nums", i).await?;
-        }
-        ctx.close_stream("nums").await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "producer",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                for i in 0..3_i64 {
+                    ctx.write_stream("nums", i).await?;
+                }
+                ctx.close_stream("nums").await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     engine
         .start::<_, ()>("producer", (), WorkflowOptions::with_id(&id))
@@ -524,9 +574,10 @@ async fn pg_typed_db_errors() -> Result<()> {
     let tag = uuid::Uuid::new_v4();
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(WorkflowQueue::new(format!("q-{tag}")));
 
     let dedup = format!("once-{tag}");
@@ -574,13 +625,18 @@ async fn pg_global_concurrency_caps_running() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("track", |ctx: DurableContext, _: ()| async move {
-        let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
-        PEAK.fetch_max(now, Ordering::SeqCst);
-        ctx.sleep(Duration::from_millis(60)).await?;
-        CURRENT.fetch_sub(1, Ordering::SeqCst);
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "track",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let now = CURRENT.fetch_add(1, Ordering::SeqCst) + 1;
+                PEAK.fetch_max(now, Ordering::SeqCst);
+                ctx.sleep(Duration::from_millis(60)).await?;
+                CURRENT.fetch_sub(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.register_queue(
         WorkflowQueue::new("gc")
             .global_concurrency(1)
@@ -631,9 +687,10 @@ async fn pg_bulk_ops() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new_with_version(Arc::new(provider), &ver).await?;
-    engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "noop",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     // Resume re-queues work for a dispatcher, so the engine must be live.
     engine.launch().await?;
     let provider = PostgresProvider::connect(&url).await?;
@@ -719,9 +776,10 @@ async fn pg_partitioned_queue_dispatch() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.register_queue(
         WorkflowQueue::new("pq")
             .partitioned()
@@ -775,9 +833,10 @@ async fn pg_set_workflow_delay() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("echo", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "echo",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine
         .register_queue(WorkflowQueue::new("dq").base_polling_interval(Duration::from_millis(10)));
     engine.launch().await?;
@@ -820,15 +879,21 @@ async fn pg_list_filters_extended() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("child", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 10)
-    });
-    engine.register("parent", |ctx: DurableContext, _: ()| async move {
-        let h = ctx
-            .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
-            .await?;
-        h.result().await
-    });
+    engine.register(
+        "child",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 10) })),
+    );
+    engine.register(
+        "parent",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let h = ctx
+                    .start_workflow::<i64, i64>("child", 5_i64, WorkflowOptions::default())
+                    .await?;
+                h.result().await
+            })
+        }),
+    );
     let pid = format!("parent-{tag}");
     let out: i64 = engine
         .start("parent", (), WorkflowOptions::with_id(&pid))
@@ -877,9 +942,10 @@ async fn pg_workflow_aggregates() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("agg_ok", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "agg_ok",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     let prefix = format!("agg-{tag}-");
     for i in 0..3 {
         engine
@@ -943,16 +1009,21 @@ async fn pg_step_aggregates() -> Result<()> {
 
     let provider = PostgresProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("work", |ctx: DurableContext, _: ()| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.step("b", || async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            Ok::<_, Error>(2_i64)
-        })
-        .await?;
-        ctx.step("a", || async { Ok::<_, Error>(3_i64) }).await?;
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "work",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
+                ctx.step("b", |_| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, Error>(2_i64)
+                })
+                .await?;
+                ctx.step("a", |_| async { Ok::<_, Error>(3_i64) }).await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine
         .start::<_, ()>("work", (), WorkflowOptions::with_id(&id))
         .await?
@@ -998,7 +1069,7 @@ async fn pg_schedule_crud() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
     engine.register(
         "nightly_job",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
+        workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
     );
 
     let name = format!("nightly-{}", uuid::Uuid::new_v4());
@@ -1066,7 +1137,7 @@ async fn pg_schedule_backfill_apply_trigger() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
     engine.register(
         "nightly_job",
-        |_ctx: DurableContext, _: ScheduledInput| async move { Ok::<_, Error>(()) },
+        workflow_fn(|_ctx, _: ScheduledInput| Box::pin(async move { Ok::<_, Error>(()) })),
     );
 
     let name = format!("bf-{}", uuid::Uuid::new_v4());
@@ -1226,9 +1297,12 @@ async fn pg_client_enqueues_work_an_engine_runs() -> Result<()> {
     // deterministic regardless of what else registers versions.
     let ver = format!("v-cew-{tag}");
     let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
-    engine.register(&wf, |ctx: DurableContext, n: i64| async move {
-        ctx.step("mul", || async { Ok::<_, Error>(n * 2) }).await
-    });
+    engine.register(
+        &wf,
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move { ctx.step("mul", |_| async { Ok::<_, Error>(n * 2) }).await })
+        }),
+    );
     engine.register_queue(WorkflowQueue::new(&queue));
     engine.launch().await?;
 
@@ -1272,9 +1346,10 @@ async fn pg_client_debounces() -> Result<()> {
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
-    engine.register(&wf, |_ctx: DurableContext, msg: String| async move {
-        Ok::<_, Error>(msg)
-    });
+    engine.register(
+        &wf,
+        workflow_fn(|_ctx, msg: String| Box::pin(async move { Ok::<_, Error>(msg) })),
+    );
     engine.launch().await?;
 
     let client = Client::new(provider.clone()).with_app_version(&ver);
@@ -1432,12 +1507,20 @@ async fn pg_config_name_routes_on_queue_dispatch() -> Result<()> {
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register_configured(&wf, "en", |_ctx: DurableContext, who: String| async move {
-        Ok::<_, Error>(format!("Hello, {who}"))
-    });
-    engine.register_configured(&wf, "fr", |_ctx: DurableContext, who: String| async move {
-        Ok::<_, Error>(format!("Bonjour, {who}"))
-    });
+    engine.register_configured(
+        &wf,
+        "en",
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Hello, {who}")) })
+        }),
+    );
+    engine.register_configured(
+        &wf,
+        "fr",
+        workflow_fn(|_ctx, who: String| {
+            Box::pin(async move { Ok::<_, Error>(format!("Bonjour, {who}")) })
+        }),
+    );
     engine.register_queue(
         WorkflowQueue::new(&queue).base_polling_interval(Duration::from_millis(10)),
     );
@@ -1499,9 +1582,10 @@ async fn pg_client_manages_workflows() -> Result<()> {
     // deterministic regardless of what else registers versions.
     let ver = format!("v-cmw-{tag}");
     let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
-    engine.register(&wf, |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        &wf,
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(WorkflowQueue::new(&queue));
     engine.launch().await?;
     let client = durare::Client::new(provider.clone()).with_app_version(&ver);
@@ -1978,64 +2062,76 @@ async fn pg_transaction_step() -> Result<()> {
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
 
-    engine.register("acct", |ctx: DurableContext, table: String| async move {
-        let t = table.clone();
-        ctx.transaction::<(), _>("setup", move |tx| {
-            let t = t.clone();
+    engine.register(
+        "acct",
+        workflow_fn(|ctx, table: String| {
             Box::pin(async move {
-                tx.execute(
-                    &format!("CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, bal BIGINT)"),
-                    &params![],
-                )
-                .await?;
-                tx.execute(
-                    &format!(
-                        "INSERT INTO {t} (id, bal) VALUES (1, 100) ON CONFLICT (id) DO NOTHING"
-                    ),
-                    &params![],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await?;
-        let t = table.clone();
-        let bal: i64 = ctx
-            .transaction("debit", move |tx| {
-                let t = t.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        &format!("UPDATE {t} SET bal = bal - ? WHERE id = ?"),
-                        &params![10_i64, 1_i64],
-                    )
-                    .await?;
-                    let row = tx
-                        .query_one(
-                            &format!("SELECT bal FROM {t} WHERE id = ?"),
-                            &params![1_i64],
+                let t = table.clone();
+                ctx.transaction::<(), _>("setup", move |tx| {
+                    let t = t.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            &format!(
+                                "CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, bal BIGINT)"
+                            ),
+                            &params![],
                         )
                         .await?;
-                    Ok(row.get::<i64>("bal"))
+                        tx.execute(
+                            &format!(
+                        "INSERT INTO {t} (id, bal) VALUES (1, 100) ON CONFLICT (id) DO NOTHING"
+                    ),
+                            &params![],
+                        )
+                        .await?;
+                        Ok(())
+                    })
                 })
+                .await?;
+                let t = table.clone();
+                let bal: i64 = ctx
+                    .transaction("debit", move |tx| {
+                        let t = t.clone();
+                        Box::pin(async move {
+                            tx.execute(
+                                &format!("UPDATE {t} SET bal = bal - ? WHERE id = ?"),
+                                &params![10_i64, 1_i64],
+                            )
+                            .await?;
+                            let row = tx
+                                .query_one(
+                                    &format!("SELECT bal FROM {t} WHERE id = ?"),
+                                    &params![1_i64],
+                                )
+                                .await?;
+                            Ok(row.get::<i64>("bal"))
+                        })
+                    })
+                    .await?;
+                Ok::<_, Error>(bal)
             })
-            .await?;
-        Ok::<_, Error>(bal)
-    });
+        }),
+    );
 
     // Register the cleanup workflow up front too: the shared runtime is built on
     // the first run, so a later registration would not be seen.
-    engine.register("drop", |ctx: DurableContext, table: String| async move {
-        ctx.transaction::<(), _>("drop", move |tx| {
-            let table = table.clone();
+    engine.register(
+        "drop",
+        workflow_fn(|ctx, table: String| {
             Box::pin(async move {
-                tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
-                    .await?;
-                Ok(())
+                ctx.transaction::<(), _>("drop", move |tx| {
+                    let table = table.clone();
+                    Box::pin(async move {
+                        tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+                Ok::<_, Error>(())
             })
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
+        }),
+    );
 
     let bal1: i64 = engine
         .start("acct", table.clone(), WorkflowOptions::with_id(&wf))
@@ -2081,69 +2177,83 @@ async fn pg_transaction_step_rolls_back_on_error() -> Result<()> {
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
 
-    engine.register("rb", |ctx: DurableContext, table: String| async move {
-        let t = table.clone();
-        ctx.transaction::<(), _>("setup", move |tx| {
-            let t = t.clone();
+    engine.register(
+        "rb",
+        workflow_fn(|ctx, table: String| {
             Box::pin(async move {
-                tx.execute(
-                    &format!("CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, v BIGINT)"),
-                    &params![],
-                )
-                .await?;
-                tx.execute(
-                    &format!("INSERT INTO {t} (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"),
-                    &params![],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await?;
-
-        // Write, then return an application error: the body's write must roll back
-        // with its transaction — the error is recorded separately, not committed
-        // inside the aborted body tx.
-        let t = table.clone();
-        let failed = ctx
-            .transaction::<(), _>("bad", move |tx| {
-                let t = t.clone();
-                Box::pin(async move {
-                    tx.execute(&format!("UPDATE {t} SET v = 999 WHERE id = 1"), &params![])
+                let t = table.clone();
+                ctx.transaction::<(), _>("setup", move |tx| {
+                    let t = t.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            &format!(
+                                "CREATE TABLE IF NOT EXISTS {t} (id INT PRIMARY KEY, v BIGINT)"
+                            ),
+                            &params![],
+                        )
                         .await?;
-                    Err(Error::app("business rule violated"))
-                })
-            })
-            .await
-            .is_err();
-
-        let t = table.clone();
-        let v: i64 = ctx
-            .transaction("read", move |tx| {
-                let t = t.clone();
-                Box::pin(async move {
-                    let row = tx
-                        .query_one(&format!("SELECT v FROM {t} WHERE id = 1"), &params![])
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO {t} (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
+                            ),
+                            &params![],
+                        )
                         .await?;
-                    Ok(row.get::<i64>("v"))
+                        Ok(())
+                    })
                 })
-            })
-            .await?;
-        Ok::<_, Error>((failed, v))
-    });
+                .await?;
 
-    engine.register("drop", |ctx: DurableContext, table: String| async move {
-        ctx.transaction::<(), _>("drop", move |tx| {
-            let table = table.clone();
-            Box::pin(async move {
-                tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                // Write, then return an application error: the body's write must roll back
+                // with its transaction — the error is recorded separately, not committed
+                // inside the aborted body tx.
+                let t = table.clone();
+                let failed = ctx
+                    .transaction::<(), _>("bad", move |tx| {
+                        let t = t.clone();
+                        Box::pin(async move {
+                            tx.execute(&format!("UPDATE {t} SET v = 999 WHERE id = 1"), &params![])
+                                .await?;
+                            Err(Error::app("business rule violated"))
+                        })
+                    })
+                    .await
+                    .is_err();
+
+                let t = table.clone();
+                let v: i64 = ctx
+                    .transaction("read", move |tx| {
+                        let t = t.clone();
+                        Box::pin(async move {
+                            let row = tx
+                                .query_one(&format!("SELECT v FROM {t} WHERE id = 1"), &params![])
+                                .await?;
+                            Ok(row.get::<i64>("v"))
+                        })
+                    })
                     .await?;
-                Ok(())
+                Ok::<_, Error>((failed, v))
             })
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
+        }),
+    );
+
+    engine.register(
+        "drop",
+        workflow_fn(|ctx, table: String| {
+            Box::pin(async move {
+                ctx.transaction::<(), _>("drop", move |tx| {
+                    let table = table.clone();
+                    Box::pin(async move {
+                        tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     let (failed, v): (bool, i64) = engine
         .start("rb", table.clone(), WorkflowOptions::with_id(&wf))
@@ -2182,66 +2292,86 @@ async fn pg_transaction_serializable_retries_on_conflict() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
 
     // All workflows registered up front (the shared runtime is built on first run).
-    engine.register("seed", |ctx: DurableContext, table: String| async move {
-        ctx.transaction::<(), _>("seed", move |tx| {
-            let table = table.clone();
+    engine.register(
+        "seed",
+        workflow_fn(|ctx, table: String| {
             Box::pin(async move {
-                tx.execute(
-                    &format!("CREATE TABLE IF NOT EXISTS {table} (id INT PRIMARY KEY, v BIGINT)"),
-                    &params![],
-                )
-                .await?;
-                tx.execute(
-                    &format!(
-                        "INSERT INTO {table} (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
-                    ),
-                    &params![],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
-    engine.register("incr", |ctx: DurableContext, table: String| async move {
-        let t = table.clone();
-        let v: i64 = ctx
-            .transaction_with(
-                TransactionOptions::new("incr").isolation(IsolationLevel::Serializable),
-                move |tx| {
-                    let t = t.clone();
+                ctx.transaction::<(), _>("seed", move |tx| {
+                    let table = table.clone();
                     Box::pin(async move {
-                        let row = tx
-                            .query_one(&format!("SELECT v FROM {t} WHERE id = 1"), &params![])
-                            .await?;
-                        let cur: i64 = row.get("v");
-                        // Widen the read-write window so the two overlap.
-                        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                         tx.execute(
-                            &format!("UPDATE {t} SET v = ? WHERE id = 1"),
-                            &params![cur + 1],
+                            &format!(
+                                "CREATE TABLE IF NOT EXISTS {table} (id INT PRIMARY KEY, v BIGINT)"
+                            ),
+                            &params![],
                         )
                         .await?;
-                        Ok(cur + 1)
+                        tx.execute(
+                            &format!(
+                        "INSERT INTO {table} (id, v) VALUES (1, 0) ON CONFLICT (id) DO NOTHING"
+                    ),
+                            &params![],
+                        )
+                        .await?;
+                        Ok(())
                     })
-                },
-            )
-            .await?;
-        Ok::<_, Error>(v)
-    });
-    engine.register("drop", |ctx: DurableContext, table: String| async move {
-        ctx.transaction::<(), _>("drop", move |tx| {
-            let table = table.clone();
-            Box::pin(async move {
-                tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
-                    .await?;
-                Ok(())
+                })
+                .await?;
+                Ok::<_, Error>(())
             })
-        })
-        .await?;
-        Ok::<_, Error>(())
-    });
+        }),
+    );
+    engine.register(
+        "incr",
+        workflow_fn(|ctx, table: String| {
+            Box::pin(async move {
+                let t = table.clone();
+                let v: i64 = ctx
+                    .transaction_with(
+                        TransactionOptions::new("incr").isolation(IsolationLevel::Serializable),
+                        move |tx| {
+                            let t = t.clone();
+                            Box::pin(async move {
+                                let row = tx
+                                    .query_one(
+                                        &format!("SELECT v FROM {t} WHERE id = 1"),
+                                        &params![],
+                                    )
+                                    .await?;
+                                let cur: i64 = row.get("v");
+                                // Widen the read-write window so the two overlap.
+                                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                                tx.execute(
+                                    &format!("UPDATE {t} SET v = ? WHERE id = 1"),
+                                    &params![cur + 1],
+                                )
+                                .await?;
+                                Ok(cur + 1)
+                            })
+                        },
+                    )
+                    .await?;
+                Ok::<_, Error>(v)
+            })
+        }),
+    );
+    engine.register(
+        "drop",
+        workflow_fn(|ctx, table: String| {
+            Box::pin(async move {
+                ctx.transaction::<(), _>("drop", move |tx| {
+                    let table = table.clone();
+                    Box::pin(async move {
+                        tx.execute(&format!("DROP TABLE IF EXISTS {table}"), &params![])
+                            .await?;
+                        Ok(())
+                    })
+                })
+                .await?;
+                Ok::<_, Error>(())
+            })
+        }),
+    );
 
     let _: () = engine
         .start(
@@ -2306,21 +2436,26 @@ async fn pg_checkpoints_a_caught_transaction_failure() -> Result<()> {
     let id = format!("wf-txn-err-{}", uuid::Uuid::new_v4());
 
     let register = |engine: &mut DurableEngine| {
-        engine.register("txn_flaky", |ctx: DurableContext, _: ()| async move {
-            let r: Result<i64> = ctx
-                .transaction::<i64, _>("maybe", |_tx| {
-                    Box::pin(async move {
-                        let n = TX_RUNS.fetch_add(1, Ordering::SeqCst);
-                        if n == 0 {
-                            Err(Error::app("transient"))
-                        } else {
-                            Ok(7)
-                        }
-                    })
+        engine.register(
+            "txn_flaky",
+            workflow_fn(|ctx, _: ()| {
+                Box::pin(async move {
+                    let r: Result<i64> = ctx
+                        .transaction::<i64, _>("maybe", |_tx| {
+                            Box::pin(async move {
+                                let n = TX_RUNS.fetch_add(1, Ordering::SeqCst);
+                                if n == 0 {
+                                    Err(Error::app("transient"))
+                                } else {
+                                    Ok(7)
+                                }
+                            })
+                        })
+                        .await;
+                    Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
                 })
-                .await;
-            Ok::<_, Error>(if r.is_ok() { "ok" } else { "caught-error" }.to_string())
-        });
+            }),
+        );
     };
 
     {
@@ -2377,43 +2512,53 @@ async fn pg_transaction_body_user_retry() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
 
     // Body fails twice then succeeds; max_retries(3) re-runs it to success.
-    engine.register("retry", |ctx: DurableContext, _: ()| async move {
-        let opts = TransactionOptions::new("flaky")
-            .max_retries(3)
-            .base_interval(Duration::from_millis(1));
-        let n: i64 = ctx
-            .transaction_with(opts, |tx| {
-                Box::pin(async move {
-                    tx.execute("SELECT 1", &params![]).await?;
-                    let run = RETRY_RUNS.fetch_add(1, Ordering::SeqCst);
-                    if run < 2 {
-                        Err(Error::app("transient"))
-                    } else {
-                        Ok(42_i64)
-                    }
-                })
+    engine.register(
+        "retry",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = TransactionOptions::new("flaky")
+                    .max_retries(3)
+                    .base_interval(Duration::from_millis(1));
+                let n: i64 = ctx
+                    .transaction_with(opts, |tx| {
+                        Box::pin(async move {
+                            tx.execute("SELECT 1", &params![]).await?;
+                            let run = RETRY_RUNS.fetch_add(1, Ordering::SeqCst);
+                            if run < 2 {
+                                Err(Error::app("transient"))
+                            } else {
+                                Ok(42_i64)
+                            }
+                        })
+                    })
+                    .await?;
+                Ok::<_, Error>(n)
             })
-            .await?;
-        Ok::<_, Error>(n)
-    });
+        }),
+    );
 
     // A rejected error stops immediately despite max_retries(5).
-    engine.register("nofast", |ctx: DurableContext, _: ()| async move {
-        let opts = TransactionOptions::new("permanent")
-            .max_retries(5)
-            .base_interval(Duration::from_millis(1))
-            .retry_if(|e: &Error| e.is_retryable());
-        let r: Result<i64> = ctx
-            .transaction_with(opts, |tx| {
-                Box::pin(async move {
-                    tx.execute("SELECT 1", &params![]).await?;
-                    FAST_RUNS.fetch_add(1, Ordering::SeqCst);
-                    Err(Error::app("permanent failure"))
-                })
+    engine.register(
+        "nofast",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let opts = TransactionOptions::new("permanent")
+                    .max_retries(5)
+                    .base_interval(Duration::from_millis(1))
+                    .retry_if(|e: &Error| e.is_retryable());
+                let r: Result<i64> = ctx
+                    .transaction_with(opts, |tx| {
+                        Box::pin(async move {
+                            tx.execute("SELECT 1", &params![]).await?;
+                            FAST_RUNS.fetch_add(1, Ordering::SeqCst);
+                            Err(Error::app("permanent failure"))
+                        })
+                    })
+                    .await;
+                Ok::<_, Error>(r.is_err())
             })
-            .await;
-        Ok::<_, Error>(r.is_err())
-    });
+        }),
+    );
 
     let out: i64 = engine
         .start(
@@ -2467,9 +2612,10 @@ async fn pg_custom_schema_isolates_tenants() -> Result<()> {
     let provider_b = Arc::new(PostgresProvider::connect_with_schema(&url, &schema_b).await?);
 
     let mut engine_a = DurableEngine::new(provider_a.clone()).await?;
-    engine_a.register("hello", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 2)
-    });
+    engine_a.register(
+        "hello",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 2) })),
+    );
     let out: i64 = engine_a
         .start::<_, i64>("hello", 21_i64, WorkflowOptions::with_id(&id))
         .await?
@@ -2530,16 +2676,21 @@ async fn pg_export_import_round_trip() -> Result<()> {
     let id = format!("wf-export-{tag}");
 
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-    engine.register("expo", |ctx: DurableContext, n: i64| async move {
-        let doubled = ctx
-            .step("double", || async { Ok::<_, Error>(n * 2) })
-            .await?;
-        ctx.set_event("k", "v").await?;
-        ctx.write_stream("s", 1_i64).await?;
-        ctx.write_stream("s", 2_i64).await?;
-        ctx.close_stream("s").await?;
-        Ok::<_, Error>(doubled)
-    });
+    engine.register(
+        "expo",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                let doubled = ctx
+                    .step("double", |_| async { Ok::<_, Error>(n * 2) })
+                    .await?;
+                ctx.set_event("k", "v").await?;
+                ctx.write_stream("s", 1_i64).await?;
+                ctx.write_stream("s", 2_i64).await?;
+                ctx.close_stream("s").await?;
+                Ok::<_, Error>(doubled)
+            })
+        }),
+    );
 
     let out: i64 = engine
         .start::<_, i64>("expo", 21_i64, WorkflowOptions::with_id(&id))
@@ -2612,10 +2763,15 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     assert!(provider.supports_listen_notify());
     let mut engine = DurableEngine::new(provider).await?;
-    engine.register("waiter", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("topic", Duration::from_secs(10)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "waiter",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("topic", Duration::from_secs(10)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
 
     let handle = engine
         .start::<_, String>("waiter", (), WorkflowOptions::with_id(&id))
@@ -2652,9 +2808,10 @@ async fn pg_send_with_idempotency_key_delivers_once() -> Result<()> {
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("sink", |_ctx: DurableContext, _: ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "sink",
+        workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     // A completed destination that can still receive messages.
     engine
         .start::<_, ()>("sink", (), WorkflowOptions::with_id(&id))
@@ -2702,14 +2859,25 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
     let setter_id = format!("setter-{tag}");
 
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-    engine.register("reader", |ctx: DurableContext, target: String| async move {
-        let v: Option<String> = ctx.get_event(&target, "k", Duration::from_secs(10)).await?;
-        Ok::<_, Error>(v.unwrap_or_default())
-    });
-    engine.register("setter", |ctx: DurableContext, _: ()| async move {
-        ctx.set_event("k", "v").await?;
-        Ok::<_, Error>(String::new())
-    });
+    engine.register(
+        "reader",
+        workflow_fn(|ctx, target: String| {
+            Box::pin(async move {
+                let v: Option<String> =
+                    ctx.get_event(&target, "k", Duration::from_secs(10)).await?;
+                Ok::<_, Error>(v.unwrap_or_default())
+            })
+        }),
+    );
+    engine.register(
+        "setter",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.set_event("k", "v").await?;
+                Ok::<_, Error>(String::new())
+            })
+        }),
+    );
 
     let reader = engine
         .start::<_, String>(
@@ -2751,15 +2919,18 @@ async fn pg_list_filters_multi_value() -> Result<()> {
     };
     let tag = uuid::Uuid::new_v4().to_string();
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-    engine.register("mvf_a", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("mvf_b", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
-    engine.register("mvf_c", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n)
-    });
+    engine.register(
+        "mvf_a",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "mvf_b",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
+    engine.register(
+        "mvf_c",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n) })),
+    );
     engine.launch().await?;
 
     let a_id = format!("mvf-a-{tag}");
@@ -2881,9 +3052,12 @@ async fn pg_was_forked_from_survives_import() -> Result<()> {
     let src = format!("wff-src-{tag}");
     let fork = format!("wff-fork-{tag}");
     let mut engine = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-    engine.register("wff", |ctx: DurableContext, n: i64| async move {
-        ctx.step("s", || async { Ok::<_, Error>(n) }).await
-    });
+    engine.register(
+        "wff",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move { ctx.step("s", |_| async { Ok::<_, Error>(n) }).await })
+        }),
+    );
     engine.launch().await?;
 
     engine
@@ -2960,9 +3134,10 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
     // keeps this test's internal-queue work claimable only here.
     let ver = format!("v-fork-{tag}");
     let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
-    engine.register(&wf, |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n * 2)
-    });
+    engine.register(
+        &wf,
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n * 2) })),
+    );
     engine.register_queue(
         WorkflowQueue::new(&queue).base_polling_interval(Duration::from_millis(50)),
     );
@@ -3025,10 +3200,15 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register(&wf, |ctx: DurableContext, _: ()| async move {
-        ctx.step("renamed", || async { Ok::<_, Error>(1_i64) })
-            .await
-    });
+    engine.register(
+        &wf,
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                ctx.step("renamed", |_| async { Ok::<_, Error>(1_i64) })
+                    .await
+            })
+        }),
+    );
     engine.launch().await?;
 
     // Seed a PENDING run whose step 0 was checkpointed under the OLD name.
@@ -3073,9 +3253,10 @@ async fn pg_resume_routes_to_named_queue() -> Result<()> {
 
     let provider = Arc::new(PostgresProvider::connect(&url).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register(&wf, |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        &wf,
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     engine.register_queue(
         WorkflowQueue::new(&queue).base_polling_interval(Duration::from_millis(50)),
     );
@@ -3115,9 +3296,10 @@ async fn pg_persists_queue_registry() -> Result<()> {
     {
         let mut engine =
             DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
-        engine.register("noop", |_ctx: DurableContext, _: ()| async move {
-            Ok::<_, Error>(())
-        });
+        engine.register(
+            "noop",
+            workflow_fn(|_ctx, _: ()| Box::pin(async move { Ok::<_, Error>(()) })),
+        );
         engine.register_queue(
             WorkflowQueue::new(&qname)
                 .worker_concurrency(4)
@@ -3199,10 +3381,15 @@ async fn pg_send_bulk_atomic_fan_out() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
     let run = uuid::Uuid::new_v4().simple().to_string();
     let (d0, d1) = (format!("sb-{run}-0"), format!("sb-{run}-1"));
-    engine.register("bulk-waiter", |ctx: DurableContext, _: ()| async move {
-        let msg: Option<String> = ctx.recv("t", Duration::from_secs(10)).await?;
-        Ok::<_, Error>(msg.unwrap_or_default())
-    });
+    engine.register(
+        "bulk-waiter",
+        workflow_fn(|ctx, _: ()| {
+            Box::pin(async move {
+                let msg: Option<String> = ctx.recv("t", Duration::from_secs(10)).await?;
+                Ok::<_, Error>(msg.unwrap_or_default())
+            })
+        }),
+    );
     engine.launch().await?;
 
     let h0 = engine
@@ -3256,25 +3443,30 @@ async fn pg_system_queries_survive_search_path_change() -> Result<()> {
 
     let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("redirect", |ctx: DurableContext, n: i64| async move {
-        // Deliberately session-scoped (not SET LOCAL): still in effect when
-        // the checkpoint is inserted moments later on this same transaction,
-        // and still poisoning the pooled connection afterwards.
-        let doubled: i64 = ctx
-            .transaction::<i64, _>("hijack", move |tx| {
-                Box::pin(async move {
-                    tx.execute("SET search_path TO public", &params![]).await?;
-                    Ok(n * 2)
-                })
+    engine.register(
+        "redirect",
+        workflow_fn(|ctx, n: i64| {
+            Box::pin(async move {
+                // Deliberately session-scoped (not SET LOCAL): still in effect when
+                // the checkpoint is inserted moments later on this same transaction,
+                // and still poisoning the pooled connection afterwards.
+                let doubled: i64 = ctx
+                    .transaction::<i64, _>("hijack", move |tx| {
+                        Box::pin(async move {
+                            tx.execute("SET search_path TO public", &params![]).await?;
+                            Ok(n * 2)
+                        })
+                    })
+                    .await?;
+                // Later durable work draws pooled connections that may still carry
+                // the redirected search_path; qualified system queries must not care.
+                let plus = ctx
+                    .step("after", |_| async { Ok::<_, Error>(1_i64) })
+                    .await?;
+                Ok::<_, Error>(doubled + plus)
             })
-            .await?;
-        // Later durable work draws pooled connections that may still carry
-        // the redirected search_path; qualified system queries must not care.
-        let plus = ctx
-            .step("after", || async { Ok::<_, Error>(1_i64) })
-            .await?;
-        Ok::<_, Error>(doubled + plus)
-    });
+        }),
+    );
 
     let out: i64 = engine
         .start::<_, i64>("redirect", 21_i64, WorkflowOptions::with_id(&id))
@@ -3409,21 +3601,24 @@ async fn pg_read_only_transaction_checkpoints_after_commit() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let wf_runs = runs.clone();
-    engine.register("ro", move |ctx: DurableContext, (): ()| {
-        let runs = wf_runs.clone();
-        async move {
-            let opts = TransactionOptions::new("snapshot-read").read_only(true);
-            ctx.transaction_with::<i64, _>(opts, move |tx| {
-                let runs = runs.clone();
-                Box::pin(async move {
-                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let row = tx.query_one("SELECT 42::bigint AS v", &params![]).await?;
-                    Ok(row.get::<i64>("v"))
+    engine.register(
+        "ro",
+        workflow_fn(move |ctx, (): ()| {
+            let runs = wf_runs.clone();
+            Box::pin(async move {
+                let opts = TransactionOptions::new("snapshot-read").read_only(true);
+                ctx.transaction_with::<i64, _>(opts, move |tx| {
+                    let runs = runs.clone();
+                    Box::pin(async move {
+                        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let row = tx.query_one("SELECT 42::bigint AS v", &params![]).await?;
+                        Ok(row.get::<i64>("v"))
+                    })
                 })
+                .await
             })
-            .await
-        }
-    });
+        }),
+    );
 
     let n: i64 = engine
         .start::<(), i64>("ro", (), WorkflowOptions::with_id(&id))
@@ -3476,24 +3671,30 @@ async fn pg_read_only_fast_path_checkpoints_after_commit() -> Result<()> {
     let mut engine = DurableEngine::new(provider.clone()).await?;
     let runs = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (wf_runs, wf_ds) = (runs.clone(), ds.clone());
-    engine.register("rof", move |ctx: DurableContext, (): ()| {
-        let (runs, ds) = (wf_runs.clone(), wf_ds.clone());
-        async move {
-            let opts = TransactionOptions::new("fast-read").read_only(true);
-            ctx.transaction_on_with::<_, i64, _>(
-                &ds,
-                opts,
-                async move |conn: &mut sqlx::PgConnection| {
-                    runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let v: i64 = sqlx::query_scalar("SELECT 7::bigint")
-                        .fetch_one(&mut *conn)
-                        .await?;
-                    Ok(v)
-                },
-            )
-            .await
-        }
-    });
+    engine.register(
+        "rof",
+        workflow_fn(move |ctx, (): ()| {
+            let (runs, ds) = (wf_runs.clone(), wf_ds.clone());
+            Box::pin(async move {
+                let opts = TransactionOptions::new("fast-read").read_only(true);
+                ctx.transaction_on_with::<_, i64, _>(
+                    &ds,
+                    opts,
+                    move |conn: &mut sqlx::PgConnection| {
+                        let runs = runs.clone();
+                        Box::pin(async move {
+                            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let v: i64 = sqlx::query_scalar("SELECT 7::bigint")
+                                .fetch_one(&mut *conn)
+                                .await?;
+                            Ok(v)
+                        })
+                    },
+                )
+                .await
+            })
+        }),
+    );
 
     let n: i64 = engine
         .start::<(), i64>("rof", (), WorkflowOptions::with_id(&id))
@@ -3573,9 +3774,10 @@ async fn pg_from_pool_with_schema_pins_system_tables() -> Result<()> {
         .map_err(Error::from)?;
     let provider = Arc::new(PostgresProvider::from_pool_with_schema(pool, &schema)?);
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register("hello", |_ctx: DurableContext, n: i64| async move {
-        Ok::<_, Error>(n + 1)
-    });
+    engine.register(
+        "hello",
+        workflow_fn(|_ctx, n: i64| Box::pin(async move { Ok::<_, Error>(n + 1) })),
+    );
     let n: i64 = engine
         .start::<i64, i64>("hello", 41, WorkflowOptions::with_id(&id))
         .await?

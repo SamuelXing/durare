@@ -255,7 +255,14 @@ impl AuthContext {
 /// All durable operations a workflow performs go through this context:
 /// [`DurableContext::step`] / [`DurableContext::step_with`] for checkpointed work
 /// and [`DurableContext::sleep`] for durable timers.
-#[derive(Clone)]
+///
+/// A context is a **borrowed capability**: the engine owns it for the run and
+/// lends it to the workflow body as `&DurableContext`. It is deliberately not
+/// `Clone`, and every durable call borrows it for as long as the call lives, so
+/// durable work cannot be moved into a `tokio::spawn`ed task — a task the
+/// engine could not replay in order. Concurrency *within* the body is
+/// ordinary: `tokio::join!` over several calls, helpers taking
+/// `&DurableContext`, and child workflows all work as written.
 pub struct DurableContext {
     workflow_id: String,
     provider: Arc<dyn StateProvider>,
@@ -265,11 +272,10 @@ pub struct DurableContext {
     // Monotonic step index. Because the workflow's control flow is
     // deterministic, the same code path yields the same seq on every replay,
     // which is how we match a step call to its stored checkpoint.
-    seq: Arc<AtomicI32>,
-    // Set while a transaction body is running (shared across context clones, so a
-    // clone captured inside a body sees it). Guards against nesting a transaction
-    // inside another — which would deadlock on the outer's write lock.
-    in_transaction: Arc<AtomicBool>,
+    seq: AtomicI32,
+    // Set while a transaction is running. Guards overlapping transactions on
+    // this context, which could otherwise wait on the same write lock.
+    in_transaction: AtomicBool,
     // `Some` in a replay verification run (`DurableEngine::verify_replay`): the
     // run serves recorded outcomes, refuses to execute anything live, and books
     // what it saw here.
@@ -277,9 +283,7 @@ pub struct DurableContext {
     // One field rather than a flag beside a cell, because they are one fact:
     // there is no such thing as a verification run without somewhere to report
     // to, and no report to fill outside one. Whether this is a verification is
-    // read off the `Option`, which copies with the clone; only the report it
-    // points at is shared, which is the point — a divergence a clone runs into
-    // has to be visible to the verifier.
+    // read off the `Option`; the report is shared with the verifier.
     verify: Option<Arc<Verification>>,
 }
 
@@ -290,8 +294,8 @@ impl DurableContext {
             provider: runtime.provider().clone(),
             runtime,
             auth,
-            seq: Arc::new(AtomicI32::new(0)),
-            in_transaction: Arc::new(AtomicBool::new(false)),
+            seq: AtomicI32::new(0),
+            in_transaction: AtomicBool::new(false),
             verify: None,
         }
     }
@@ -524,7 +528,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// if ctx.patch("use-v2-pricing").await? {
     ///     // new code
     /// } else {
@@ -612,7 +616,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, WorkflowOptions};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// // Fan out durable children, then gather their results.
     /// let mut handles = Vec::new();
     /// for region in ["us", "eu", "ap"] {
@@ -726,9 +730,9 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Error, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let charge_id = ctx
-    ///     .step("charge_card", || async {
+    ///     .step("charge_card", |_step| async {
     ///         // Any side effect: an HTTP call, an email, a write to another system.
     ///         Ok::<_, Error>("ch_123".to_string())
     ///     })
@@ -738,8 +742,9 @@ impl DurableContext {
     /// # }
     /// ```
     ///
-    /// `f` is `FnOnce`: it is invoked at most once per call. For automatic
-    /// retries, use [`step_with`](Self::step_with).
+    /// `f` is `FnOnce`: it is invoked at most once per call, and receives a
+    /// [`StepCtx`] describing the attempt. For automatic retries, use
+    /// [`step_with`](Self::step_with).
     ///
     /// # Errors
     ///
@@ -751,7 +756,7 @@ impl DurableContext {
     pub fn step<'a, T, F, Fut>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
-        F: FnOnce() -> Fut + Send + 'a,
+        F: FnOnce(StepCtx) -> Fut + Send + 'a,
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let position = claim!(self, "step");
@@ -764,7 +769,12 @@ impl DurableContext {
                     return Ok(stored);
                 }
                 let started = chrono::Utc::now().timestamp_millis();
-                match run_step_catching(&name, in_body(f)).await {
+                match run_step_catching(
+                    &name,
+                    in_body(|| f(StepCtx::new(&self.workflow_id, seq, 0, 1))),
+                )
+                .await
+                {
                     Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
                 }
@@ -788,11 +798,14 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Error, Result, StepOptions};
     /// # async fn fetch_quote() -> Result<f64> { Ok(1.0) }
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let quote = ctx
     ///     .step_with(
     ///         StepOptions::new("fetch_quote").max_retries(5),
-    ///         || async { fetch_quote().await },
+    ///         |step| async move {
+    ///             tracing::debug!(attempt = step.attempt, "fetching quote");
+    ///             fetch_quote().await
+    ///         },
     ///     )
     ///     .await?;
     /// # let _ = quote;
@@ -810,7 +823,7 @@ impl DurableContext {
     pub fn step_with<'a, T, F, Fut>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
-        F: FnMut() -> Fut + Send + 'a,
+        F: FnMut(StepCtx) -> Fut + Send + 'a,
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let position = claim!(self, "step");
@@ -824,7 +837,7 @@ impl DurableContext {
                 // Run with retries; only the final result/error is observed, then
                 // checkpointed — a success as its output, a failure as its error.
                 let started = chrono::Utc::now().timestamp_millis();
-                match self.run_with_retries(&opts, &mut f).await {
+                match self.run_with_retries(seq, &opts, &mut f).await {
                     Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
                 }
@@ -852,18 +865,15 @@ impl DurableContext {
     /// table.
     ///
     /// The body receives a [`Tx`] and returns a boxed future — `Box::pin(async
-    /// move { … })`, mirroring sqlx's own transaction closures. (Its sibling
-    /// [`transaction_on`](Self::transaction_on) takes a plain `async |conn|`
-    /// closure instead; this path cannot, because it hands the body to the
-    /// provider through a `dyn` boundary, and stable Rust has no way to require
-    /// that an async closure's future is `Send`. Use
-    /// [`#[transaction]`](macro@crate::transaction) to skip the scaffolding.)
+    /// move { … })`, mirroring sqlx's own transaction closures. Native
+    /// [`transaction_on`](Self::transaction_on) uses the same boxed-future form.
+    /// Use [`#[transaction]`](macro@crate::transaction) to skip the scaffolding.
     /// SQL is written with `?` placeholders (rewritten to `$1, $2, …` for
     /// Postgres) and bound via [`params!`](crate::params):
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, params};
-    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext) -> Result<()> {
     /// let bal: i64 = ctx
     ///     .transaction("debit", |tx| Box::pin(async move {
     ///         tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?",
@@ -896,7 +906,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, IsolationLevel, Result, TransactionOptions, params};
-    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext) -> Result<()> {
     /// let opts = TransactionOptions::new("transfer").isolation(IsolationLevel::Serializable);
     /// ctx.transaction_with::<(), _>(opts, |tx| Box::pin(async move {
     ///     tx.execute("UPDATE acct SET bal = bal - ? WHERE id = ?", &params![10_i64, 1_i64]).await?;
@@ -968,14 +978,8 @@ impl DurableContext {
 
     /// Run a durable transaction on a **separate application database**.
     ///
-    /// **Await this where it is written.** The body is an `AsyncFn`, and stable
-    /// Rust has no way to say that the future it returns is `Send` — the bound
-    /// needs `async_fn_traits`, which is unstable — so this call cannot hand back
-    /// the [`PendingStep`] every other durable call does, and takes its position
-    /// when it is first polled rather than when it is built. Building one
-    /// alongside other durable calls and awaiting them out of order would give it
-    /// a position one of them already holds. A transaction is a sequence point by
-    /// nature, so this is a rule to keep rather than a cost to pay.
+    /// Claims its position at construction and borrows the workflow context.
+    /// The returned future can be combined with other durable operations in scope.
     ///
     /// [`transaction`](Self::transaction) commits the body's SQL and the step
     /// checkpoint together — but only in the *system* database. This runs the
@@ -996,13 +1000,9 @@ impl DurableContext {
     /// plain connection, and on Postgres a raw `COMMIT`/`ROLLBACK` statement
     /// smuggled through SQL is detected and fails the step.
     ///
-    /// The body is an **async closure** — `async |conn| { … }`, with no
-    /// `Box::pin` scaffolding (unlike [`transaction`](Self::transaction),
-    /// which hands its body through a `dyn` boundary that stable Rust cannot
-    /// combine with async closures). It must be re-runnable (`AsyncFn`, not
-    /// `AsyncFnOnce`): a serialization conflict or deadlock restarts it on a
-    /// fresh transaction, so write `async move |conn|` and clone anything the
-    /// body consumes rather than moving it out of a capture.
+    /// The callback returns a boxed `Send` future. It must be repeatable (`Fn`):
+    /// conflicts and retries start a fresh transaction. Clone owned captures in
+    /// the callback before returning `Box::pin(async move { ... })`.
     ///
     /// If your application tables live **in the system database**, get the
     /// data source from the provider instead —
@@ -1037,9 +1037,9 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, PgDataSource, Result};
-    /// # async fn ex(ctx: DurableContext, ds: PgDataSource) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext, ds: PgDataSource) -> Result<()> {
     /// let total: i64 = ctx
-    ///     .transaction_on(&ds, "record-order", async |conn| {
+    ///     .transaction_on(&ds, "record-order", |conn| Box::pin(async move {
     ///         sqlx::query("INSERT INTO orders(item) VALUES ($1)")
     ///             .bind("widget")
     ///             .execute(&mut *conn)
@@ -1048,51 +1048,52 @@ impl DurableContext {
     ///             .fetch_one(&mut *conn)
     ///             .await?;
     ///         Ok(n)
-    ///     })
+    ///     }))
     ///     .await?;
     /// # let _ = total;
     /// # Ok(()) }
     /// ```
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn transaction_on<DS, T, F>(&self, ds: &DS, name: &str, f: F) -> Result<T>
+    pub fn transaction_on<'a, DS, T, F>(
+        &'a self,
+        ds: &'a DS,
+        name: &str,
+        f: F,
+    ) -> PendingStep<'a, T>
     where
         DS: crate::datasource::DataSource,
-        T: Serialize + DeserializeOwned + 'static,
-        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> crate::BoxFuture<'c, Result<T>> + Send + Sync + 'a,
     {
         self.transaction_on_with(ds, TransactionOptions::new(name), f)
-            .await
     }
 
-    /// Like [`transaction_on`](Self::transaction_on) but with explicit
-    /// [`TransactionOptions`] — isolation level (advisory on SQLite),
-    /// read-only, and the application-error retry policy. Conflicts and
-    /// transient database errors are retried on a fresh transaction
-    /// regardless, without consuming the `max_retries` budget; once that
-    /// budget is exhausted the failure is recorded in **both** databases, so a
-    /// replay returns the same error without re-running the body.
+    /// Like [`transaction_on`](Self::transaction_on), with an explicit retry policy.
+    /// The callback is repeatable: clone owned dependencies before each returned future.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn transaction_on_with<DS, T, F>(
-        &self,
-        ds: &DS,
+    pub fn transaction_on_with<'a, DS, T, F>(
+        &'a self,
+        ds: &'a DS,
         opts: TransactionOptions,
         f: F,
-    ) -> Result<T>
+    ) -> PendingStep<'a, T>
     where
         DS: crate::datasource::DataSource,
-        T: Serialize + DeserializeOwned + 'static,
-        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
+        T: Serialize + DeserializeOwned + Send + 'static,
+        F: for<'c> Fn(&'c mut DS::Conn) -> crate::BoxFuture<'c, Result<T>> + Send + Sync + 'a,
     {
-        let seq = self.claim_position("transaction")?.seq();
-        let _guard = self.begin_transaction()?;
-
+        let position = claim!(self, "transaction");
+        let seq = position.seq();
         let span = self.op_span("transaction", &opts.name, seq);
-        let out = self
-            .run_datasource_transaction(ds, &opts, &f, seq)
-            .instrument(span.clone())
-            .await;
-        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
-        out
+        PendingStep::new(position, async move {
+            let _guard = self.begin_transaction()?;
+            let out = self
+                .run_datasource_transaction(ds, &opts, &f, seq)
+                .instrument(span.clone())
+                .await;
+            span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+            out
+        })
     }
 
     /// The two-commit protocol behind [`transaction_on`](Self::transaction_on):
@@ -1109,7 +1110,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
+        F: for<'c> Fn(&'c mut DS::Conn) -> crate::BoxFuture<'c, Result<T>> + Send + Sync,
     {
         // Layer 1: the system-database checkpoint — a completed run.
         if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
@@ -1271,7 +1272,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
+        F: for<'c> Fn(&'c mut DS::Conn) -> crate::BoxFuture<'c, Result<T>> + Send + Sync,
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
@@ -1340,7 +1341,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
+        F: for<'c> Fn(&'c mut DS::Conn) -> crate::BoxFuture<'c, Result<T>> + Send + Sync,
     {
         let mut user_attempt: u32 = 0;
         let body_err = loop {
@@ -1441,7 +1442,7 @@ impl DurableContext {
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
-        F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
+        F: for<'c> Fn(&'c mut DS::Conn) -> crate::BoxFuture<'c, Result<T>> + Send + Sync,
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
@@ -1588,7 +1589,7 @@ impl DurableContext {
     /// # use durare::{DurableContext, Result};
     /// # async fn fetch_primary() -> String { String::new() }
     /// # async fn fetch_fallback() -> String { String::new() }
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let (winner, value) = ctx
     ///     .select(vec![
     ///         Box::pin(async { fetch_primary().await }),
@@ -1751,14 +1752,21 @@ impl DurableContext {
 
     /// Drive `f` to success, retrying on error per `opts` with exponential
     /// backoff. Returns the last error if all attempts are exhausted.
-    async fn run_with_retries<T, F, Fut>(&self, opts: &StepOptions, f: &mut F) -> Result<T>
+    async fn run_with_retries<T, F, Fut>(
+        &self,
+        seq: i32,
+        opts: &StepOptions,
+        f: &mut F,
+    ) -> Result<T>
     where
-        F: FnMut() -> Fut,
+        F: FnMut(StepCtx) -> Fut,
         Fut: Future<Output = Result<T>>,
     {
         let mut attempt: u32 = 0;
+        let max_attempts = u64::from(opts.max_retries) + 1;
         loop {
-            match run_step_catching(&opts.name, in_body(&mut *f)).await {
+            let step = StepCtx::new(&self.workflow_id, seq, attempt, max_attempts);
+            match run_step_catching(&opts.name, in_body(|| f(step))).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,
@@ -1798,7 +1806,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Result};
     /// # use std::time::Duration;
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// ctx.sleep(Duration::from_secs(7 * 24 * 3600)).await?; // a restart doesn't reset it
     /// # Ok(())
     /// # }
@@ -1837,7 +1845,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn ex(ctx: DurableContext) -> Result<()> {
+    /// # async fn ex(ctx: &DurableContext) -> Result<()> {
     /// let started = ctx.now().await?; // same value on every replay
     /// # Ok(()) }
     /// ```
@@ -1910,7 +1918,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// ctx.send("order-1001", "approved".to_string(), "review").await?;
     /// # Ok(())
     /// # }
@@ -2063,7 +2071,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Result};
     /// # use std::time::Duration;
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// // Block this workflow until an approval message arrives (or a day passes).
     /// match ctx.recv::<String>("review", Duration::from_secs(24 * 3600)).await? {
     ///     Some(decision) => println!("decision: {decision}"),
@@ -2152,7 +2160,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// ctx.set_event("status", "shipped".to_string()).await?;
     /// # Ok(())
     /// # }
@@ -2203,7 +2211,7 @@ impl DurableContext {
     /// ```no_run
     /// # use durare::{DurableContext, Result};
     /// # use std::time::Duration;
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// let status: Option<String> = ctx
     ///     .get_event("order-1001", "status", Duration::from_secs(60))
     ///     .await?;
@@ -2308,7 +2316,7 @@ impl DurableContext {
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext) -> Result<()> {
     /// for i in 0..3 {
     ///     ctx.write_stream("progress", format!("chunk {i}")).await?;
     /// }
@@ -2432,7 +2440,7 @@ impl DurableContext {
     /// ```no_run
     /// use durare::StreamExt;
     /// # use durare::{DurableContext, Result};
-    /// # async fn demo(ctx: DurableContext, id: &str) -> Result<()> {
+    /// # async fn demo(ctx: &DurableContext, id: &str) -> Result<()> {
     /// let mut values = ctx.read_stream_values::<String>(id, "events");
     /// while let Some(v) = values.next().await {
     ///     println!("{}", v?);
@@ -2563,6 +2571,54 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
             "step `{name}` panicked: {}",
             panic_message(&*payload)
         ))),
+    }
+}
+
+/// What a step body is told about the attempt it is running as.
+///
+/// Handed by value to the closure passed to [`DurableContext::step`] and
+/// [`DurableContext::step_with`], one per attempt. It is small and `Clone`, and
+/// it deliberately carries **no** durable capability: a step body cannot start
+/// nested steps, child workflows, or transactions through it, which is what
+/// keeps a step a leaf of the workflow.
+#[derive(Clone, Debug)]
+pub struct StepCtx {
+    /// The position this step occupies in the workflow.
+    pub step_id: i32,
+    /// Which attempt this is, counting from zero.
+    pub attempt: u32,
+    /// How many attempts the step's retry policy allows in total.
+    pub max_attempts: u64,
+    workflow_id: String,
+}
+
+impl StepCtx {
+    fn new(workflow_id: &str, step_id: i32, attempt: u32, max_attempts: u64) -> Self {
+        Self {
+            step_id,
+            attempt,
+            max_attempts,
+            workflow_id: workflow_id.to_owned(),
+        }
+    }
+
+    /// Stable across retries and recovery of this workflow and position.
+    ///
+    /// This is a versioned JSON pair, without the attempt number. A new workflow
+    /// ID (including a fork) produces a different key. Reusing an ID and position
+    /// for different work reuses the key; code compatibility remains required.
+    /// The receiver must actually enforce deduplication. This is not exactly-once IO.
+    pub fn idempotency_key(&self) -> String {
+        format!(
+            "durare:v1:{}",
+            serde_json::to_string(&(&self.workflow_id, self.step_id))
+                .expect("string and integer serialize")
+        )
+    }
+
+    /// Whether this is the final attempt allowed by the retry policy.
+    pub fn is_last_attempt(&self) -> bool {
+        u64::from(self.attempt) + 1 >= self.max_attempts
     }
 }
 

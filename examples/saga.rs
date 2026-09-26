@@ -63,18 +63,18 @@ async fn cancel_flight(ctx: &DurableContext, flight_id: String) -> Result<()> {
 }
 
 #[durare::workflow]
-async fn book_trip(ctx: DurableContext, trip: Trip) -> Result<Booking> {
-    let flight = book_flight(&ctx, trip.traveler.clone()).await?;
-    let hotel = book_hotel(&ctx, trip.traveler.clone()).await?;
+async fn book_trip(ctx: &DurableContext, trip: Trip) -> Result<Booking> {
+    let flight = book_flight(ctx, trip.traveler.clone()).await?;
+    let hotel = book_hotel(ctx, trip.traveler.clone()).await?;
 
     // The step that may fail. On error, unwind the bookings already made with
     // compensating steps — each durable, so a crash during rollback also
     // resumes cleanly — then propagate the failure.
-    let car = match book_car(&ctx, trip.traveler.clone(), !trip.car_unavailable).await {
+    let car = match book_car(ctx, trip.traveler.clone(), !trip.car_unavailable).await {
         Ok(car) => car,
         Err(e) => {
-            cancel_hotel(&ctx, hotel).await?;
-            cancel_flight(&ctx, flight).await?;
+            cancel_hotel(ctx, hotel).await?;
+            cancel_flight(ctx, flight).await?;
             return Err(e);
         }
     };

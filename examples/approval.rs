@@ -29,7 +29,7 @@ struct Expense {
 }
 
 #[durare::workflow]
-async fn expense_approval(ctx: DurableContext, exp: Expense) -> Result<String> {
+async fn expense_approval(ctx: &DurableContext, exp: Expense) -> Result<String> {
     println!("  >> {} filed an expense for {} cents", exp.who, exp.cents);
 
     // Announce that we are waiting; an outside observer can read this.

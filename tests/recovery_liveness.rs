@@ -6,19 +6,24 @@
 //! the dispatch loop — for its entire wait. The DBOS SDKs return handles
 //! and resume execution in the background; so do we now.
 
-use durare::{DurableContext, DurableEngine, SqliteProvider, WorkflowOptions};
+use durare::{workflow_fn, DurableEngine, SqliteProvider, WorkflowOptions};
 use std::sync::Arc;
 use std::time::Duration;
 
 async fn engine_over(url: &str) -> DurableEngine {
     let provider = Arc::new(SqliteProvider::connect(url).await.expect("connect"));
     let mut b = DurableEngine::builder(provider);
-    b.register("parked", |ctx: DurableContext, _input: i32| async move {
-        // Parks for up to ten minutes; the property under test is that
-        // nobody is made to wait alongside it.
-        let got: Option<String> = ctx.recv("go", Duration::from_secs(600)).await?;
-        Ok::<String, durare::Error>(got.unwrap_or_default())
-    });
+    b.register(
+        "parked",
+        workflow_fn(|ctx, _input: i32| {
+            Box::pin(async move {
+                // Parks for up to ten minutes; the property under test is that
+                // nobody is made to wait alongside it.
+                let got: Option<String> = ctx.recv("go", Duration::from_secs(600)).await?;
+                Ok::<String, durare::Error>(got.unwrap_or_default())
+            })
+        }),
+    );
     b.build().await.expect("engine builds")
 }
 

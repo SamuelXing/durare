@@ -66,21 +66,21 @@ impl Parse for WorkflowArgs {
     }
 }
 
-/// Register an `async fn(DurableContext, Input) -> Result<Output>` as a durable
+/// Register an `async fn(&DurableContext, Input) -> Result<Output>` as a durable
 /// workflow.
 ///
 /// ```ignore
 /// #[durare::workflow]
-/// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { ... }
+/// async fn process_order(ctx: &DurableContext, order: Order) -> Result<Receipt> { ... }
 ///
 /// // Override the registered name:
 /// #[durare::workflow("orders.process")]
-/// async fn process_order(ctx: DurableContext, order: Order) -> Result<Receipt> { ... }
+/// async fn process_order(ctx: &DurableContext, order: Order) -> Result<Receipt> { ... }
 ///
 /// // Run on a cron schedule (6-field cron, second precision). The workflow
 /// // receives the scheduled tick time (RFC 3339) as its input:
 /// #[durare::workflow(schedule = "0 0 * * * *")] // top of every hour
-/// async fn hourly(ctx: DurableContext, scheduled_at: String) -> Result<()> { ... }
+/// async fn hourly(ctx: &DurableContext, scheduled_at: String) -> Result<()> { ... }
 /// ```
 ///
 /// The function is left as-is. The macro additionally emits:
@@ -284,7 +284,7 @@ impl Parse for StepArgs {
 /// Turn an `async fn(&DurableContext, args..) -> Result<T>` into a durable
 /// [`step`](durare::DurableContext::step): the body is checkpointed on first run
 /// and served from the checkpoint on replay — exactly like calling
-/// `ctx.step("name", || async move { ... })` by hand, but without the closure,
+/// `ctx.step("name", |_| async move { ... })` by hand, but without the closure,
 /// the `Box::pin`, or the `Ok::<_, Error>` annotation.
 ///
 /// ```ignore
@@ -353,7 +353,7 @@ pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#attrs)*
         #vis #sig {
-            #ctx_ident.step(#name, move || async move #block)
+            #ctx_ident.step(#name, move |_| async move #block)
         }
     };
 

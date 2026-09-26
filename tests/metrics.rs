@@ -2,7 +2,7 @@
 //! counters from the engine — each driven by the real event it counts.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
+    workflow_fn, DurableEngine, Error, InMemoryProvider, Result, StepOptions, WorkflowOptions,
     WorkflowQueue,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,9 +15,10 @@ use std::time::Duration;
 #[tokio::test]
 async fn queue_depth_counts_enqueued_work() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("mq-task", |_ctx: DurableContext, (): ()| async move {
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "mq-task",
+        workflow_fn(|_ctx, (): ()| Box::pin(async move { Ok::<_, Error>(()) })),
+    );
     engine.register_queue(WorkflowQueue::new("obs-mq"));
     engine.register_queue(WorkflowQueue::new("obs-mq-live"));
     engine.listen_queues(["obs-mq-live"]);
@@ -51,15 +52,20 @@ async fn queue_depth_counts_enqueued_work() -> Result<()> {
 #[tokio::test]
 async fn step_retries_counter_counts_reruns() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("flaky", |ctx: DurableContext, (): ()| async move {
-        ctx.step_with(
-            StepOptions::new("always-fails")
-                .max_retries(2)
-                .base_interval(Duration::from_millis(1)),
-            || async { Err::<(), _>(Error::app("nope")) },
-        )
-        .await
-    });
+    engine.register(
+        "flaky",
+        workflow_fn(|ctx, (): ()| {
+            Box::pin(async move {
+                ctx.step_with(
+                    StepOptions::new("always-fails")
+                        .max_retries(2)
+                        .base_interval(Duration::from_millis(1)),
+                    |_| async { Err::<(), _>(Error::app("nope")) },
+                )
+                .await
+            })
+        }),
+    );
     engine.launch().await?;
 
     let err = engine
@@ -87,12 +93,17 @@ async fn recovery_and_dead_letter_counters() -> Result<()> {
 
     // Part 1: a stalled run, recovered to completion.
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("stalls-once", |_ctx: DurableContext, (): ()| async move {
-        if STALL.load(Ordering::SeqCst) {
-            std::future::pending::<()>().await;
-        }
-        Ok::<_, Error>(())
-    });
+    engine.register(
+        "stalls-once",
+        workflow_fn(|_ctx, (): ()| {
+            Box::pin(async move {
+                if STALL.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     engine.launch().await?;
     let _parked = engine
         .start::<(), ()>("stalls-once", (), WorkflowOptions::with_id("wf-stalled"))
@@ -110,11 +121,16 @@ async fn recovery_and_dead_letter_counters() -> Result<()> {
     // Part 2: a deterministic panic dead-letters at the attempt cap.
     let provider: Arc<InMemoryProvider> = Arc::new(InMemoryProvider::new());
     let mut b = DurableEngine::builder(provider);
-    b.register("panicky", |_ctx: DurableContext, (): ()| async move {
-        panic!("kaboom");
-        #[allow(unreachable_code)]
-        Ok::<_, Error>(())
-    });
+    b.register(
+        "panicky",
+        workflow_fn(|_ctx, (): ()| {
+            Box::pin(async move {
+                panic!("kaboom");
+                #[allow(unreachable_code)]
+                Ok::<_, Error>(())
+            })
+        }),
+    );
     b.max_recovery_attempts(1);
     let engine2 = b.build().await?;
     engine2.launch().await?;

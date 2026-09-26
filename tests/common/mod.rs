@@ -1,10 +1,10 @@
 //! Shared helpers for the integration tests.
 #![allow(dead_code)] // each test binary uses a subset
 
+use durare::{workflow_fn, BoxFuture};
 use durare::{DurableContext, DurableEngine, Result, StateProvider, WorkflowOptions};
 #[cfg(feature = "postgres")]
 use sqlx::postgres::PgPool;
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,18 +22,17 @@ pub async fn recorded(engine: &DurableEngine, id: &str) -> Result<Vec<(i32, Stri
 
 /// Runs `body` to completion as workflow `name` under `id` on `provider`, and
 /// hands back the engine it ran under so the caller can read what it recorded.
-pub async fn run_body<F, Fut>(
+pub async fn run_body<F>(
     provider: &Arc<dyn StateProvider>,
     name: &str,
     id: &str,
     body: F,
 ) -> Result<DurableEngine>
 where
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<i64>> + Send + 'static,
+    F: for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<i64>> + Send + Sync + 'static,
 {
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register(name, move |ctx: DurableContext, _: ()| body(ctx));
+    engine.register(name, workflow_fn(move |ctx, _: ()| body(ctx)));
     engine
         .start::<_, i64>(name, (), WorkflowOptions::with_id(id))
         .await?

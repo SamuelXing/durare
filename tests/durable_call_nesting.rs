@@ -24,11 +24,11 @@
 //!
 //! [`select`]: durare::DurableContext::select
 
+use durare::{workflow_fn, BoxFuture};
 use durare::{
-    params, DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result,
-    SqliteProvider, StateProvider, WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, StateProvider,
+    WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
 };
-use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,10 +45,9 @@ async fn recorded(engine: &DurableEngine) -> Result<Vec<(i32, String)>> {
 }
 
 /// Runs `body` once and reports what it recorded, in position order.
-async fn positions<F, Fut>(body: F) -> Result<Vec<(i32, String)>>
+async fn positions<F>(body: F) -> Result<Vec<(i32, String)>>
 where
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<i64>> + Send + 'static,
+    F: for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<i64>> + Send + Sync + 'static,
 {
     let provider: Arc<dyn StateProvider> = Arc::new(InMemoryProvider::new());
     let engine = common::run_body(&provider, WORKFLOW, ID, body).await?;
@@ -63,25 +62,27 @@ where
 /// The `after` step is written here, outside `body`, so every test shares the
 /// same call after the `select`: it claims the position immediately after the
 /// select's, and what it finds there is what each test asserts on.
-async fn replay<F, Fut>(body: F) -> Result<(Vec<(i32, String)>, WorkflowStatus)>
+async fn replay<F>(body: F) -> Result<(Vec<(i32, String)>, WorkflowStatus)>
 where
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<()>> + Send + 'static,
+    F: for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<()>> + Send + Sync + 'static,
 {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     let attempts = Arc::new(AtomicUsize::new(0));
-    engine.register(WORKFLOW, move |ctx: DurableContext, _: ()| {
-        let attempts = attempts.clone();
-        let select = body(ctx.clone());
-        async move {
-            select.await?;
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("crash after the select, before the workflow completes");
-            }
-            ctx.step("after", || async { Ok::<_, Error>(2_i64) }).await
-        }
-    });
+    engine.register(
+        WORKFLOW,
+        workflow_fn(move |ctx, _: ()| {
+            let attempts = attempts.clone();
+            let select = body(ctx);
+            Box::pin(async move {
+                select.await?;
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("crash after the select, before the workflow completes");
+                }
+                ctx.step("after", |_| async { Ok::<_, Error>(2_i64) }).await
+            })
+        }),
+    );
 
     // First run: records the select, then crashes.
     engine
@@ -118,10 +119,12 @@ where
 /// it did on the first run.
 #[tokio::test]
 async fn a_plain_branch_replays_cleanly() -> Result<()> {
-    let (before, status) = replay(|ctx| async move {
-        let (index, value) = ctx.select(vec![Box::pin(async { Some(1_i64) })]).await?;
-        assert_eq!((index, value), (0, Some(1)));
-        Ok(())
+    let (before, status) = replay(|ctx| {
+        Box::pin(async move {
+            let (index, value) = ctx.select(vec![Box::pin(async { Some(1_i64) })]).await?;
+            assert_eq!((index, value), (0, Some(1)));
+            Ok(())
+        })
     })
     .await?;
 
@@ -141,24 +144,26 @@ async fn a_plain_branch_replays_cleanly() -> Result<()> {
 /// reported at all under the same one.
 #[tokio::test]
 async fn a_step_inside_a_select_branch_is_refused() -> Result<()> {
-    let (before, status) = replay(|ctx| async move {
-        let inner = ctx.clone();
-        let (index, value) = ctx
-            .select(vec![Box::pin(async move {
-                let refused = inner
-                    .step("inner", || async { Ok::<_, Error>(1_i64) })
-                    .await
-                    .expect_err("a durable call in a branch is refused");
-                assert_eq!(refused.code(), ErrorCode::NestedDurableCall);
-                Some(refused.to_string())
-            })])
-            .await?;
-        assert_eq!(index, 0);
-        assert!(
-            value.unwrap().contains("`step` was created inside another"),
-            "the branch sees the refusal, not a checkpoint"
-        );
-        Ok(())
+    let (before, status) = replay(|ctx| {
+        Box::pin(async move {
+            let inner = ctx;
+            let (index, value) = ctx
+                .select(vec![Box::pin(async move {
+                    let refused = inner
+                        .step("inner", |_| async { Ok::<_, Error>(1_i64) })
+                        .await
+                        .expect_err("a durable call in a branch is refused");
+                    assert_eq!(refused.code(), ErrorCode::NestedDurableCall);
+                    Some(refused.to_string())
+                })])
+                .await?;
+            assert_eq!(index, 0);
+            assert!(
+                value.unwrap().contains("`step` was created inside another"),
+                "the branch sees the refusal, not a checkpoint"
+            );
+            Ok(())
+        })
     })
     .await?;
 
@@ -180,18 +185,20 @@ async fn a_step_inside_a_select_branch_is_refused() -> Result<()> {
 /// the case nothing could detect after the fact, because the name check passes.
 #[tokio::test]
 async fn a_same_named_step_inside_a_select_branch_is_refused() -> Result<()> {
-    let (before, status) = replay(|ctx| async move {
-        let inner = ctx.clone();
-        let (index, value) = ctx
-            .select(vec![Box::pin(async move {
-                inner
-                    .step("after", || async { Ok::<_, Error>(1_i64) })
-                    .await
-                    .ok()
-            })])
-            .await?;
-        assert_eq!((index, value), (0, None), "the inner call was refused");
-        Ok(())
+    let (before, status) = replay(|ctx| {
+        Box::pin(async move {
+            let inner = ctx;
+            let (index, value) = ctx
+                .select(vec![Box::pin(async move {
+                    inner
+                        .step("after", |_| async { Ok::<_, Error>(1_i64) })
+                        .await
+                        .ok()
+                })])
+                .await?;
+            assert_eq!((index, value), (0, None), "the inner call was refused");
+            Ok(())
+        })
     })
     .await?;
 
@@ -209,20 +216,22 @@ async fn a_same_named_step_inside_a_select_branch_is_refused() -> Result<()> {
 /// the call written after the outer step takes the position directly behind it.
 #[tokio::test]
 async fn a_step_inside_a_step_body_is_refused_and_claims_no_position() -> Result<()> {
-    let recorded = positions(|ctx| async move {
-        let inner = ctx.clone();
-        let refused = ctx
-            .step("outer", || async move {
-                let e = inner
-                    .step("inner", || async { Ok::<_, Error>(1_i64) })
-                    .await
-                    .expect_err("a step inside a step body is refused");
-                assert_eq!(e.code(), ErrorCode::NestedDurableCall);
-                Ok::<_, Error>(e.to_string())
-            })
-            .await?;
-        assert!(refused.contains("`step` was created inside another"));
-        ctx.step("after", || async { Ok::<_, Error>(2_i64) }).await
+    let recorded = positions(|ctx| {
+        Box::pin(async move {
+            let inner = ctx;
+            let refused = ctx
+                .step("outer", |_| async move {
+                    let e = inner
+                        .step("inner", |_| async { Ok::<_, Error>(1_i64) })
+                        .await
+                        .expect_err("a step inside a step body is refused");
+                    assert_eq!(e.code(), ErrorCode::NestedDurableCall);
+                    Ok::<_, Error>(e.to_string())
+                })
+                .await?;
+            assert!(refused.contains("`step` was created inside another"));
+            ctx.step("after", |_| async { Ok::<_, Error>(2_i64) }).await
+        })
     })
     .await?;
 
@@ -243,22 +252,24 @@ async fn a_step_inside_a_step_body_is_refused_and_claims_no_position() -> Result
 /// cancellation and timeout have no owner across that boundary either.
 #[tokio::test]
 async fn a_call_built_outside_and_polled_inside_a_body_is_refused() -> Result<()> {
-    let recorded = positions(|ctx| async move {
-        let carried = ctx.step("carried", || async { Ok::<_, Error>(1_i64) });
-        let message = ctx
-            .step("outer", move || async move {
-                let e = carried
-                    .await
-                    .expect_err("a call built outside this body is refused in it");
-                assert_eq!(e.code(), ErrorCode::NestedDurableCall);
-                Ok::<_, Error>(e.to_string())
-            })
-            .await?;
-        assert!(
-            message.contains("was built outside the durable body"),
-            "got: {message}"
-        );
-        ctx.step("after", || async { Ok::<_, Error>(3_i64) }).await
+    let recorded = positions(|ctx| {
+        Box::pin(async move {
+            let carried = ctx.step("carried", |_| async { Ok::<_, Error>(1_i64) });
+            let message = ctx
+                .step("outer", move |_| async move {
+                    let e = carried
+                        .await
+                        .expect_err("a call built outside this body is refused in it");
+                    assert_eq!(e.code(), ErrorCode::NestedDurableCall);
+                    Ok::<_, Error>(e.to_string())
+                })
+                .await?;
+            assert!(
+                message.contains("was built outside the durable body"),
+                "got: {message}"
+            );
+            ctx.step("after", |_| async { Ok::<_, Error>(3_i64) }).await
+        })
     })
     .await?;
 
@@ -288,26 +299,30 @@ async fn a_call_built_outside_and_polled_inside_a_body_is_refused() -> Result<()
 /// returns only once `beside` has been awaited.
 #[tokio::test]
 async fn a_sibling_built_while_a_body_is_in_flight_is_allowed() -> Result<()> {
-    let recorded = positions(|ctx| async move {
-        let inside = Arc::new(Notify::new());
-        let go = Arc::new(Notify::new());
-        let (held, beside) = tokio::join!(
-            ctx.step("held", {
-                let (inside, go) = (inside.clone(), go.clone());
-                move || async move {
-                    inside.notify_one();
-                    go.notified().await;
-                    Ok::<_, Error>(1_i64)
+    let recorded = positions(|ctx| {
+        Box::pin(async move {
+            let inside = Arc::new(Notify::new());
+            let go = Arc::new(Notify::new());
+            let (held, beside) = tokio::join!(
+                ctx.step("held", {
+                    let (inside, go) = (inside.clone(), go.clone());
+                    move |_| async move {
+                        inside.notify_one();
+                        go.notified().await;
+                        Ok::<_, Error>(1_i64)
+                    }
+                }),
+                async {
+                    inside.notified().await;
+                    let beside = ctx
+                        .step("beside", |_| async { Ok::<_, Error>(2_i64) })
+                        .await;
+                    go.notify_one();
+                    beside
                 }
-            }),
-            async {
-                inside.notified().await;
-                let beside = ctx.step("beside", || async { Ok::<_, Error>(2_i64) }).await;
-                go.notify_one();
-                beside
-            }
-        );
-        Ok(held? + beside?)
+            );
+            Ok(held? + beside?)
+        })
     })
     .await?;
 
@@ -324,24 +339,26 @@ async fn a_sibling_built_while_a_body_is_in_flight_is_allowed() -> Result<()> {
 /// panics does not leave the workflow unable to make durable calls afterwards.
 #[tokio::test]
 async fn a_body_that_errors_or_panics_leaves_the_scope_clean() -> Result<()> {
-    let recorded = positions(|ctx| async move {
-        ctx.step("errored", || async {
-            Err::<i64, _>(Error::app("business failure"))
-        })
-        .await
-        .expect_err("the body returned an error");
+    let recorded = positions(|ctx| {
+        Box::pin(async move {
+            ctx.step("errored", |_| async {
+                Err::<i64, _>(Error::app("business failure"))
+            })
+            .await
+            .expect_err("the body returned an error");
 
-        ctx.step("panicked", || async {
-            panic!("the body panicked");
-            #[allow(unreachable_code)]
-            Ok::<i64, Error>(0)
-        })
-        .await
-        .expect_err("the panic is caught and recorded as a failure");
+            ctx.step("panicked", |_| async {
+                panic!("the body panicked");
+                #[allow(unreachable_code)]
+                Ok::<i64, Error>(0)
+            })
+            .await
+            .expect_err("the panic is caught and recorded as a failure");
 
-        // Both bodies unwound out of their scope. If either had left it set,
-        // this call would be refused as nested.
-        ctx.step("after", || async { Ok::<_, Error>(7_i64) }).await
+            // Both bodies unwound out of their scope. If either had left it set,
+            // this call would be refused as nested.
+            ctx.step("after", |_| async { Ok::<_, Error>(7_i64) }).await
+        })
     })
     .await?;
 
@@ -369,17 +386,19 @@ async fn a_body_that_errors_or_panics_leaves_the_scope_clean() -> Result<()> {
 /// position of the call that follows.
 #[tokio::test]
 async fn a_call_created_by_the_closure_before_its_future_is_refused() -> Result<()> {
-    let recorded = positions(|ctx| async move {
-        ctx.step("outer", {
-            let inner = ctx.clone();
-            move || {
-                // Runs at the call, before anything below is polled.
-                drop(inner.step("hidden", || async { Ok::<_, Error>(1_i64) }));
-                async { Ok::<_, Error>(0_i64) }
-            }
+    let recorded = positions(|ctx| {
+        Box::pin(async move {
+            ctx.step("outer", {
+                let inner = ctx;
+                move |_| {
+                    // Runs at the call, before anything below is polled.
+                    drop(inner.step("hidden", |_| async { Ok::<_, Error>(1_i64) }));
+                    async { Ok::<_, Error>(0_i64) }
+                }
+            })
+            .await?;
+            ctx.step("after", |_| async { Ok::<_, Error>(2_i64) }).await
         })
-        .await?;
-        ctx.step("after", || async { Ok::<_, Error>(2_i64) }).await
     })
     .await?;
 
@@ -392,41 +411,4 @@ async fn a_call_created_by_the_closure_before_its_future_is_refused() -> Result<
     Ok(())
 }
 
-/// The same rule inside a plain `transaction` body, which the provider runs
-/// rather than the workflow awaiting it in place.
-///
-/// Transactions need a SQL backend, so this one runs on SQLite. The closure's
-/// own work and the future it returns share one scope, so a call built in either
-/// half is refused and the counter does not move.
-#[tokio::test]
-async fn a_call_created_in_a_transaction_body_is_refused() -> Result<()> {
-    let (url, path) = common::temp_db_url("nesting");
-
-    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
-    engine.register(WORKFLOW, |ctx: DurableContext, _: ()| async move {
-        let inner = ctx.clone();
-        ctx.transaction("tx", move |tx| {
-            drop(inner.step("hidden", || async { Ok::<_, Error>(1_i64) }));
-            Box::pin(async move {
-                tx.execute("SELECT 1", &params![]).await?;
-                Ok(0_i64)
-            })
-        })
-        .await?;
-        ctx.step("after", || async { Ok::<_, Error>(2_i64) }).await
-    });
-    engine
-        .start::<_, i64>(WORKFLOW, (), WorkflowOptions::with_id(ID))
-        .await?
-        .result()
-        .await?;
-
-    assert_eq!(
-        recorded(&engine).await?,
-        [(0, "tx".to_string()), (1, "after".to_string())],
-        "the call built inside the transaction body claimed no position"
-    );
-    drop(engine);
-    common::remove_sqlite_files(&path);
-    Ok(())
-}
+// Capturing the workflow context in a transaction is covered by compile_fail.
