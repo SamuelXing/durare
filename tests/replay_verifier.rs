@@ -397,6 +397,37 @@ async fn a_body_that_panics_on_the_frontier_of_a_running_history_passes() -> Res
     Ok(())
 }
 
+/// Reaching the frontier of a running history does not excuse a recorded
+/// position the re-run never asked for. A call built and dropped over `a`
+/// claims position 0 without consulting it; the re-run then serves the timer
+/// and is stopped at the frontier, and `a` was still never verified.
+#[tokio::test]
+async fn a_built_and_dropped_call_is_missing_against_a_running_history_too() -> Result<()> {
+    let provider = provider();
+    let _running = park_on_timer(&provider).await?;
+
+    let report = engine(&provider, |ctx: DurableContext| async move {
+        drop(ctx.step("renamed", || async { Ok::<_, Error>(1_i64) }));
+        ctx.sleep(Duration::from_secs(3_600)).await?;
+        ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await?;
+        Ok(0)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+
+    assert_eq!(report.matched, 1, "only the timer was served");
+    assert_eq!(
+        report.divergence,
+        Some(Divergence::Missing {
+            position: 0,
+            recorded: "a".into(),
+        }),
+        "{report:?}"
+    );
+    Ok(())
+}
+
 /// A recorded value that no longer decodes is a failure against a running
 /// history too. The history being a prefix excuses the operations it does not
 /// hold yet, not a re-run that fails on one it does hold.

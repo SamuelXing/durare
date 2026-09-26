@@ -240,18 +240,25 @@ impl Verification {
 
     /// The report for a re-run of `history` that ended in `outcome`.
     ///
-    /// One decision, in this order: a divergence the run booked wins; a run the
-    /// verifier stopped at the frontier of an incomplete history is clean; a run
-    /// that ended on its own is judged first by how it ended ([`failed`]) and
-    /// then by what it never asked for ([`missing`]).
+    /// One decision, in this order: a divergence the run booked wins. Then how
+    /// the run ended — but only if it ended on its own: a run the verifier
+    /// stopped at the frontier of an incomplete history ended because of the
+    /// verifier, and a body that panics on that stop has not failed
+    /// ([`failed`]). Then, whichever way it ended, what it never asked for
+    /// ([`missing`]): reaching the frontier does not excuse a recorded position
+    /// the re-run walked past on the way.
     pub(crate) fn report(&self, history: History<'_>, outcome: RunOutcome) -> ReplayReport {
         let seen = self.seen();
-        let divergence = seen.divergence.clone().or_else(|| {
-            if seen.stopped_at.is_some() {
-                return None;
-            }
-            failed(history.status, &outcome).or_else(|| missing(history.recorded, &seen.served))
-        });
+        let own_failure = if seen.stopped_at.is_some() {
+            None
+        } else {
+            failed(history.status, &outcome)
+        };
+        let divergence = seen
+            .divergence
+            .clone()
+            .or(own_failure)
+            .or_else(|| missing(history.recorded, &seen.served));
         ReplayReport {
             workflow_id: history.id.to_owned(),
             workflow_name: history.name.to_owned(),
