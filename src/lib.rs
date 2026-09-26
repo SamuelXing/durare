@@ -193,6 +193,7 @@ mod memory;
 mod postgres;
 mod provider;
 mod queue;
+mod recorded_error;
 mod replay;
 mod schedule;
 mod serialize;
@@ -225,7 +226,7 @@ pub use engine::{
     HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef, WorkflowFn,
     WorkflowOptions, WorkflowRegistration,
 };
-pub use error::{Error, ErrorCode, Result};
+pub use error::{Error, ErrorCode, RecordedError, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by
 /// `read_stream_values` (`StreamExt::next`) without depending on `futures` directly.
 pub use futures_util::{Stream, StreamExt};

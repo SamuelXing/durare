@@ -688,7 +688,7 @@ impl StateProvider for SqliteProvider {
                         // error retries on a fresh tx, an application error is left for
                         // the outer user-retry loop (recorded only once the budget is
                         // spent).
-                        Err(e) if e.is_tx_conflict() || e.is_retryable() => Err(e),
+                        Err(e) if e.should_retry_live_transaction() => Err(e),
                         Err(e) => {
                             tx.rollback().await?;
                             Err(e)
@@ -703,7 +703,7 @@ impl StateProvider for SqliteProvider {
                     // retry on a fresh transaction, unbounded, backing off and bailing
                     // if the workflow is cancelled. Matches Go/Python, which retry
                     // these until they clear rather than failing under contention.
-                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                    Err(e) if e.should_retry_live_transaction() => {
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
@@ -723,7 +723,7 @@ impl StateProvider for SqliteProvider {
             }
             // A body error reached the user-retry policy: retry the whole body if
             // the budget allows and the predicate accepts, otherwise record the
-            // failure durably and surface the original error.
+            // failure durably and surface the same representation as replay.
             if opts.should_user_retry(&body_err, user_attempt) {
                 let delay = opts.user_retry_backoff(user_attempt);
                 tracing::warn!(
@@ -770,7 +770,10 @@ impl StateProvider for SqliteProvider {
                 )
                 .await?;
             }
-            return Err(body_err);
+            return Err(serialize::restore_error(
+                Some(self.serializer.name()),
+                &encoded_err,
+            ));
         }
     }
 
@@ -2147,8 +2150,8 @@ impl StateProvider for SqliteProvider {
                 sqlx::query(
                     "INSERT INTO operation_outputs
                          (workflow_uuid, function_id, function_name, output, error,
-                          child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                          child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
                 .bind(col_str(op, "workflow_uuid"))
                 .bind(col_i64(op, "function_id"))
@@ -2158,6 +2161,7 @@ impl StateProvider for SqliteProvider {
                 .bind(col_str(op, "child_workflow_id"))
                 .bind(col_i64(op, "started_at_epoch_ms"))
                 .bind(col_i64(op, "completed_at_epoch_ms"))
+                .bind(col_str(op, "serialization"))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -2273,6 +2277,7 @@ fn export_op_map(row: &sqlx::sqlite::SqliteRow) -> Map<String, Value> {
         "output",
         "error",
         "child_workflow_id",
+        "serialization",
     ] {
         m.insert(c.to_string(), s_col(row, c));
     }

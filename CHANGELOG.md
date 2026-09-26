@@ -8,6 +8,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: recorded failures return the same error representation on the
+  initial execution and replay.** Built-in variants retain their fields;
+  live driver, migration, and JSON errors become `Error::Recorded`, preserving
+  their message, `ErrorCode`, and `is_*` classifications. `app_source` sources
+  are available to live retry predicates but no longer escape a successful
+  checkpoint. Structured application errors keep their fields in either format.
+
+  Step, transaction, workflow, and handle readers share the versioned error
+  decoder. Legacy bare text remains `Error::App`. Existing fieldless portable
+  `DBOSNotAuthorizedError` records (including foreign SDK records) now return
+  `Error::NotAuthorized` / `ErrorCode::NotAuthorized`, rather than
+  `Error::Portable` / `ErrorCode::Application`. Review workflows that branch on
+  authorization failures before replaying old histories under this version.
+  Upgrade readers before
+  recording new typed failures: older binaries cannot replay the new records
+  with their classifications. See the durability guide's "Recorded errors"
+  section for reserved-marker collisions and mixed-version restrictions.
+
 - **Breaking: a durable call may not be created inside another durable
   operation's body, and may not be awaited in a body other than the one it was
   built in.** A step body, a transaction body and a `select` branch are all

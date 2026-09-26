@@ -329,6 +329,9 @@ impl IsolationLevel {
 /// exponential backoff; the whole body re-runs on a new transaction. Only after
 /// the budget is exhausted is the failure checkpointed durably. With the default
 /// `max_retries` of 0 an application error fails immediately, as before.
+/// Re-raised [`Error::Recorded`](crate::Error::Recorded) diagnostics use this
+/// user budget too, even when their saved retry/conflict classifications are true.
+/// Only live driver failures enter the internal database retry loop.
 #[derive(Clone)]
 pub struct TransactionOptions {
     /// Checkpoint name recorded for this transactional step.
@@ -438,7 +441,7 @@ impl TransactionOptions {
     /// not count against this budget, so an exhausted conflict fails immediately
     /// rather than re-running the whole body.
     pub(crate) fn should_user_retry(&self, err: &Error, attempt: u32) -> bool {
-        !err.is_tx_conflict()
+        !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
             && attempt < self.max_retries
             && self.retry_if.as_ref().is_none_or(|p| p(err))
     }

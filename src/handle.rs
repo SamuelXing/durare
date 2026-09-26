@@ -177,17 +177,13 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
             STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
                 Err(Error::MaxRecoveryAttemptsExceeded(self.id.clone()))
             }
-            // A workflow that failed under portable mode carries a structured
-            // error; reconstruct it so an observer reads the same name/code/data
-            // any SDK wrote. Otherwise the bare message.
-            STATUS_ERROR => Err(match status.error_info {
-                Some(info) => Error::Portable(Box::new(info)),
-                None => Error::app(
-                    status
-                        .error
-                        .unwrap_or_else(|| "workflow failed".to_string()),
-                ),
-            }),
+            // Use the same decoder as initial completion and step replay.
+            STATUS_ERROR => Err(crate::recorded_error::from_parts(
+                status
+                    .error
+                    .unwrap_or_else(|| "workflow failed".to_string()),
+                status.error_info,
+            )),
             _ => {
                 let output = status.output.unwrap_or(Value::Null);
                 Ok(serde_json::from_value(output)?)
