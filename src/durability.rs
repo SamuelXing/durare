@@ -123,7 +123,8 @@
 //!
 //! # Storage failures during execution
 //!
-//! A checkpoint read, write, or decoding failure is not a business outcome.
+//! A checkpoint read/write failure or unreadable stored envelope is not a
+//! business outcome.
 //! The execution stops with [`Error::RecoveryRequired`], retaining the original
 //! cause. The engine does not write `ERROR` or `SUCCESS` for that execution,
 //! even if workflow code catches the error. Further durable calls on the same
@@ -139,11 +140,22 @@
 //! Concurrent cancellation/completion may already have changed the stored status.
 //!
 //! Recovery must be scheduled through the engine's existing recovery APIs; this
-//! error does not start an automatic retry loop. Persistent decoding failures
-//! require a compatible reader or repaired data before recovery can succeed.
+//! error does not start an automatic retry loop. Every execution path emits an
+//! error event with `workflow_id`, `workflow`, `error`, and `recovery_required=true`,
+//! including queued, scheduled, child and recovered runs without an owning handle.
+//! Launch-time recovery does not automatically pick up new failures in a live
+//! process. Persistent decoding failures require a compatible reader or repaired
+//! data before recovery can succeed.
+//!
 //! Errors returned by user step/transaction bodies remain business outcomes,
-//! including database errors. Their Rust variant alone does not identify a
-//! checkpoint failure.
+//! including database errors. Failure to encode a body's return value is saved
+//! as a step failure, so recovery does not repeat the body merely to reproduce
+//! that encoding error. This still requires the failure checkpoint to commit.
+//! Provider semantic rejections (for example a missing message destination or
+//! closed stream) and conversion of a recorded value to an incompatible requested
+//! Rust type remain catchable API errors. The provider's storage error contract
+//! is defined by [`StateProvider`](crate::StateProvider); error variants alone
+//! do not classify errors returned by arbitrary user code.
 //!
 //! # Crash recovery
 //!

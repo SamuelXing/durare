@@ -16,6 +16,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   errors remain ordinary recorded failures. Lost terminal-write responses are
   reconciled with the stored workflow status. Exhaustive matches on `Error`
   need an arm for the new variant.
+  Provider semantic errors remain catchable. A step result that cannot be
+  serialized is recorded as a failed step, preventing recovery from rerunning
+  its body just to encounter the same encoding failure. Recoverable failures
+  emit a structured error event on every execution path, including detached runs.
 
 - **Breaking: recorded failures return the same error representation on the
   initial execution and replay.** Built-in variants retain their fields;

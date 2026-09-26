@@ -1319,6 +1319,18 @@ pub enum RecoveryClaim {
 ///
 /// Every method must be **idempotent** with respect to its keys, because the
 /// engine may re-run a workflow after a crash and replay completed steps.
+///
+/// # Error contract
+///
+/// At this boundary, return [`Error::Db`], [`Error::Migrate`], [`Error::Serde`]
+/// or [`Error::Serialization`] for storage/record-encoding failures. A provider
+/// with another storage error type can wrap its cause in [`Error::RecoveryRequired`].
+/// The engine stops the affected execution without recording a business outcome.
+/// Return semantic rejections (such as [`Error::NonExistentWorkflow`] or
+/// [`Error::App`] for a closed stream) as ordinary errors; callers may handle them.
+/// Do not flatten storage failures to an application message. Recorded user
+/// failures are outcomes, not live storage errors; transaction callers reconcile
+/// ambiguous failures against the stored step before deciding how to proceed.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Create tables / indexes if they do not yet exist.

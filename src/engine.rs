@@ -2726,8 +2726,8 @@ pub(crate) async fn dispatch_pending_workflows(
                 // timer stalled every pending workflow behind it in this loop —
                 // and stalled the caller of `recover` for its whole wait — and
                 // shutdown could never drain a recovery that contained one.
-                // Best-effort as before: a workflow that fails again is marked
-                // ERROR by `run_to_completion`.
+                // run_to_completion records business failures and reports
+                // recoverable infrastructure failures without finalizing them.
                 let auth = AuthContext::from_status(&record);
                 let span = rt.workflow_span(&record.id, &record.name, None, &auth);
                 let task_rt = rt.clone();
@@ -3234,7 +3234,8 @@ async fn run_to_completion(
     // The span covers the whole execution, terminal status write included;
     // `recorder` sets the outcome fields declared `Empty` at creation.
     let recorder = span.clone();
-    async move {
+    let diagnostics = span.clone();
+    let result = async {
     let provider = rt.provider().clone();
     // Required-roles enforcement, before the body runs — the single gate every
     // execution path (direct, queued, scheduled, child, recovery) flows
@@ -3307,7 +3308,6 @@ async fn run_to_completion(
     // no terminal status.
     // A handled error is still a failed execution: no terminal status may be
     // invented after a checkpoint read/write or decoding failure.
-    execution.check()?;
     let result = match caught {
         Ok(returned) => returned,
         Err(payload) => {
@@ -3315,10 +3315,12 @@ async fn run_to_completion(
             tracing::error!(id = %id, panic = %msg, "workflow panicked; left recoverable for recovery to re-run");
             // No `dbos.workflow.status`: the row keeps its non-terminal state.
             recorder.record("otel.status_code", "ERROR");
+            execution.check()?;
             return Err(Error::app(format!("workflow panicked: {msg}")));
         }
     };
 
+    execution.check()?;
     match result {
         Ok(output) => {
             let landed = write_terminal_status(&provider, &id, STATUS_SUCCESS, Some(&output), None).await?;
@@ -3345,7 +3347,7 @@ async fn run_to_completion(
             }
             recorder.record("dbos.workflow.status", STATUS_CANCELLED);
             recorder.record("otel.status_code", "ERROR");
-            Err(Error::Cancelled(id))
+            Err(Error::Cancelled(id.clone()))
         }
         Err(e) => {
             // Encode once and return the same representation a polling handle
@@ -3365,7 +3367,21 @@ async fn run_to_completion(
     }
     }
     .instrument(span)
-    .await
+    .await;
+    // Every entry path uses this boundary, including detached queue, schedule,
+    // child and recovered runs whose Result has no owning caller.
+    if let Err(Error::RecoveryRequired(cause)) = &result {
+        diagnostics.record("otel.status_code", "ERROR");
+        tracing::error!(
+            parent: &diagnostics,
+            workflow_id = %id,
+            workflow = %name,
+            error = %cause,
+            recovery_required = true,
+            "workflow execution stopped without finalizing; schedule recovery after resolving the cause"
+        );
+    }
+    result
 }
 
 async fn write_terminal_status(
@@ -3380,6 +3396,7 @@ async fn write_terminal_status(
         .await
     {
         Ok(landed) => Ok(landed),
+        Err(error) if !crate::execution::is_storage_failure(&error) => Err(error),
         Err(error) => {
             // The commit may have succeeded. A terminal readback is evidence;
             // an unavailable/nonterminal read is not permission to finalize.

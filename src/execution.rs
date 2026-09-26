@@ -27,22 +27,30 @@ impl Execution {
         }
     }
 
-    /// Only call at a storage/decoding boundary, never around user code or a
-    /// recorded business failure. Ownership and cancellation keep their existing
-    /// control paths; an ordinary provider failure halts this execution.
+    /// Classify only a provider/storage result, never a user body result.
+    /// Providers also return semantic rejections (missing destination, closed
+    /// stream, unsupported operation); those remain ordinary catchable errors.
     pub(crate) fn record(&self, error: Error) -> Error {
-        if matches!(
-            error,
-            Error::Cancelled(_) | Error::WorkflowConflict(_) | Error::UnexpectedStep { .. }
-        ) {
+        if !is_storage_failure(&error) {
             return error;
         }
+        self.interrupt(error)
+    }
+
+    /// A known infrastructure failure, including an inconsistent stored row
+    /// whose diagnostic uses App. Do not use for user-value serialization.
+    pub(crate) fn interrupt(&self, error: Error) -> Error {
         let mut failure = self
             .0
             .failure
             .lock()
             .expect("execution failure lock poisoned");
-        let first = failure.get_or_insert_with(|| Arc::new(error)).clone();
+        let first = failure
+            .get_or_insert_with(|| match error {
+                Error::RecoveryRequired(cause) => cause,
+                error => Arc::new(error),
+            })
+            .clone();
         self.0.changed.notify_one();
         Error::RecoveryRequired(first)
     }
@@ -60,4 +68,18 @@ impl Execution {
             changed.await;
         }
     }
+}
+
+/// The provider boundary's error contract, not a global classification of an
+/// arbitrary Error: a Db/Serde returned by application code is a business result.
+/// Recorded driver errors are snapshots of business failures, not live failures.
+pub(crate) fn is_storage_failure(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Db(_)
+            | Error::Migrate(_)
+            | Error::Serde(_)
+            | Error::Serialization(_)
+            | Error::RecoveryRequired(_)
+    )
 }

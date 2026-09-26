@@ -15,6 +15,8 @@ pub enum Fault {
     TransactionBefore,
     TransactionAfter,
     Corrupt,
+    ChildBefore,
+    ChildAfter,
 }
 
 pub struct FaultProvider {
@@ -54,7 +56,15 @@ impl StateProvider for FaultProvider {
         &self,
         status: WorkflowStatus,
     ) -> Result<(WorkflowStatus, bool)> {
-        self.inner.insert_workflow_status(status).await
+        let child = status.parent_workflow_id.is_some();
+        if child && self.take(Fault::ChildBefore) {
+            return Self::failure();
+        }
+        let result = self.inner.insert_workflow_status(status).await?;
+        if child && self.take(Fault::ChildAfter) {
+            return Self::failure();
+        }
+        Ok(result)
     }
     async fn get_deduplicated_workflow(
         &self,

@@ -725,7 +725,8 @@ impl DurableContext {
                     &self.workflow_id,
                     child_auth,
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_child_workflow(&self.workflow_id, seq, &name, &child_id)
                 .await
@@ -977,16 +978,7 @@ impl DurableContext {
                     .await;
                 match result {
                     Ok(value) => self.recorded_value(StepOutcome::Output(value)),
-                    Err(error)
-                        if matches!(
-                            error,
-                            Error::Cancelled(_)
-                                | Error::WorkflowConflict(_)
-                                | Error::UnexpectedStep { .. }
-                        ) =>
-                    {
-                        Err(error)
-                    }
+                    Err(error) if !crate::execution::is_storage_failure(&error) => Err(error),
                     Err(error) => {
                         // The provider API returns both recorded body errors and
                         // storage failures as Err. Only a durable row establishes
@@ -1233,7 +1225,7 @@ impl DurableContext {
                             .await
                             .map_err(|error| self.execution.record(error))?
                             .ok_or_else(|| {
-                                self.execution.record(Error::app(
+                                self.execution.interrupt(Error::app(
                                     "transaction_completion row vanished after a duplicate insert",
                                 ))
                             })?;
@@ -1330,7 +1322,13 @@ impl DurableContext {
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
         match in_body(|| f(&mut *tx)).await {
             Ok(v) => {
-                let value = serde_json::to_value(v)?;
+                let value = match serde_json::to_value(v) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = ds.rollback(tx).await;
+                        return Ok(DsAttempt::BodyFailed(error.into()));
+                    }
+                };
                 // A body that ended our transaction via raw SQL would make the
                 // completion row commit separately from the writes it
                 // witnesses — detect and refuse instead of breaking atomicity.
@@ -1422,7 +1420,7 @@ impl DurableContext {
                             .await
                             .map_err(|error| self.execution.record(error))?
                             .ok_or_else(|| {
-                                self.execution.record(Error::app(
+                                self.execution.interrupt(Error::app(
                                     "checkpoint row vanished after a duplicate insert",
                                 ))
                             })?;
@@ -1509,7 +1507,13 @@ impl DurableContext {
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
         match in_body(|| f(&mut *tx)).await {
             Ok(v) => {
-                let value = serde_json::to_value(v)?;
+                let value = match serde_json::to_value(v) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = ds.rollback(tx).await;
+                        return Ok(DsAttempt::BodyFailed(error.into()));
+                    }
+                };
                 // Ending our transaction via raw SQL would split the writes
                 // from their checkpoint — detect and refuse.
                 if let Some(expected) = &fingerprint {
@@ -1575,16 +1579,10 @@ impl DurableContext {
         if let Some(err_text) = row.error.as_deref() {
             let (message, info) =
                 crate::serialize::decode_error(row.serialization.as_deref(), err_text);
-            self.execution
-                .storage(crate::recorded_error::try_from_parts(
-                    message.clone(),
-                    info.clone(),
-                ))?;
-            let encoded = crate::serialize::encode_stored_error(
-                &self.provider.serializer(),
-                &message,
-                info.as_ref(),
-            );
+            let error = self
+                .execution
+                .storage(crate::recorded_error::try_from_parts(message, info))?;
+            let encoded = crate::serialize::encode_error(&self.provider.serializer(), &error);
             let stored = self
                 .provider
                 .record_step_result(
@@ -1601,7 +1599,7 @@ impl DurableContext {
             return self.recorded_value(stored);
         }
         let output = row.output.as_deref().ok_or_else(|| {
-            self.execution.record(Error::app(
+            self.execution.interrupt(Error::app(
                 "transaction completion row has neither output nor error",
             ))
         })?;
@@ -1785,9 +1783,9 @@ impl DurableContext {
 
     fn recorded_value<T: DeserializeOwned>(&self, outcome: StepOutcome) -> Result<T> {
         match outcome {
-            StepOutcome::Output(value) => self
-                .execution
-                .storage(serde_json::from_value(value).map_err(Error::from)),
+            // Converting an already-recorded JSON value to the user's type is
+            // an ordinary, repeatable API error, not failure to read storage.
+            StepOutcome::Output(value) => serde_json::from_value(value).map_err(Error::from),
             StepOutcome::Failure { message, info } => {
                 let error = self
                     .execution
@@ -1809,9 +1807,16 @@ impl DurableContext {
         started_at_ms: Option<i64>,
     ) -> Result<T> {
         self.execution.check()?;
-        let json = self
-            .execution
-            .storage(serde_json::to_value(&result).map_err(Error::from))?;
+        let json = match serde_json::to_value(&result) {
+            Ok(value) => value,
+            Err(error) => {
+                // The body already ran. Persist this deterministic result
+                // encoding failure so recovery does not repeat its effects.
+                return self
+                    .record_failure(seq, name, error.into(), started_at_ms)
+                    .await;
+            }
+        };
         let outcome = self
             .provider
             .record_step_result(
