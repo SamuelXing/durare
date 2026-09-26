@@ -2,7 +2,6 @@
 
 Baseline: `e0ed95aa0c66727ae3be2bb2a2ad9ce451be7471` (2026-09-26).
 This is an implementation review, not a claim that proposed behavior ships.
-The [development plan](../development-plan.md) tracks delivery separately.
 
 ## The problem in application code
 
