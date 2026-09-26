@@ -1362,7 +1362,7 @@ impl StateProvider for PostgresProvider {
                 user_attempt += 1;
                 continue;
             }
-            let encoded_err = serialize::encode_error(&self.serializer, &body_err);
+            let encoded_err = serialize::encode_error(&self.serializer, &body_err)?;
             let won = sqlx::query(&format!(
                 "INSERT INTO {operation_outputs}
                      (workflow_uuid, function_id, function_name, error, serialization,

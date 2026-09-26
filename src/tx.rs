@@ -453,7 +453,8 @@ impl TransactionOptions {
     /// not count against this budget, so an exhausted conflict fails immediately
     /// rather than re-running the whole body.
     pub(crate) fn should_user_retry(&self, err: &Error, attempt: u32) -> bool {
-        !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
+        !matches!(err, Error::RecoveryRequired(_))
+            && !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
             && attempt < self.max_retries
             && self.retry_if.as_ref().is_none_or(|p| p(err))
     }

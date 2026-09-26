@@ -814,7 +814,11 @@ impl DurableEngineBuilder {
     }
 
     /// Set the recovery-attempt cap before a workflow is parked in
-    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (default 100).
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (default 100). Counts successful recovery
+    /// claims after process loss, workflow panic or infrastructure interruption;
+    /// it is not a process-crash counter. Repeated storage outages can exhaust
+    /// this budget even when the workflow code is healthy. Checkpoint progress
+    /// does not reset it; explicit resume resets the count.
     pub fn max_recovery_attempts(&mut self, max: i32) -> &mut Self {
         self.max_recovery_attempts = max;
         self
@@ -1920,8 +1924,11 @@ impl DurableEngine {
                         && e.code() == ErrorCode::QueueDeduplicated =>
                 {
                     if let (Some(q), Some(d)) = (opts.queue.as_deref(), opts.dedup_id.as_deref()) {
-                        if let Some(existing) =
-                            self.provider.get_deduplicated_workflow(q, d).await?
+                        if let Some(existing) = self
+                            .provider
+                            .get_deduplicated_workflow(q, d)
+                            .await
+                            .map_err(crate::execution::provider_error)?
                         {
                             return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
                         }
@@ -2089,7 +2096,8 @@ impl DurableEngine {
     pub async fn retrieve_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         self.provider
             .get_workflow_status(id)
-            .await?
+            .await
+            .map_err(crate::execution::provider_error)?
             .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
         Ok(WorkflowHandle::polling(
             id.to_string(),
@@ -2228,7 +2236,8 @@ impl DurableEngine {
     /// body is caught and goes into the report: as
     /// [`Failed`](crate::Divergence::Failed) when nothing else diverged, and
     /// otherwise not at all, since a divergence is the better explanation for a
-    /// body that panicked on an operation it did not get.
+    /// body that panicked on an operation it did not get. A storage interruption
+    /// during replay returns [`Error::RecoveryRequired`], not a divergence report.
     pub async fn verify_replay(&self, workflow_id: &str) -> Result<ReplayReport> {
         let status = self
             .provider
@@ -2260,10 +2269,15 @@ impl DurableEngine {
         // Panics are caught the way a real execution catches them, so a body
         // that panics on an operation it was refused is reported rather than
         // taken out on the caller.
+        let execution = ctx.execution();
         let outcome = AssertUnwindSafe(handler(ctx, status.input))
             .catch_unwind()
             .await;
 
+        execution.check()?;
+        if let Ok(Err(Error::RecoveryRequired(cause))) = &outcome {
+            return Err(Error::RecoveryRequired(cause.clone()));
+        }
         Ok(verification.report(
             History {
                 id: workflow_id,
@@ -2936,7 +2950,11 @@ impl Runtime {
             row.deadline_ms = row.timeout_ms.map(|t| created_ms + t);
         }
 
-        let (canonical, created) = self.provider.insert_workflow_status(row).await?;
+        let (canonical, created) = self
+            .provider
+            .insert_workflow_status(row)
+            .await
+            .map_err(crate::execution::provider_error)?;
         Ok((canonical, queued, created))
     }
 
@@ -3207,7 +3225,12 @@ async fn queue_dispatch_loop(
                             )
                             .await;
                             drop(local_guard);
-                            if matches!(result, Err(Error::RecoveryRequired(_))) {
+                            // Err alone does not establish a failed workflow:
+                            // it can be a recorded business failure, a panic or
+                            // an interrupted storage operation. The recovery CAS
+                            // checks PENDING and this ownership generation; it
+                            // cannot requeue a terminal or superseded run.
+                            if result.is_err() {
                                 requeue_interrupted_run(
                                     &run_rt,
                                     &RecoveryClaimRequest {
@@ -3374,7 +3397,7 @@ async fn run_to_completion(
             // No `dbos.workflow.status`: the row keeps its non-terminal state.
             recorder.record("otel.status_code", "ERROR");
             execution.check()?;
-            return Err(Error::app(format!("workflow panicked: {msg}")));
+            return Err(crate::execution::recovery_error(Error::app(format!("workflow panicked: {msg}"))));
         }
     };
 
@@ -3410,7 +3433,7 @@ async fn run_to_completion(
         Err(e) => {
             // Encode once and return the same representation a polling handle
             // or recovered execution will read, rather than the live error.
-            let stored = crate::serialize::encode_error(&provider.serializer(), &e);
+            let stored = crate::serialize::encode_error(&provider.serializer(), &e)?;
             let landed = write_terminal_status(&provider, &id, STATUS_ERROR, None, Some(&stored)).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
@@ -3463,7 +3486,7 @@ async fn write_terminal_status(
                     return Ok(false); // the caller adopts the stored outcome
                 }
             }
-            Err(Error::RecoveryRequired(Arc::new(error)))
+            Err(crate::execution::recovery_error(error))
         }
     }
 }
@@ -3488,7 +3511,11 @@ async fn adopt_recorded_outcome(
         "workflow outcome was not recorded: this execution no longer owns the workflow; waiting for the recorded outcome"
     );
     loop {
-        let Some(status) = provider.get_workflow_status(id).await? else {
+        let Some(status) = provider
+            .get_workflow_status(id)
+            .await
+            .map_err(crate::execution::provider_error)?
+        else {
             return Err(Error::NonExistentWorkflow(id.to_string()));
         };
         if is_terminal(&status.status) {
@@ -3507,12 +3534,13 @@ async fn adopt_recorded_outcome(
                 STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
                     Err(Error::MaxRecoveryAttemptsExceeded(id.to_string()))
                 }
-                _ => Err(crate::recorded_error::from_parts(
+                _ => Err(crate::recorded_error::try_from_parts(
                     status
                         .error
                         .unwrap_or_else(|| "workflow failed".to_string()),
                     status.error_info,
-                )),
+                )
+                .map_err(crate::execution::recovery_error)?),
             };
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

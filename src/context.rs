@@ -962,13 +962,15 @@ impl DurableContext {
                 // Separate the call from the `async move`: `f(tx)` borrows `f`
                 // and yields a future that we move in, so the wrapper stays `Fn`
                 // (re-runnable).
+                let execution = self.execution.clone();
                 let body: TxBody = Box::new(move |tx| {
                     // Entered here rather than inside the `async move`: `f`'s
                     // own work happens at this call, and it is part of the body
                     // too.
                     let running = in_body(|| f(tx));
+                    let execution = execution.clone();
                     Box::pin(async move {
-                        let out = running.await?;
+                        let out = running.await.map_err(|error| execution.body_error(error))?;
                         Ok::<_, Error>(serde_json::to_value(out)?)
                     })
                 });
@@ -1286,7 +1288,8 @@ impl DurableContext {
         // written before the system-database record to keep the
         // layer-1-then-layer-2 recovery order. Best-effort: the system
         // database remains the source of truth.
-        let encoded = crate::serialize::encode_error(&ser, &body_err);
+        let encoded = crate::serialize::encode_error(&ser, &body_err)
+            .map_err(|error| self.execution.record(error))?;
         if let Err(mirror_err) = ds
             .insert_failure(&self.workflow_id, seq, &encoded, ser.name())
             .await
@@ -1320,12 +1323,15 @@ impl DurableContext {
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
-        match in_body(|| f(&mut *tx)).await {
+        match in_body(|| f(&mut *tx))
+            .await
+            .map_err(|error| self.execution.body_error(error))
+        {
             Ok(v) => {
                 let value = match serde_json::to_value(v) {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = ds.rollback(tx).await;
+                        ds.rollback(tx).await?;
                         return Ok(DsAttempt::BodyFailed(error.into()));
                     }
                 };
@@ -1334,7 +1340,7 @@ impl DurableContext {
                 // witnesses — detect and refuse instead of breaking atomicity.
                 if let Some(expected) = &fingerprint {
                     if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
-                        let _ = ds.rollback(tx).await;
+                        ds.rollback(tx).await?;
                         return Ok(DsAttempt::BodyFailed(Error::app(TX_TERMINATED_MSG)));
                     }
                 }
@@ -1359,14 +1365,14 @@ impl DurableContext {
                     )
                     .await?
                 {
-                    let _ = ds.rollback(tx).await;
+                    ds.rollback(tx).await?;
                     return Ok(DsAttempt::AlreadyCompleted { value });
                 }
                 ds.commit(tx).await?;
                 Ok(DsAttempt::Committed(value))
             }
             Err(e) => {
-                let _ = ds.rollback(tx).await;
+                ds.rollback(tx).await?;
                 if e.should_retry_live_transaction() {
                     Err(e)
                 } else {
@@ -1505,12 +1511,15 @@ impl DurableContext {
     {
         let mut tx = ds.begin(opts.isolation, opts.read_only).await?;
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
-        match in_body(|| f(&mut *tx)).await {
+        match in_body(|| f(&mut *tx))
+            .await
+            .map_err(|error| self.execution.body_error(error))
+        {
             Ok(v) => {
                 let value = match serde_json::to_value(v) {
                     Ok(value) => value,
                     Err(error) => {
-                        let _ = ds.rollback(tx).await;
+                        ds.rollback(tx).await?;
                         return Ok(DsAttempt::BodyFailed(error.into()));
                     }
                 };
@@ -1518,7 +1527,7 @@ impl DurableContext {
                 // from their checkpoint — detect and refuse.
                 if let Some(expected) = &fingerprint {
                     if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
-                        let _ = ds.rollback(tx).await;
+                        ds.rollback(tx).await?;
                         return Ok(DsAttempt::BodyFailed(Error::app(TX_TERMINATED_MSG)));
                     }
                 }
@@ -1547,14 +1556,14 @@ impl DurableContext {
                     // back — discarding this attempt's writes keeps the step
                     // exactly-once even under duplicate execution — and let
                     // the caller classify the stored row.
-                    let _ = ds.rollback(tx).await;
+                    ds.rollback(tx).await?;
                     return Ok(DsAttempt::AlreadyCompleted { value });
                 }
                 ds.commit(tx).await?;
                 Ok(DsAttempt::Committed(value))
             }
             Err(e) => {
-                let _ = ds.rollback(tx).await;
+                ds.rollback(tx).await?;
                 if e.should_retry_live_transaction() {
                     Err(e)
                 } else {
@@ -1582,7 +1591,8 @@ impl DurableContext {
             let error = self
                 .execution
                 .storage(crate::recorded_error::try_from_parts(message, info))?;
-            let encoded = crate::serialize::encode_error(&self.provider.serializer(), &error);
+            let encoded = crate::serialize::encode_error(&self.provider.serializer(), &error)
+                .map_err(|error| self.execution.record(error))?;
             let stored = self
                 .provider
                 .record_step_result(
@@ -1844,7 +1854,8 @@ impl DurableContext {
         started_at_ms: Option<i64>,
     ) -> Result<T> {
         self.execution.check()?;
-        let encoded = crate::serialize::encode_error(&self.provider.serializer(), &err);
+        let encoded = crate::serialize::encode_error(&self.provider.serializer(), &err)
+            .map_err(|error| self.execution.record(error))?;
         let outcome = self
             .provider
             .record_step_result(
@@ -1872,6 +1883,9 @@ impl DurableContext {
         loop {
             match run_step_catching(&opts.name, in_body(&mut *f)).await {
                 Ok(v) => return Ok(v),
+                Err(Error::RecoveryRequired(cause)) => {
+                    return Err(self.execution.interrupt(Error::RecoveryRequired(cause)));
+                }
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,
                     // regardless of remaining attempts (fail fast on permanent errors).

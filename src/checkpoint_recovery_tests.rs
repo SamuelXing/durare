@@ -562,7 +562,12 @@ async fn child_insert_storage_failures_leave_the_parent_recoverable() -> Result<
 struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
 impl std::io::Write for LogBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        const LIMIT: usize = 64 * 1024;
+        let mut buffer = self.0.lock().unwrap();
+        let incoming = &bytes[bytes.len().saturating_sub(LIMIT)..];
+        let overflow = (buffer.len() + incoming.len()).saturating_sub(LIMIT);
+        buffer.drain(..overflow);
+        buffer.extend_from_slice(incoming);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -571,14 +576,28 @@ impl std::io::Write for LogBuffer {
 }
 impl LogBuffer {
     fn text(&self) -> String {
-        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
 }
 
 #[tokio::test]
 async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()> {
-    // A global subscriber also observes spawned work on other runtime threads.
-    // This is the only subscriber installed by the library test binary.
+    // Run only this test in a child process: the global subscriber cannot
+    // capture unrelated tests or survive this test's lifetime. Spawned tasks
+    // still inherit the process subscriber, and the buffer is bounded.
+    if std::env::var_os("DURARE_TRACE_TEST_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "checkpoint_recovery_tests::recovery_required_is_reported_for_every_execution_entry", "--nocapture"])
+            .env("DURARE_TRACE_TEST_CHILD", "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
     let logs = LogBuffer::default();
     let writer = logs.clone();
     tracing::subscriber::set_global_default(
@@ -596,12 +615,15 @@ async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()>
         "child",
         "scheduled",
         "terminal",
+        "adopt",
         "panic",
     ] {
         logs.0.lock().unwrap().clear();
         let inner = Arc::new(InMemoryProvider::new());
         let fault = if mode == "terminal" {
             Fault::TerminalBefore
+        } else if mode == "adopt" {
+            Fault::TerminalAfterThenAdoptRead
         } else {
             Fault::WriteBefore
         };
@@ -618,7 +640,7 @@ async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()>
             },
         );
         let expected_id = match mode {
-            "direct" | "terminal" | "panic" => {
+            "direct" | "terminal" | "adopt" | "panic" => {
                 let _ = engine
                     .start::<_, ()>(
                         "logged",
@@ -1036,6 +1058,8 @@ async fn postgres_transaction_machinery_faults_are_not_recorded() -> Result<()> 
     let admin = sqlx::PgPool::connect(&url).await?;
     for at_commit in [false, true] {
         let schema = format!("checkpoint_fault_{}", uuid::Uuid::new_v4().simple());
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(async {
         let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
         let mut engine = DurableEngine::new(provider.clone()).await?;
         let timing = if at_commit {
@@ -1121,9 +1145,21 @@ async fn postgres_transaction_machinery_faults_are_not_recorded() -> Result<()> 
             .await?;
         assert_eq!(count, 1);
         engine.shutdown(Duration::from_secs(5)).await?;
-        sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        Ok::<(), Error>(())
+        }).catch_unwind().await;
+        let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
             .execute(&admin)
-            .await?;
+            .await;
+        match result {
+            Ok(outcome) => {
+                cleanup?;
+                outcome?;
+            }
+            Err(panic) => {
+                let _ = cleanup;
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
     Ok(())
 }
@@ -1322,27 +1358,35 @@ async fn queue_recovery_respects_cancellation_and_shutdown() -> Result<()> {
 
 #[cfg(feature = "sqlite")]
 #[derive(Clone)]
-struct BeginFaultDataSource {
+struct FaultDataSource {
     inner: SqliteDataSource,
     attempts: Arc<AtomicUsize>,
+    fail_begin: bool,
 }
 
 #[cfg(feature = "sqlite")]
 #[async_trait::async_trait]
-impl crate::datasource::sealed::Backend for BeginFaultDataSource {
+impl crate::datasource::sealed::Backend for FaultDataSource {
     type Conn = sqlx::SqliteConnection;
     type NativeTx = sqlx::Transaction<'static, sqlx::Sqlite>;
-    async fn begin(&self, _: IsolationLevel, _: bool) -> Result<Self::NativeTx> {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
-        Err(Error::Db(sqlx::Error::Protocol(
-            "transaction setup failed".into(),
-        )))
+    async fn begin(&self, isolation: IsolationLevel, read_only: bool) -> Result<Self::NativeTx> {
+        if self.fail_begin {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(Error::Db(sqlx::Error::Protocol(
+                "transaction setup failed".into(),
+            )));
+        }
+        self.inner.begin(isolation, read_only).await
     }
     async fn commit(&self, tx: Self::NativeTx) -> Result<()> {
         self.inner.commit(tx).await
     }
     async fn rollback(&self, tx: Self::NativeTx) -> Result<()> {
-        self.inner.rollback(tx).await
+        self.inner.rollback(tx).await?;
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Db(sqlx::Error::Protocol(
+            "rollback response lost".into(),
+        )))
     }
     async fn tx_fingerprint(&self, conn: &mut Self::Conn) -> Result<Option<String>> {
         self.inner.tx_fingerprint(conn).await
@@ -1397,7 +1441,7 @@ impl crate::datasource::sealed::Backend for BeginFaultDataSource {
     }
 }
 #[cfg(feature = "sqlite")]
-impl crate::datasource::DataSource for BeginFaultDataSource {}
+impl crate::datasource::DataSource for FaultDataSource {}
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
@@ -1407,13 +1451,14 @@ async fn datasource_setup_failures_bypass_the_business_retry_policy() -> Result<
         let attempts = Arc::new(AtomicUsize::new(0));
         let retries = Arc::new(AtomicUsize::new(0));
         let body_runs = Arc::new(AtomicUsize::new(0));
-        let ds = BeginFaultDataSource {
+        let ds = FaultDataSource {
             inner: if system {
                 inner.system_datasource()
             } else {
                 SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
             },
             attempts: attempts.clone(),
+            fail_begin: true,
         };
         // Forward provider identity so the system data-source path is exercised.
         let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::ChildBefore));
@@ -1452,6 +1497,549 @@ async fn datasource_setup_failures_bypass_the_business_retry_policy() -> Result<
             inner.get_workflow_status("setup").await?.unwrap().status,
             STATUS_PENDING
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_panics_recover_or_park_without_leaking_capacity() -> Result<()> {
+    for permanent in [false, true] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let mut builder = DurableEngine::builder(inner.clone());
+        builder.max_recovery_attempts(1);
+        let mut engine = builder.build().await?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = attempts.clone();
+        engine.register("panics", move |_: DurableContext, _: ()| {
+            let counted = counted.clone();
+            async move {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 || permanent {
+                    panic!("recoverable workflow panic");
+                }
+                Ok(42)
+            }
+        });
+        engine.register("healthy", |_: DurableContext, _: ()| async { Ok(42) });
+        engine.register_queue(
+            WorkflowQueue::new("limited")
+                .global_concurrency(1)
+                .base_polling_interval(Duration::from_millis(10)),
+        );
+        engine.launch().await?;
+        let first = engine
+            .start::<_, i32>(
+                "panics",
+                (),
+                WorkflowOptions::with_id("panics").queue("limited"),
+            )
+            .await?;
+        let result = tokio::time::timeout(Duration::from_secs(3), first.result()).await;
+        if result.is_err() {
+            engine.shutdown(Duration::from_secs(1)).await?;
+        }
+        let result = result.expect("an interrupted queued run must recover or park");
+        if permanent {
+            assert_eq!(
+                result.unwrap_err().code(),
+                ErrorCode::MaxRecoveryAttemptsExceeded
+            );
+        } else {
+            assert_eq!(result?, 42);
+        }
+        let next = engine
+            .start::<_, i32>(
+                "healthy",
+                (),
+                WorkflowOptions::with_id("healthy").queue("limited"),
+            )
+            .await?;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), next.result())
+                .await
+                .unwrap()?,
+            42
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_child_recovery_error_cannot_be_checkpointed_by_its_parent() -> Result<()> {
+    for panics in [false, true] {
+        let child_store = Arc::new(InMemoryProvider::new());
+        let mut child = DurableEngine::new(Arc::new(FaultProvider::new(
+            child_store.clone(),
+            if panics {
+                Fault::ChildBefore
+            } else {
+                Fault::WriteBefore
+            },
+        )))
+        .await?;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        child.register("child", move |ctx: DurableContext, _: ()| {
+            let attempts = attempts.clone();
+            async move {
+                if panics && attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("child workflow interrupted");
+                }
+                ctx.step("work", || async { Ok(42) }).await
+            }
+        });
+        let child = Arc::new(child);
+        let parent_store = Arc::new(InMemoryProvider::new());
+        let mut parent = DurableEngine::new(parent_store.clone()).await?;
+        let child_engine = child.clone();
+        parent.register("parent", move |ctx: DurableContext, _: ()| {
+            let child = child_engine.clone();
+            async move {
+                let _ = ctx
+                    .step("child-result", || async {
+                        child
+                            .start::<_, i32>("child", (), WorkflowOptions::with_id("child"))
+                            .await?
+                            .result()
+                            .await
+                    })
+                    .await;
+                Ok(42)
+            }
+        });
+        let result = parent
+            .start::<_, i32>("parent", (), WorkflowOptions::with_id("parent"))
+            .await?
+            .result()
+            .await;
+        assert!(
+            matches!(result, Err(Error::RecoveryRequired(_))),
+            "child storage failure must interrupt parent: {result:?}"
+        );
+        assert!(parent_store.get_step_result("parent", 0).await?.is_none());
+        assert_eq!(
+            parent_store
+                .get_workflow_status("parent")
+                .await?
+                .unwrap()
+                .status,
+            STATUS_PENDING
+        );
+        let owner = child_store
+            .get_workflow_status("child")
+            .await?
+            .unwrap()
+            .executor_id;
+        child.recover_pending_for(&[owner]).await?;
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                child.retrieve_workflow::<i32>("child").await?.result()
+            )
+            .await
+            .unwrap()?,
+            42
+        );
+        let owner = parent_store
+            .get_workflow_status("parent")
+            .await?
+            .unwrap()
+            .executor_id;
+        parent.recover_pending_for(&[owner]).await?;
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                parent.retrieve_workflow::<i32>("parent").await?.result()
+            )
+            .await
+            .unwrap()?,
+            42
+        );
+        child.shutdown(Duration::from_secs(1)).await?;
+        parent.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_reconciliation_preserves_the_recovery_channel() -> Result<()> {
+    for fault in [Fault::TerminalWrapped, Fault::TerminalAfterThenAdoptRead] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let mut engine =
+            DurableEngine::new(Arc::new(FaultProvider::new(inner.clone(), fault))).await?;
+        engine.register("terminal", |_: DurableContext, _: ()| async { Ok(42) });
+        let error = engine
+            .start::<_, i32>("terminal", (), WorkflowOptions::with_id("terminal"))
+            .await?
+            .result()
+            .await
+            .unwrap_err();
+        let Error::RecoveryRequired(cause) = error else {
+            panic!("expected recovery channel, got {error:?}");
+        };
+        assert!(
+            matches!(&*cause, Error::Db(sqlx::Error::PoolTimedOut)),
+            "cause must not be double-wrapped: {cause:?}"
+        );
+        let status = inner.get_workflow_status("terminal").await?.unwrap();
+        assert_eq!(
+            status.status,
+            if fault == Fault::TerminalWrapped {
+                STATUS_PENDING
+            } else {
+                STATUS_SUCCESS
+            }
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn verification_storage_fault_is_not_reported_as_divergence() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::ChildBefore));
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("verify", |ctx: DurableContext, _: ()| async move {
+        let _ = ctx.step("work", || async { Ok(42) }).await;
+        Ok(42)
+    });
+    engine
+        .start::<_, i32>("verify", (), WorkflowOptions::with_id("verify"))
+        .await?
+        .result()
+        .await?;
+    *provider.fault.lock().unwrap() = Some(Fault::Read);
+    let result = engine.verify_replay("verify").await;
+    assert!(
+        matches!(result, Err(Error::RecoveryRequired(_))),
+        "storage failure is not a determinism finding: {result:?}"
+    );
+    assert_eq!(
+        inner.get_workflow_status("verify").await?.unwrap().status,
+        STATUS_SUCCESS
+    );
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn native_rollback_failures_interrupt_instead_of_recording_body_errors() -> Result<()> {
+    for system in [false, true] {
+        let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let ds = FaultDataSource {
+            inner: if system {
+                inner.system_datasource()
+            } else {
+                SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+            },
+            attempts: attempts.clone(),
+            fail_begin: false,
+        };
+        let mut engine = DurableEngine::new(inner.clone()).await?;
+        engine.register("rollback", move |ctx: DurableContext, _: ()| {
+            let ds = ds.clone();
+            async move {
+                let _ = ctx
+                    .transaction_on(&ds, "rollback", async |_: &mut sqlx::SqliteConnection| {
+                        Err::<(), _>(Error::app("business rejection"))
+                    })
+                    .await;
+                Ok(())
+            }
+        });
+        let result = engine
+            .start::<_, ()>("rollback", (), WorkflowOptions::with_id("rollback"))
+            .await?
+            .result()
+            .await;
+        assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert!(inner.get_step_result("rollback", 0).await?.is_none());
+        assert_eq!(
+            inner.get_workflow_status("rollback").await?.unwrap().status,
+            STATUS_PENDING
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn recovery_signal_crosses_every_error_recording_boundary_without_being_saved() -> Result<()>
+{
+    fn interruption() -> Error {
+        Error::RecoveryRequired(Arc::new(Error::Db(sqlx::Error::PoolTimedOut)))
+    }
+    for mode in [
+        "workflow",
+        "step-retry",
+        "transaction",
+        "external",
+        "system",
+    ] {
+        let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+        let mut engine = DurableEngine::new(inner.clone()).await?;
+        let predicates = Arc::new(AtomicUsize::new(0));
+        let counted = predicates.clone();
+        let ds = if mode == "external" {
+            SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+        } else {
+            inner.system_datasource()
+        };
+        let workflow_ds = ds.clone();
+        engine.register("boundary", move |ctx: DurableContext, _: ()| {
+            let (counted, ds) = (counted.clone(), workflow_ds.clone());
+            async move {
+                if mode == "workflow" {
+                    return Err::<(), _>(interruption());
+                }
+                let retry = move |_: &Error| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    true
+                };
+                let _ = match mode {
+                    "step-retry" => {
+                        ctx.step_with(
+                            StepOptions::new("boundary").max_retries(2).retry_if(retry),
+                            || async { Err::<(), _>(interruption()) },
+                        )
+                        .await
+                    }
+                    "transaction" => {
+                        ctx.transaction_with(
+                            TransactionOptions::new("boundary")
+                                .max_retries(2)
+                                .retry_if(retry),
+                            |_| Box::pin(async { Err::<(), _>(interruption()) }),
+                        )
+                        .await
+                    }
+                    _ => {
+                        ctx.transaction_on_with(
+                            &ds,
+                            TransactionOptions::new("boundary")
+                                .max_retries(2)
+                                .retry_if(retry),
+                            async |_: &mut sqlx::SqliteConnection| Err::<(), _>(interruption()),
+                        )
+                        .await
+                    }
+                };
+                Ok(()) // catching a rejected record must not authorize SUCCESS
+            }
+        });
+        let result = engine
+            .start::<_, ()>("boundary", (), WorkflowOptions::with_id("boundary"))
+            .await?
+            .result()
+            .await;
+        assert!(
+            matches!(result, Err(Error::RecoveryRequired(_))),
+            "{mode}: {result:?}"
+        );
+        assert_eq!(
+            predicates.load(Ordering::SeqCst),
+            0,
+            "{mode}: infrastructure signals skip business retry"
+        );
+        assert!(
+            inner.get_step_result("boundary", 0).await?.is_none(),
+            "{mode}"
+        );
+        assert_eq!(
+            inner.get_workflow_status("boundary").await?.unwrap().status,
+            STATUS_PENDING,
+            "{mode}"
+        );
+        if mode == "external" {
+            use crate::datasource::sealed::Backend;
+            assert!(ds.fetch_completion("boundary", 0).await?.is_none());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_business_failures_do_not_spend_recovery_attempts() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(inner.clone()).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counted = attempts.clone();
+    engine.register("business", move |_: DurableContext, _: ()| {
+        let counted = counted.clone();
+        async move {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(Error::app("declined"))
+        }
+    });
+    engine.register_queue(
+        WorkflowQueue::new("limited")
+            .global_concurrency(1)
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+    let result = engine
+        .start::<_, ()>(
+            "business",
+            (),
+            WorkflowOptions::with_id("business").queue("limited"),
+        )
+        .await?
+        .result()
+        .await;
+    assert!(result.is_err());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status = inner.get_workflow_status("business").await?.unwrap();
+    assert_eq!(status.status, STATUS_ERROR);
+    assert_eq!(status.recovery_attempts, 0);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn fault_wrapper_preserves_atomic_sql_notification_batches() -> Result<()> {
+    let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+    let engine = DurableEngine::new(inner.clone()).await?;
+    inner
+        .insert_workflow_status(WorkflowStatus::new(
+            "target",
+            "unused",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "owner",
+            engine.app_version(),
+        ))
+        .await?;
+    let wrapper = FaultProvider::new(inner.clone(), Fault::ChildBefore);
+    let rows = ["target", "absent"].map(|id| NotificationInsert {
+        destination_id: id.into(),
+        topic: "topic".into(),
+        message: serde_json::json!(42),
+        idempotency_key: None,
+    });
+    assert!(wrapper.insert_notifications(&rows).await.is_err());
+    assert!(
+        inner
+            .list_workflow_notifications("target")
+            .await?
+            .is_empty(),
+        "the wrapper must call the provider's atomic batch, not the sequential default"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn polling_handle_failures_preserve_infrastructure_origin() -> Result<()> {
+    for mode in ["read", "envelope", "type"] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let mut status = WorkflowStatus::new(
+            "observed",
+            "unused",
+            serde_json::Value::Null,
+            if mode == "envelope" {
+                STATUS_ERROR
+            } else {
+                STATUS_SUCCESS
+            },
+            "owner",
+            "version",
+        );
+        status.output = Some(serde_json::json!(42));
+        if mode == "envelope" {
+            status.error = Some("unreadable".into());
+            status.error_info = Some(PortableWorkflowError {
+                name: crate::recorded_error::NAME.into(),
+                message: "unreadable".into(),
+                code: None,
+                data: Some(serde_json::json!({"version":999})),
+            });
+        }
+        inner.insert_workflow_status(status).await?;
+        let provider = Arc::new(FaultProvider::new(
+            inner,
+            if mode == "read" {
+                Fault::StatusRead
+            } else {
+                Fault::ChildBefore
+            },
+        ));
+        let handle = WorkflowHandle::<String>::polling("observed".into(), provider);
+        let error = handle.result().await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            if mode == "type" {
+                ErrorCode::Serialization
+            } else {
+                ErrorCode::RecoveryRequired
+            },
+            "{mode}: {error:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancelled_workflow_task_is_an_interruption_not_a_business_error() -> Result<()> {
+    let join = tokio::spawn(std::future::pending::<Result<serde_json::Value>>());
+    join.abort();
+    let handle =
+        WorkflowHandle::<()>::local("aborted".into(), Arc::new(InMemoryProvider::new()), join);
+    assert!(matches!(
+        handle.result().await,
+        Err(Error::RecoveryRequired(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn creating_or_retrieving_a_workflow_preserves_storage_origin() -> Result<()> {
+    for client_api in [false, true] {
+        for fault in [Fault::InsertBefore, Fault::InsertAfter, Fault::StatusRead] {
+            let inner = Arc::new(InMemoryProvider::new());
+            let provider = Arc::new(FaultProvider::new(inner.clone(), fault));
+            let mut engine = DurableEngine::new(provider.clone()).await?;
+            engine.register("child", |_: DurableContext, _: ()| async { Ok(()) });
+            let client = Client::new(provider);
+            if fault == Fault::StatusRead {
+                inner
+                    .insert_workflow_status(WorkflowStatus::new(
+                        "child",
+                        "child",
+                        serde_json::Value::Null,
+                        STATUS_PENDING,
+                        "owner",
+                        engine.app_version(),
+                    ))
+                    .await?;
+            }
+            let result = if fault == Fault::StatusRead {
+                if client_api {
+                    client.retrieve_workflow::<()>("child").await
+                } else {
+                    engine.retrieve_workflow::<()>("child").await
+                }
+            } else if client_api {
+                client
+                    .enqueue::<_, ()>("jobs", "child", (), WorkflowOptions::with_id("child"))
+                    .await
+            } else {
+                engine
+                    .start::<_, ()>("child", (), WorkflowOptions::with_id("child"))
+                    .await
+            };
+            let error = result.err().expect("injected failure must surface");
+            assert!(
+                matches!(error, Error::RecoveryRequired(_)),
+                "client={client_api}, {fault:?}: {error:?}"
+            );
+            assert_eq!(
+                inner.get_workflow_status("child").await?.is_some(),
+                fault != Fault::InsertBefore
+            );
+        }
     }
     Ok(())
 }

@@ -106,9 +106,17 @@ struct Payload {
 
 /// Return a new-format record where the legacy format would lose information,
 /// or where an application value must be escaped to avoid the reserved marker.
-pub(crate) fn encode(serializer: &Serializer, error: &Error) -> Option<String> {
+pub(crate) fn encode(serializer: &Serializer, error: &Error) -> crate::Result<Option<String>> {
+    if let Error::RecoveryRequired(cause) = error {
+        return Err(Error::RecoveryRequired(cause.clone()));
+    }
+    if error.code() == crate::ErrorCode::RecoveryRequired {
+        return Err(Error::Serialization(
+            "an execution interruption is not a recordable outcome".into(),
+        ));
+    }
     match error {
-        Error::App { message, .. } if !message.starts_with(PREFIX) => return None,
+        Error::App { message, .. } if !message.starts_with(PREFIX) => return Ok(None),
         Error::Portable(info)
             if matches!(serializer, Serializer::Portable)
                 && info.name != NAME
@@ -116,17 +124,17 @@ pub(crate) fn encode(serializer: &Serializer, error: &Error) -> Option<String> {
                     && info.code.is_none()
                     && info.data.is_none()) =>
         {
-            return None
+            return Ok(None)
         }
         // Preserve the established cross-SDK authorization envelope. Its exact
         // fieldless form has a typed decoder below; structured foreign payloads
         // with the same class name remain Portable.
-        Error::NotAuthorized(_) if matches!(serializer, Serializer::Portable) => return None,
+        Error::NotAuthorized(_) if matches!(serializer, Serializer::Portable) => return Ok(None),
         _ => {}
     }
     let captured;
     let recordable = match error {
-        Error::Db(_) | Error::Migrate(_) | Error::Serde(_) | Error::RecoveryRequired(_) => {
+        Error::Db(_) | Error::Migrate(_) | Error::Serde(_) => {
             captured = Error::Recorded(Box::new(RecordedError::capture(error)));
             &captured
         }
@@ -140,11 +148,11 @@ pub(crate) fn encode(serializer: &Serializer, error: &Error) -> Option<String> {
     };
     let encoded =
         serde_json::to_string(&envelope).expect("a recorded error contains only JSON-safe fields");
-    Some(if matches!(serializer, Serializer::Portable) {
+    Ok(Some(if matches!(serializer, Serializer::Portable) {
         encoded
     } else {
         format!("{PREFIX}{encoded}")
-    })
+    }))
 }
 
 /// Decode a stored failure only once: escaped application errors can themselves
@@ -169,7 +177,13 @@ pub(crate) fn try_from_parts(
                         payload.version
                     )));
                 }
-                Ok(serde_json::from_value::<OwnedError>(payload.error)?.0)
+                let error = serde_json::from_value::<OwnedError>(payload.error)?.0;
+                if error.code() == crate::ErrorCode::RecoveryRequired {
+                    return Err(Error::Serialization(
+                        "record contains an execution interruption, not a business outcome".into(),
+                    ));
+                }
+                Ok(error)
             };
             decode().map_err(|error| {
                 Error::Serialization(format!("cannot decode recorded error: {error}"))
@@ -202,7 +216,10 @@ mod tests {
     use crate::ErrorCode;
 
     fn roundtrip(serializer: &Serializer, error: &Error) -> Error {
-        restore_error(Some(serializer.name()), &encode_error(serializer, error))
+        restore_error(
+            Some(serializer.name()),
+            &encode_error(serializer, error).unwrap(),
+        )
     }
 
     #[test]
@@ -212,7 +229,7 @@ mod tests {
             (Serializer::Portable, fixture.to_string()),
             (Serializer::Json, format!("{PREFIX}{fixture}")),
         ] {
-            assert_eq!(encode_error(&serializer, &Error::Timeout), stored);
+            assert_eq!(encode_error(&serializer, &Error::Timeout).unwrap(), stored);
             assert!(matches!(
                 restore_error(Some(serializer.name()), &stored),
                 Error::Timeout
@@ -255,8 +272,8 @@ mod tests {
                 assert_eq!(format!("{restored:?}"), format!("{error:?}"));
                 assert_eq!(restored.to_string(), error.to_string());
                 assert_eq!(
-                    encode_error(&serializer, &restored),
-                    encode_error(&serializer, error)
+                    encode_error(&serializer, &restored).unwrap(),
+                    encode_error(&serializer, error).unwrap()
                 );
             }
         }
@@ -337,7 +354,7 @@ mod tests {
     fn reserved_prefix_in_application_text_is_escaped_once() {
         for message in [
             format!("{PREFIX}not json"),
-            encode_error(&Serializer::Json, &Error::Timeout),
+            encode_error(&Serializer::Json, &Error::Timeout).unwrap(),
         ] {
             for serializer in [Serializer::Json, Serializer::Portable] {
                 let error = roundtrip(&serializer, &Error::app(&message));
@@ -375,7 +392,7 @@ mod tests {
     fn unknown_codes_are_rejected_instead_of_changing_workflow_branches() {
         let error = Error::Db(sqlx::Error::PoolTimedOut);
         let mut record: serde_json::Value =
-            serde_json::from_str(&encode_error(&Serializer::Portable, &error)).unwrap();
+            serde_json::from_str(&encode_error(&Serializer::Portable, &error).unwrap()).unwrap();
         record["data"]["error"]["data"]["code"] = json!("future_code");
         let restored = restore_error(Some(crate::serialize::PORTABLE), &record.to_string());
         assert_eq!(restored.code(), ErrorCode::Serialization);
@@ -396,7 +413,7 @@ mod tests {
 
     #[test]
     fn corrupt_and_unknown_records_report_decoding_errors() {
-        let good = encode_error(&Serializer::Portable, &Error::Timeout);
+        let good = encode_error(&Serializer::Portable, &Error::Timeout).unwrap();
         let mut unknown: serde_json::Value = serde_json::from_str(&good).unwrap();
         unknown["data"]["version"] = json!(2);
         let mut bad_kind: serde_json::Value = serde_json::from_str(&good).unwrap();
@@ -420,5 +437,45 @@ mod tests {
             restore_error(None, &format!("{PREFIX}{{")).code(),
             ErrorCode::Serialization
         );
+    }
+}
+
+#[cfg(test)]
+mod execution_channel_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn execution_interruptions_are_not_recordable_and_keep_their_diagnostics() {
+        let cause = Arc::new(Error::Db(sqlx::Error::PoolTimedOut));
+        let error = Error::RecoveryRequired(cause.clone());
+        assert!(error.is_retryable());
+        assert!(!error.should_retry_live_transaction());
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = called.clone();
+        let opts = crate::TransactionOptions::new("body")
+            .max_retries(3)
+            .retry_if(move |_| {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            });
+        assert!(!opts.should_user_retry(&error, 0));
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        for serializer in [Serializer::Json, Serializer::Portable] {
+            let rejected = crate::serialize::encode_error(&serializer, &error).unwrap_err();
+            let Error::RecoveryRequired(actual) = rejected else {
+                panic!("recovery signal lost");
+            };
+            assert!(Arc::ptr_eq(&cause, &actual));
+        }
+        let snapshot = Error::Recorded(Box::new(RecordedError::capture(&error)));
+        assert!(crate::serialize::encode_error(&Serializer::Json, &snapshot).is_err());
+        let legacy = PortableWorkflowError {
+            name: NAME.into(),
+            message: "interrupted".into(),
+            code: None,
+            data: Some(json!({"version":1,"error":BorrowedError(&snapshot)})),
+        };
+        assert!(try_from_parts(legacy.message.clone(), Some(legacy)).is_err());
     }
 }

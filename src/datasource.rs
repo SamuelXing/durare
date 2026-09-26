@@ -64,7 +64,8 @@ pub(crate) mod sealed {
         /// Commit `tx`.
         async fn commit(&self, tx: Self::NativeTx) -> Result<()>;
 
-        /// Roll back `tx` (best-effort; dropping also rolls back).
+        /// Roll back `tx`. Explicit rollback failures propagate as infrastructure
+        /// failures; the driver's rollback on drop remains best-effort.
         async fn rollback(&self, tx: Self::NativeTx) -> Result<()>;
 
         /// An identifier of the connection's *current* transaction, used to

@@ -15,11 +15,17 @@ pub enum Fault {
     WriteAfter,
     TerminalBefore,
     TerminalAfter,
+    TerminalWrapped,
+    TerminalAfterThenAdoptRead,
+    ReconcileRead,
+    StatusRead,
     TransactionBefore,
     TransactionAfter,
     Corrupt,
     ChildBefore,
     ChildAfter,
+    InsertBefore,
+    InsertAfter,
 }
 
 pub struct FaultProvider {
@@ -79,11 +85,11 @@ impl StateProvider for FaultProvider {
         status: WorkflowStatus,
     ) -> Result<(WorkflowStatus, bool)> {
         let child = status.parent_workflow_id.is_some();
-        if child && self.take(Fault::ChildBefore) {
+        if self.take(Fault::InsertBefore) || (child && self.take(Fault::ChildBefore)) {
             return Self::failure();
         }
         let result = self.inner.insert_workflow_status(status).await?;
-        if child && self.take(Fault::ChildAfter) {
+        if self.take(Fault::InsertAfter) || (child && self.take(Fault::ChildAfter)) {
             return Self::failure();
         }
         Ok(result)
@@ -98,6 +104,12 @@ impl StateProvider for FaultProvider {
             .await
     }
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
+        if self.take(Fault::StatusRead) {
+            return Self::failure();
+        }
+        if self.take(Fault::ReconcileRead) {
+            *self.fault.lock().unwrap() = Some(Fault::StatusRead);
+        }
         self.inner.get_workflow_status(id).await
     }
     async fn set_workflow_status(
@@ -107,6 +119,11 @@ impl StateProvider for FaultProvider {
         output: Option<&Value>,
         error: Option<&str>,
     ) -> Result<bool> {
+        if self.take(Fault::TerminalWrapped) {
+            return Err(Error::RecoveryRequired(Arc::new(Error::Db(
+                sqlx::Error::PoolTimedOut,
+            ))));
+        }
         if self.take(Fault::TerminalBefore) {
             return Self::failure();
         }
@@ -114,6 +131,10 @@ impl StateProvider for FaultProvider {
             .inner
             .set_workflow_status(id, status, output, error)
             .await?;
+        if self.take(Fault::TerminalAfterThenAdoptRead) {
+            *self.fault.lock().unwrap() = Some(Fault::ReconcileRead);
+            return Self::failure();
+        }
         if self.take(Fault::TerminalAfter) {
             return Self::failure();
         }
@@ -198,6 +219,21 @@ impl StateProvider for FaultProvider {
     }
     async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>> {
         self.inner.queue_partitions(queue_name).await
+    }
+    async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
+        self.inner.insert_notifications(rows).await
+    }
+    async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
+        self.inner.nth_newest_completed_at(threshold).await
+    }
+    async fn garbage_collect(
+        &self,
+        cutoff_epoch_ms: Option<i64>,
+        rows_threshold: Option<i64>,
+    ) -> Result<u64> {
+        self.inner
+            .garbage_collect(cutoff_epoch_ms, rows_threshold)
+            .await
     }
     async fn insert_notification(
         &self,

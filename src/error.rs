@@ -11,8 +11,8 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorCode {
-    /// Storage or decoding failed during execution; recovery must reconcile
-    /// durable state before the workflow can continue.
+    /// Execution or result observation was interrupted without establishing a
+    /// business outcome; recovery must reconcile durable state before continuing.
     RecoveryRequired,
     /// A database query or connection failed.
     Database,
@@ -66,9 +66,12 @@ pub enum ErrorCode {
 /// the `is_*` helpers to classify the underlying database failure.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// The execution stopped at a storage or decoding boundary. This is not a
-    /// recorded business failure. The workflow remains recoverable unless a
-    /// concurrent terminal transition already committed. See the durability guide.
+    /// Execution stopped without a durable business outcome (for example a
+    /// storage/decoding failure or workflow panic). This is not a recorded failure. The workflow remains recoverable unless a
+    /// concurrent terminal transition already committed. It cannot be encoded
+    /// as a business failure, even when returned by another workflow. Its `is_*`
+    /// predicates describe the cause, not permission to retry a business body.
+    /// See the durability guide.
     #[error("workflow execution requires recovery: {0}")]
     RecoveryRequired(#[source] std::sync::Arc<Error>),
 
@@ -369,6 +372,9 @@ impl Error {
 
     /// Whether this wraps a database unique-constraint violation.
     pub fn is_unique_violation(&self) -> bool {
+        if let Self::RecoveryRequired(cause) = self {
+            return cause.is_unique_violation();
+        }
         if let Self::Recorded(error) = self {
             return error.unique_violation;
         }
@@ -377,6 +383,9 @@ impl Error {
 
     /// Whether this wraps a database foreign-key violation.
     pub fn is_foreign_key_violation(&self) -> bool {
+        if let Self::RecoveryRequired(cause) = self {
+            return cause.is_foreign_key_violation();
+        }
         if let Self::Recorded(error) = self {
             return error.foreign_key_violation;
         }
@@ -390,6 +399,9 @@ impl Error {
     /// For [`Error::Recorded`], this describes the original failure; it does
     /// not authorize the engine's unbounded live-database retry loop.
     pub fn is_retryable(&self) -> bool {
+        if let Self::RecoveryRequired(cause) = self {
+            return cause.is_retryable();
+        }
         if let Self::Recorded(error) = self {
             return error.retryable;
         }
@@ -407,6 +419,9 @@ impl Error {
     /// transaction on a fresh one: Postgres `40001` serialization_failure / `40P01`
     /// deadlock_detected, or SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`.
     pub fn is_tx_conflict(&self) -> bool {
+        if let Self::RecoveryRequired(cause) = self {
+            return cause.is_tx_conflict();
+        }
         if let Self::Recorded(error) = self {
             return error.tx_conflict;
         }

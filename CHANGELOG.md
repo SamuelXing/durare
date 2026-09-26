@@ -28,6 +28,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ownership check, bounded by `max_recovery_attempts`; exhausted runs are parked
   so they no longer consume queue concurrency. Non-queued runs still require
   explicit recovery. Shutdown leaves unfinished recovery for a later executor.
+  Workflow-body panics use the same queue recovery path; the ownership CAS
+  only requeues still-PENDING executions, never recorded business failures.
+  The recovery cap counts restarts after storage interruptions and panics, not
+  just process crashes. Progress does not reset it, so flapping storage can
+  exhaust a healthy workflow's budget; repair the cause and explicitly resume.
+  `RecoveryRequired` cannot be persisted as a step, transaction or workflow
+  failure, including when it arrives through another workflow's handle. Workflow
+  panics, failed workflow tasks and polling-result infrastructure faults also
+  return this signal, so parents cannot permanently record an unfinished child
+  as a failed business operation. Engine/client workflow creation and retrieval
+  preserve storage origin too; retry ambiguous creation with the same workflow
+  id. Output-to-Rust-type mismatches remain catchable. The interruption preserves
+  its cause's diagnostic predicates without enabling business retries.
+  Terminal-outcome read failures and native rollback failures preserve their
+  infrastructure origin. Replay verification returns storage interruptions as
+  errors instead of reporting them as code divergence.
   The stopped workflow future is dropped; compensation after catching the fault
   is not guaranteed to run.
 

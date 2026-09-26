@@ -298,9 +298,11 @@ pub struct PortableWorkflowError {
 /// representation, except when escaping the reserved prefix. Structured
 /// [`Error::Portable`] values retain their data in either format. See the
 /// [durability guide](crate::durability#recorded-errors) for rollout limits.
-pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
-    if let Some(recorded) = crate::recorded_error::encode(serializer, err) {
-        return recorded;
+/// Execution interruptions are rejected and must propagate through recovery;
+/// they are not serializable business outcomes.
+pub fn encode_error(serializer: &Serializer, err: &Error) -> crate::Result<String> {
+    if let Some(recorded) = crate::recorded_error::encode(serializer, err)? {
+        return Ok(recorded);
     }
     if matches!(serializer, Serializer::Portable) {
         let env = match err {
@@ -322,9 +324,9 @@ pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
         };
         // The envelope is plain JSON values, so serialization cannot fail; fall
         // back to the bare message in the impossible case that it does.
-        return serde_json::to_string(&env).unwrap_or_else(|_| err.to_string());
+        return Ok(serde_json::to_string(&env).unwrap_or_else(|_| err.to_string()));
     }
-    err.to_string()
+    Ok(err.to_string())
 }
 
 /// Decode a stored workflow **error**, returning its human message and — for a
@@ -391,7 +393,8 @@ pub(crate) fn encode_stored_error(
         Some(info) => encode_error(
             serializer,
             &crate::recorded_error::from_parts(message.into(), Some(info.clone())),
-        ),
+        )
+        .expect("a foreign error envelope cannot contain a live execution interruption"),
         // Keep legacy text (and a corrupt reserved record) as-is. Upgrading it
         // to a new error would invent information or conceal corruption.
         None => message.into(),
@@ -538,7 +541,7 @@ mod tests {
     fn portable_error_wraps_under_generic_name() {
         // An untyped error becomes the cross-language envelope under the generic
         // name — message present, code/data omitted (matching Go and Python bytes).
-        let enc = encode_error(&Serializer::Portable, &Error::app("boom"));
+        let enc = encode_error(&Serializer::Portable, &Error::app("boom")).unwrap();
         assert_eq!(enc, r#"{"name":"Portable Error","message":"boom"}"#);
         // It decodes back to the human message plus the structured envelope.
         let (msg, info) = decode_error(Some(PORTABLE), &enc);
@@ -559,7 +562,7 @@ mod tests {
             code: Some(json!(400)),
             data: Some(json!({"field": "email"})),
         }));
-        let enc = encode_error(&Serializer::Portable, &err);
+        let enc = encode_error(&Serializer::Portable, &err).unwrap();
         let (msg, info) = decode_error(Some(PORTABLE), &enc);
         assert_eq!(msg, "invalid input");
         let info = info.expect("typed portable error decodes");
@@ -572,8 +575,12 @@ mod tests {
     fn json_error_stays_bare() {
         // Ordinary application text retains its legacy representation. Typed
         // errors now use a record instead of losing their fields.
-        assert_eq!(encode_error(&Serializer::Json, &Error::app("boom")), "boom");
-        let stored = encode_error(&Serializer::Json, &Error::portable("Validation", "boom"));
+        assert_eq!(
+            encode_error(&Serializer::Json, &Error::app("boom")).unwrap(),
+            "boom"
+        );
+        let stored =
+            encode_error(&Serializer::Json, &Error::portable("Validation", "boom")).unwrap();
         assert!(
             matches!(restore_error(Some(DBOS_JSON), &stored), Error::Portable(pe)
             if pe.name == "Validation" && pe.message == "boom")

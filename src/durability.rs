@@ -146,6 +146,17 @@
 //! against the same ownership generation. If a claim committed but its reply was
 //! lost, retrying cannot claim it again or spend another recovery attempt.
 //! Shutdown stops these attempts and leaves unfinished rows for later recovery.
+//! The same rule applies to a workflow-body panic: only a still-PENDING row
+//! owned by the stopped execution can be recovered. Recorded business failures
+//! and concurrent terminal transitions are never requeued.
+//!
+//! The cap counts successful recovery claims, including restarts after storage
+//! interruptions and panics, not only process crashes. Progress does not reset
+//! the count: flapping storage can exhaust a healthy workflow's budget. Persistent
+//! decoding/configuration problems use this same bounded policy, because their
+//! error category cannot establish when an operator or deployment will repair
+//! them. Repair the cause and explicitly resume a parked workflow to reset the
+//! budget; increasing the cap alone does not make a persistent cause recoverable.
 //!
 //! Non-queued executions still require the engine's explicit recovery APIs.
 //! Launch-time recovery does not pick up new failures in a live process. Every
@@ -157,7 +168,16 @@
 //! including asynchronous compensation, is not guaranteed to run. Keep necessary
 //! compensation durable and perform it from a separate, healthy execution.
 //!
-//! Errors returned by user step/transaction bodies remain business outcomes,
+//! Workflow-body panics and task cancellation also use `RecoveryRequired`:
+//! neither establishes a business failure. Local and polling handles preserve
+//! infrastructure origin, including result-read and error-envelope decode faults.
+//! Workflow creation and handle retrieval do too; retry a failed start/enqueue
+//! with the same workflow id to reconcile an insert whose response was lost.
+//! A `RecoveryRequired` returned through a child handle is still an execution
+//! interruption. Step/transaction/workflow error writers refuse to checkpoint
+//! it, and body retry policies do not retry it. A parent durable boundary adopts
+//! that signal, so catching the returned error cannot finalize the parent.
+//! Other errors returned by user step/transaction bodies remain business outcomes,
 //! including database errors. Failure to encode a body's return value is saved
 //! as a step failure, so recovery does not repeat the body merely to reproduce
 //! that encoding error. This still requires the failure checkpoint to commit.

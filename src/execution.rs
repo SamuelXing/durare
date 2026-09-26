@@ -31,10 +31,21 @@ impl Execution {
     /// Providers also return semantic rejections (missing destination, closed
     /// stream, unsupported operation); those remain ordinary catchable errors.
     pub(crate) fn record(&self, error: Error) -> Error {
-        if !is_storage_failure(&error) {
-            return error;
+        match provider_error(error) {
+            interruption @ Error::RecoveryRequired(_) => self.interrupt(interruption),
+            rejection => rejection,
         }
-        self.interrupt(error)
+    }
+
+    /// A body may return another execution's interruption (for example from
+    /// a child handle). Adopt that control signal before rollback or retry can
+    /// replace it. Ordinary body errors, including Db, remain business errors.
+    pub(crate) fn body_error(&self, error: Error) -> Error {
+        if matches!(error, Error::RecoveryRequired(_)) {
+            self.interrupt(error)
+        } else {
+            error
+        }
     }
 
     /// A known infrastructure failure, including an inconsistent stored row
@@ -67,6 +78,25 @@ impl Execution {
             }
             changed.await;
         }
+    }
+}
+
+/// Normalize an infrastructure failure once; callers already carrying the
+/// recovery channel retain the original cause and wrapper.
+pub(crate) fn recovery_error(error: Error) -> Error {
+    match error {
+        Error::RecoveryRequired(_) => error,
+        other => Error::RecoveryRequired(Arc::new(other)),
+    }
+}
+
+/// Preserve infrastructure origin at a provider read/write boundary, including
+/// observers with no local execution latch. Never apply this to user-body errors.
+pub(crate) fn provider_error(error: Error) -> Error {
+    if is_storage_failure(&error) {
+        recovery_error(error)
+    } else {
+        error
     }
 }
 
