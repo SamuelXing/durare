@@ -40,8 +40,8 @@ async fn debit(ctx: &DurableContext, tx: &mut Tx<'_>, amount: i64, id: i64) -> R
 
 #[durare::workflow]
 async fn account(ctx: &DurableContext, _: ()) -> Result<i64> {
-    setup(&ctx).await?;
-    debit(&ctx, 10_i64, 1_i64).await
+    setup(ctx).await?;
+    debit(ctx, 10_i64, 1_i64).await
 }
 
 /// The macro'd transactional steps run against a real SQL backend and commit:

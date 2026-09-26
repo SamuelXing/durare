@@ -34,7 +34,7 @@
 //! | `Utc::now()`, `SystemTime::now()`, `Instant::now()` | a later run reads a different time | [`ctx.now()`](DurableContext::now) |
 //! | `Uuid::new_v4()`, `rand::random()` | a later run draws a different value | [`ctx.uuid()`](DurableContext::uuid) / [`ctx.random()`](DurableContext::random) |
 //! | iterating a `HashMap` / `HashSet` | order is randomized per map, so a loop issues its steps in a different order | a `BTreeMap` / `BTreeSet`, or sort the keys first |
-//! | `tokio::spawn` of durable work | a position is claimed where the call is **written**, but a spawned task writes its calls into the same counter from another task, so a replay interleaves them differently | keep durable calls on the workflow's own task; run them concurrently with `join!` / `try_join!` (see the note below it) |
+//! | `tokio::spawn` of durable work | detached construction would interleave position allocation nondeterministically; the borrowed context prevents passing this capability to a `'static` task | build durable calls on the workflow task and combine them in scope with `join!` / `try_join!` (see the next row) |
 //! | a durable call built *after* an `.await` inside a `join!` branch | `join!` rotates which branch it polls first, so which branch reaches its call first is decided by wake-up order, not by the source | build the durable calls first and join the built calls, so the positions are claimed before anything is polled |
 //! | `tokio::select!` over durable calls | positions are fine — every branch is built before any is polled — but only the winner runs, and which one wins turns on real timing, so a replay can pick a different branch and leave the loser's position with nothing recorded at it | race plain async work with [`ctx.select`](DurableContext::select), which records the winner, or give each branch a child workflow |
 //! | `FuturesUnordered`, `buffer_unordered`, any "handle them as they finish" loop | the first run observes real I/O latencies; a replay serves every step from its checkpoint at once, so the completion order — and anything derived from it, including which durable call is reached next — differs | collect with `join!` / `try_join!` and process in a fixed order, or give each branch a child workflow |
@@ -61,8 +61,9 @@
 //!
 //! # A durable call belongs to the workflow body
 //!
-//! Every rule above is one you keep yourself, with `UnexpectedStep` as a
-//! backstop. This one the engine checks at the call: a durable operation may not
+//! Most rules above require user discipline, with `UnexpectedStep` as a
+//! backstop; detached-task escape is rejected by borrowing. The engine also
+//! checks this rule at the call: a durable operation may not
 //! be created inside another durable operation's body, and may not be awaited in
 //! a body other than the one it was built in.
 //!
@@ -79,25 +80,26 @@
 //! [`Error::NestedDurableCall`] and [`Error::DurableCallCrossedBody`]. The calls
 //! around a refused one keep the positions they would have had.
 //!
-//! **The check does not reach a spawned task.** It is task-local, so a durable
-//! call made from a task the body spawned is outside it and is not refused —
-//! the `tokio::spawn` row above still applies, and still has no mechanism
-//! behind it.
+//! **The runtime check is task-local.** It does not propagate to other tasks.
+//! Separately, the borrowed context cannot be passed to `tokio::spawn` or
+//! `spawn_local`, which require `'static`. This is not a general concurrency
+//! proof: scoped threads can borrow the context, and deterministic construction
+//! order is still the caller's responsibility.
 //!
 //! ```no_run
 //! # use durare::{DurableContext, Error, Result};
 //! # async fn charge(ctx: &DurableContext) -> Result<i64> { Ok(0) }
 //! # async fn fetch() -> i64 { 0 }
-//! # async fn workflow(ctx: DurableContext) -> Result<()> {
+//! # async fn workflow(ctx: &DurableContext) -> Result<()> {
 //! // WRONG: `inner` is created while `outer`'s body is being polled.
-//! let inner_ctx = ctx.clone();
-//! ctx.step("outer", || async move {
-//!     inner_ctx.step("inner", || async { Ok::<_, Error>(1) }).await
+//! let inner_ctx = ctx;
+//! ctx.step("outer", |_| async move {
+//!     inner_ctx.step("inner", |_| async { Ok::<_, Error>(1) }).await
 //! }).await?;
 //!
 //! // RIGHT: the body does plain work; the durable calls are siblings.
-//! let a = ctx.step("a", || async { Ok::<_, Error>(fetch().await) }).await?;
-//! let b = ctx.step("b", || async { Ok::<_, Error>(fetch().await) }).await?;
+//! let a = ctx.step("a", |_| async { Ok::<_, Error>(fetch().await) }).await?;
+//! let b = ctx.step("b", |_| async { Ok::<_, Error>(fetch().await) }).await?;
 //! # let _ = (a, b);
 //! # Ok(())
 //! # }

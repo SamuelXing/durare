@@ -50,11 +50,9 @@ fn internal_queue() -> WorkflowQueue {
 
 /// A boxed, `Send` future that borrows for `'a`.
 ///
-/// The return type a closure-shaped workflow handler names: because a closure's
-/// return type cannot depend on the lifetime of its arguments, a handler written
-/// as a closure spells it out —
-/// `|ctx: &DurableContext, input: I| -> BoxFuture<'_, Result<O>> { Box::pin(async move { .. }) }`.
-/// An `async fn` item needs none of this; see [`WorkflowHandler`].
+/// Used by [`workflow_fn`] to give a closure handler a return type tied to its
+/// context argument. Named async functions register directly without boxing at
+/// the call site.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Name the borrowed-context signature for a closure-shaped workflow body.
@@ -81,9 +79,8 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// closure's signature — so a capture-free closure stays `Copy` and can be
 /// registered more than once.
 ///
-/// The `Box::pin` is the one piece of scaffolding that remains: an unboxed
-/// closure body would need the unstable `closure_lifetime_binder` to name the
-/// borrow. `#[durare::workflow]` on an `async fn` needs none of this.
+/// `Box::pin` supplies a return type whose borrow can vary with the argument
+/// lifetime. `#[durare::workflow]` on an `async fn` needs no adapter.
 pub fn workflow_fn<I, O, F>(f: F) -> F
 where
     F: for<'a> Fn(&'a DurableContext, I) -> BoxFuture<'a, Result<O>> + Send + Sync + 'static,
@@ -107,10 +104,10 @@ pub type WorkflowFn =
 /// -> Fut` bound cannot say that — and [`erase`] asks for it at every lifetime
 /// (`for<'a> WorkflowHandler<'a, I, O>`).
 ///
-/// Ordinary async closures that capture state (`async move |ctx, x| { counter
-/// .. }`) do not implement `Fn` at all on stable Rust, and the `AsyncFn` family
-/// cannot promise a `Send` future, so they are not accepted here; write an
-/// `async fn` or box the future.
+/// Lending async closures that borrow their captures do not implement the `Fn`
+/// bound used here. Stable Rust cannot express a general `Send` bound on the
+/// `AsyncFn` family's returned future. Use a named async function or
+/// [`workflow_fn`] with a boxed future for captured dependencies.
 pub trait WorkflowHandler<'a, I, O>: Send + Sync + 'static {
     /// The future one call returns; borrows the context for `'a`.
     type Fut: Future<Output = Result<O>> + Send + 'a;

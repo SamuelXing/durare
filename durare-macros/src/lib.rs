@@ -66,7 +66,7 @@ impl Parse for WorkflowArgs {
     }
 }
 
-/// Register an `async fn(DurableContext, Input) -> Result<Output>` as a durable
+/// Register an `async fn(&DurableContext, Input) -> Result<Output>` as a durable
 /// workflow.
 ///
 /// ```ignore
@@ -353,7 +353,7 @@ pub fn step(attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#attrs)*
         #vis #sig {
-            #ctx_ident.step(#name, move |_step| async move #block)
+            #ctx_ident.step(#name, move |_| async move #block)
         }
     };
 

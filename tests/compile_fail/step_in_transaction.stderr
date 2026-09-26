@@ -1,0 +1,15 @@
+error[E0521]: borrowed data escapes outside of function
+ --> tests/compile_fail/step_in_transaction.rs:3:5
+  |
+2 |   async fn workflow(ctx: &DurableContext, _: ()) -> Result<()> {
+  |                     ---  - let's call the lifetime of this reference `'1`
+  |                     |
+  |                     `ctx` is a reference that is only valid in the function body
+3 | /     ctx.transaction("tx", move |_tx| {
+4 | |         drop(ctx.step("hidden", |_| async { Ok(()) }));
+5 | |         Box::pin(async { Ok(()) })
+6 | |     }).await
+  | |      ^
+  | |      |
+  | |______`ctx` escapes the function body here
+  |        argument requires that `'1` must outlive `'static`

@@ -3680,12 +3680,15 @@ async fn pg_read_only_fast_path_checkpoints_after_commit() -> Result<()> {
                 ctx.transaction_on_with::<_, i64, _>(
                     &ds,
                     opts,
-                    async move |conn: &mut sqlx::PgConnection| {
-                        runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let v: i64 = sqlx::query_scalar("SELECT 7::bigint")
-                            .fetch_one(&mut *conn)
-                            .await?;
-                        Ok(v)
+                    move |conn: &mut sqlx::PgConnection| {
+                        let runs = runs.clone();
+                        Box::pin(async move {
+                            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let v: i64 = sqlx::query_scalar("SELECT 7::bigint")
+                                .fetch_one(&mut *conn)
+                                .await?;
+                            Ok(v)
+                        })
                     },
                 )
                 .await

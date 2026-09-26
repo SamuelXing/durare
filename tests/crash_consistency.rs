@@ -104,7 +104,16 @@ fn register(engine: &mut DurableEngine, name: &str, tag: String, armed: Arc<Mute
                 }
                 for i in 1u8..=3 {
                     let effect = format!("{tag}/s{i}");
-                    ctx.step(&format!("s{i}"), |_| async {
+                    ctx.step(&format!("s{i}"), |step| async move {
+                        // Recovery may repeat the effect before its checkpoint,
+                        // but must present exactly the same deduplication key.
+                        static KEYS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+                        let key = step.idempotency_key();
+                        {
+                            let mut keys = KEYS.get_or_init(Default::default).lock().unwrap();
+                            let first = keys.entry(effect.clone()).or_insert_with(|| key.clone());
+                            assert_eq!(*first, key, "key changed across crash recovery");
+                        }
                         bump(effect);
                         if crash == Some(Crash::InStep(i)) {
                             die().await;

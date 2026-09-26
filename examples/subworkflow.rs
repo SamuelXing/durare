@@ -29,7 +29,7 @@ async fn sum_step(ctx: &DurableContext, nums: Vec<i64>) -> Result<i64> {
 // The child: sums one chunk. An ordinary workflow — nothing marks it as a child.
 #[durare::workflow]
 async fn sum_chunk(ctx: &DurableContext, nums: Vec<i64>) -> Result<i64> {
-    sum_step(&ctx, nums).await
+    sum_step(ctx, nums).await
 }
 
 // The parent: fan out one child per chunk, then reduce their partial sums.

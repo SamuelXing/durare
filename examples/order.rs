@@ -62,7 +62,7 @@ async fn send_email(ctx: &DurableContext, to: String) -> Result<()> {
 
 #[durare::workflow]
 async fn process_order(ctx: &DurableContext, order: Order) -> Result<Receipt> {
-    let charge_id = charge_card(&ctx, order.id.clone(), order.amount_cents).await?;
+    let charge_id = charge_card(ctx, order.id.clone(), order.amount_cents).await?;
     println!("  charge_id = {charge_id}");
 
     // Simulate a hard crash between steps via a failpoint. Arm it with
@@ -73,8 +73,8 @@ async fn process_order(ctx: &DurableContext, order: Order) -> Result<Receipt> {
         std::process::exit(1);
     });
 
-    let shipment_id = create_shipment(&ctx, order.id.clone()).await?;
-    send_email(&ctx, order.email.clone()).await?;
+    let shipment_id = create_shipment(ctx, order.id.clone()).await?;
+    send_email(ctx, order.email.clone()).await?;
 
     Ok(Receipt {
         charge_id,

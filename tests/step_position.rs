@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 mod common;
 
-const WORKFLOW: &str = "probe";
 const ID: &str = "wf";
 
 /// The `(position, operation)` pairs the workflow recorded, in position order.
@@ -173,8 +172,8 @@ async fn macro_second(ctx: &DurableContext, n: i64) -> Result<i64> {
 async fn a_macro_written_call_claims_its_position_where_it_is_written() -> Result<()> {
     let seen = positions(|ctx| {
         Box::pin(async move {
-            let first = macro_first(&ctx, 1);
-            let second = macro_second(&ctx, 2);
+            let first = macro_first(ctx, 1);
+            let second = macro_second(ctx, 2);
             // Awaited back to front, as in the hand-written case above.
             second.await?;
             first.await?;

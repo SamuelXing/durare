@@ -63,7 +63,7 @@ async fn compute_fee(ctx: &DurableContext, amount_cents: u64) -> Result<u64> {
 // calls the step and adds up recorded results.
 #[durare::workflow]
 async fn checkout(ctx: &DurableContext, amount_cents: u64) -> Result<u64> {
-    let fee = compute_fee(&ctx, amount_cents).await?;
+    let fee = compute_fee(ctx, amount_cents).await?;
     Ok(amount_cents + fee)
 }
 

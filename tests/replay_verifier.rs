@@ -10,7 +10,7 @@ use durare::{
     params, Divergence, DurableContext, DurableEngine, Error, InMemoryProvider, Result,
     SqliteProvider, StateProvider, WorkflowOptions, STATUS_SUCCESS,
 };
-use std::future::Future;
+use durare::{workflow_fn, BoxFuture};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,13 +23,12 @@ const ID: &str = "wf-1";
 
 /// An engine over `provider` with `body` registered as the workflow — a stand-in
 /// for one deployed version of the code.
-async fn engine<F, Fut>(provider: &Arc<dyn StateProvider>, body: F) -> Result<DurableEngine>
+async fn engine<F>(provider: &Arc<dyn StateProvider>, body: F) -> Result<DurableEngine>
 where
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<i64>> + Send + 'static,
+    F: for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<i64>> + Send + Sync + 'static,
 {
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    engine.register(NAME, move |ctx: DurableContext, _: ()| body(ctx));
+    engine.register(NAME, workflow_fn(move |ctx, _: ()| body(ctx)));
     Ok(engine)
 }
 
@@ -38,10 +37,9 @@ fn provider() -> Arc<dyn StateProvider> {
 }
 
 /// Runs `body` to completion as the recorded workflow.
-async fn record<F, Fut>(provider: &Arc<dyn StateProvider>, body: F) -> Result<()>
+async fn record<F>(provider: &Arc<dyn StateProvider>, body: F) -> Result<()>
 where
-    F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<i64>> + Send + 'static,
+    F: for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<i64>> + Send + Sync + 'static,
 {
     common::run_body(provider, NAME, ID, body).await?;
     Ok(())
@@ -50,14 +48,11 @@ where
 /// A workflow body of plain steps, named in order.
 fn steps(
     names: &'static [&'static str],
-) -> impl Fn(DurableContext) -> futures_util::future::BoxFuture<'static, Result<i64>>
-       + Send
-       + Sync
-       + 'static {
-    move |ctx: DurableContext| {
+) -> impl for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<i64>> + Send + Sync + 'static {
+    move |ctx: &DurableContext| {
         Box::pin(async move {
             for name in names {
-                ctx.step(name, || async { Ok::<_, Error>(1_i64) }).await?;
+                ctx.step(name, |_| async { Ok::<_, Error>(1_i64) }).await?;
             }
             Ok(0)
         })
@@ -193,12 +188,17 @@ async fn a_swallowed_error_is_still_reported() -> Result<()> {
     let provider = provider();
     record(&provider, steps(&["a"])).await?;
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        // The classic shape: the error is dropped and the workflow carries on.
-        let _ = ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await;
-        let _ = ctx.step("c", || async { Ok::<_, Error>(3_i64) }).await.ok();
-        Ok(0)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
+            // The classic shape: the error is dropped and the workflow carries on.
+            let _ = ctx.step("b", |_| async { Ok::<_, Error>(2_i64) }).await;
+            let _ = ctx
+                .step("c", |_| async { Ok::<_, Error>(3_i64) })
+                .await
+                .ok();
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -226,15 +226,17 @@ async fn verification_writes_nothing_and_runs_nothing() -> Result<()> {
     let provider = provider();
 
     // The recorded run: two steps whose bodies count themselves.
-    record(&provider, |ctx: DurableContext| async move {
-        for name in ["a", "b"] {
-            ctx.step(name, || async {
-                RAN.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, Error>(1_i64)
-            })
-            .await?;
-        }
-        Ok(0)
+    record(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            for name in ["a", "b"] {
+                ctx.step(name, |_| async {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, Error>(1_i64)
+                })
+                .await?;
+            }
+            Ok(0)
+        })
     })
     .await?;
     assert_eq!(
@@ -243,17 +245,19 @@ async fn verification_writes_nothing_and_runs_nothing() -> Result<()> {
         "the recorded run ran its steps"
     );
 
-    let verifier = engine(&provider, |ctx: DurableContext| async move {
-        // The two recorded names, plus one the history does not have. Every body
-        // counts itself and then fails the test loudly.
-        for name in ["a", "b", "c"] {
-            ctx.step::<i64, _, _>(name, || async {
-                RAN.fetch_add(1, Ordering::SeqCst);
-                panic!("a step body ran during verification");
-            })
-            .await?;
-        }
-        Ok(0)
+    let verifier = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            // The two recorded names, plus one the history does not have. Every body
+            // counts itself and then fails the test loudly.
+            for name in ["a", "b", "c"] {
+                ctx.step::<i64, _, _>(name, |_| async {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                    panic!("a step body ran during verification");
+                })
+                .await?;
+            }
+            Ok(0)
+        })
     })
     .await?;
 
@@ -343,11 +347,11 @@ async fn a_running_workflow_may_end_its_history_early() -> Result<()> {
 /// The workflow the running-history tests verify: a step, a long durable timer,
 /// a step. Parked on the timer, its row stays `PENDING` with `a` and the timer
 /// recorded and `b` not yet reached.
-fn parked_body(ctx: DurableContext) -> futures_util::future::BoxFuture<'static, Result<i64>> {
+fn parked_body(ctx: &DurableContext) -> BoxFuture<'_, Result<i64>> {
     Box::pin(async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
         ctx.sleep(Duration::from_secs(3_600)).await?;
-        ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await?;
+        ctx.step("b", |_| async { Ok::<_, Error>(2_i64) }).await?;
         Ok(0)
     })
 }
@@ -380,13 +384,15 @@ async fn a_body_that_panics_on_the_frontier_of_a_running_history_passes() -> Res
     let provider = provider();
     let _running = park_on_timer(&provider).await?;
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.sleep(Duration::from_secs(3_600)).await?;
-        ctx.step("b", || async { Ok::<_, Error>(2_i64) })
-            .await
-            .expect("b");
-        Ok(0)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
+            ctx.sleep(Duration::from_secs(3_600)).await?;
+            ctx.step("b", |_| async { Ok::<_, Error>(2_i64) })
+                .await
+                .expect("b");
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -406,11 +412,13 @@ async fn a_built_and_dropped_call_is_missing_against_a_running_history_too() -> 
     let provider = provider();
     let _running = park_on_timer(&provider).await?;
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        drop(ctx.step("renamed", || async { Ok::<_, Error>(1_i64) }));
-        ctx.sleep(Duration::from_secs(3_600)).await?;
-        ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await?;
-        Ok(0)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            drop(ctx.step("renamed", |_| async { Ok::<_, Error>(1_i64) }));
+            ctx.sleep(Duration::from_secs(3_600)).await?;
+            ctx.step("b", |_| async { Ok::<_, Error>(2_i64) }).await?;
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -435,10 +443,12 @@ async fn a_built_and_dropped_call_is_missing_against_a_running_history_too() -> 
 #[tokio::test]
 async fn an_unchanged_wait_that_timed_out_passes() -> Result<()> {
     let provider = provider();
-    record(&provider, |ctx: DurableContext| async move {
-        ctx.recv::<i64>("empty", Duration::ZERO).await?;
-        ctx.get_event::<i64>(ID, "unset", Duration::ZERO).await?;
-        Ok(0)
+    record(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            ctx.recv::<i64>("empty", Duration::ZERO).await?;
+            ctx.get_event::<i64>(ID, "unset", Duration::ZERO).await?;
+            Ok(0)
+        })
     })
     .await?;
     let recorded = common::recorded(&engine(&provider, steps(&[])).await?, ID).await?;
@@ -451,10 +461,12 @@ async fn an_unchanged_wait_that_timed_out_passes() -> Result<()> {
         "both waits recorded their deadline"
     );
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        ctx.recv::<i64>("empty", Duration::ZERO).await?;
-        ctx.get_event::<i64>(ID, "unset", Duration::ZERO).await?;
-        Ok(0)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            ctx.recv::<i64>("empty", Duration::ZERO).await?;
+            ctx.get_event::<i64>(ID, "unset", Duration::ZERO).await?;
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -473,10 +485,12 @@ async fn an_unchanged_wait_that_timed_out_passes() -> Result<()> {
 #[tokio::test]
 async fn a_wait_still_in_flight_owns_its_recorded_deadline() -> Result<()> {
     let provider = provider();
-    let body = |ctx: DurableContext| async move {
-        ctx.recv::<i64>("never", Duration::from_secs(3_600)).await?;
-        Ok(0)
-    };
+    fn body(ctx: &DurableContext) -> BoxFuture<'_, Result<i64>> {
+        Box::pin(async move {
+            ctx.recv::<i64>("never", Duration::from_secs(3_600)).await?;
+            Ok(0)
+        })
+    }
     let running = engine(&provider, body).await?;
     let _handle = running
         .start::<_, i64>(NAME, (), WorkflowOptions::with_id(ID))
@@ -507,11 +521,13 @@ async fn a_reserved_position_holding_another_record_is_a_mismatch() -> Result<()
     let provider = provider();
     // A message that is already waiting is received on the first look, so the
     // deadline position stays empty: `send`, `recv`, then nothing at 2.
-    let body = |ctx: DurableContext| async move {
-        ctx.send(ID, 1_i64, "ready").await?;
-        ctx.recv::<i64>("ready", Duration::ZERO).await?;
-        Ok(0)
-    };
+    fn body(ctx: &DurableContext) -> BoxFuture<'_, Result<i64>> {
+        Box::pin(async move {
+            ctx.send(ID, 1_i64, "ready").await?;
+            ctx.recv::<i64>("ready", Duration::ZERO).await?;
+            Ok(0)
+        })
+    }
     record(&provider, body).await?;
     provider
         .record_step_result(ID, 2, "b", serde_json::json!(2), None, None, None)
@@ -538,13 +554,15 @@ async fn a_value_that_no_longer_decodes_fails_against_a_running_history() -> Res
     let provider = provider();
     let _running = park_on_timer(&provider).await?;
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        // Same name, now a String: the recorded `1` does not deserialize as one.
-        let s: String = ctx
-            .step("a", || async { Ok::<_, Error>("x".to_string()) })
-            .await?;
-        ctx.sleep(Duration::from_secs(3_600)).await?;
-        Ok(s.len() as i64)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            // Same name, now a String: the recorded `1` does not deserialize as one.
+            let s: String = ctx
+                .step("a", |_| async { Ok::<_, Error>("x".to_string()) })
+                .await?;
+            ctx.sleep(Duration::from_secs(3_600)).await?;
+            Ok(s.len() as i64)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -568,12 +586,14 @@ async fn a_panicking_body_is_reported_as_its_divergence() -> Result<()> {
     let provider = provider();
     record(&provider, steps(&["a"])).await?;
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.step("b", || async { Ok::<_, Error>(2_i64) })
-            .await
-            .expect("b");
-        Ok(0)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
+            ctx.step("b", |_| async { Ok::<_, Error>(2_i64) })
+                .await
+                .expect("b");
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -603,7 +623,10 @@ async fn an_unknown_workflow_or_name_is_an_error() -> Result<()> {
 
     // An engine that does not register the recorded workflow's name.
     let mut bare = DurableEngine::new(provider.clone()).await?;
-    bare.register("other", |_: DurableContext, _: ()| async { Ok(0_i64) });
+    bare.register(
+        "other",
+        workflow_fn(|_, _: ()| Box::pin(async { Ok(0_i64) })),
+    );
     let unknown_name = bare.verify_replay(ID).await;
     assert!(matches!(unknown_name, Err(Error::UnknownWorkflow(name)) if name == NAME));
     Ok(())
@@ -648,17 +671,19 @@ async fn an_added_transaction_is_refused_not_run() -> Result<()> {
 
     record(&provider, steps(&["a"])).await?;
 
-    let verifier = engine(&provider, |ctx: DurableContext| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.transaction("tx", |tx| {
-            Box::pin(async move {
-                RAN.fetch_add(1, Ordering::SeqCst);
-                tx.execute("SELECT 1", &params![]).await?;
-                Ok(2_i64)
+    let verifier = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
+            ctx.transaction("tx", |tx| {
+                Box::pin(async move {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                    tx.execute("SELECT 1", &params![]).await?;
+                    Ok(2_i64)
+                })
             })
+            .await?;
+            Ok(0)
         })
-        .await?;
-        Ok(0)
     })
     .await?;
 
@@ -689,11 +714,7 @@ async fn an_added_transaction_is_refused_not_run() -> Result<()> {
 /// and `transaction_on` need a SQL backend and are covered on SQLite above.
 #[tokio::test]
 async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
-    type Body = Box<
-        dyn Fn(DurableContext) -> futures_util::future::BoxFuture<'static, Result<i64>>
-            + Send
-            + Sync,
-    >;
+    type Body = Box<dyn for<'a> Fn(&'a DurableContext) -> BoxFuture<'a, Result<i64>> + Send + Sync>;
     // The operation name as `refuse_live_work` receives it, and a body that
     // replays `a` and then issues the operation.
     let rows: Vec<(&str, Body)> = vec![
@@ -701,7 +722,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.sleep",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.sleep(Duration::from_millis(1)).await?;
                     Ok(0)
                 })
@@ -711,7 +732,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.now",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.now().await?;
                     Ok(0)
                 })
@@ -721,7 +742,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.uuid",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.uuid().await?;
                     Ok(0)
                 })
@@ -731,7 +752,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.random",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.random().await?;
                     Ok(0)
                 })
@@ -741,7 +762,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.send",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.send(ID, 1_i64, "topic").await?;
                     Ok(0)
                 })
@@ -751,7 +772,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.updateWorkflowAttributes",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.set_workflow_attributes(ID, None).await?;
                     Ok(0)
                 })
@@ -761,7 +782,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.recv",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.recv::<i64>("topic", Duration::from_millis(1)).await?;
                     Ok(0)
                 })
@@ -771,7 +792,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.setEvent",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.set_event("key", 1_i64).await?;
                     Ok(0)
                 })
@@ -781,7 +802,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.getEvent",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.get_event::<i64>(ID, "key", Duration::from_millis(1))
                         .await?;
                     Ok(0)
@@ -792,7 +813,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.writeStream",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.write_stream("stream", 1_i64).await?;
                     Ok(0)
                 })
@@ -802,7 +823,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.closeStream",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.close_stream("stream").await?;
                     Ok(0)
                 })
@@ -812,7 +833,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "child",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.start_workflow::<_, i64>("child", (), WorkflowOptions::default())
                         .await?;
                     Ok(0)
@@ -823,7 +844,7 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
             "DBOS.select",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.step("a", |_| async { Ok::<_, Error>(1_i64) }).await?;
                     ctx.select(vec![Box::pin(async { 1_i64 })]).await?;
                     Ok(0)
                 })
@@ -878,11 +899,13 @@ async fn a_built_and_dropped_call_does_not_verify_the_history_under_it() -> Resu
     let provider = provider();
     record(&provider, steps(&["a"])).await?;
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        // Claims position 0 and never polls it. Under a counter-based check the
-        // counter would read 1 and the history would look fully covered.
-        drop(ctx.step("renamed", || async { Ok::<_, Error>(1_i64) }));
-        Ok(0)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            // Claims position 0 and never polls it. Under a counter-based check the
+            // counter would read 1 and the history would look fully covered.
+            drop(ctx.step("renamed", |_| async { Ok::<_, Error>(1_i64) }));
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -909,12 +932,14 @@ async fn a_recorded_value_that_no_longer_decodes_is_a_failure() -> Result<()> {
     let provider = provider();
     record(&provider, steps(&["a"])).await?; // records the integer 1 at `a`
 
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        // Same name, now a String: `1` does not deserialize as one.
-        let s: String = ctx
-            .step("a", || async { Ok::<_, Error>("x".to_string()) })
-            .await?;
-        Ok(s.len() as i64)
+    let report = engine(&provider, |ctx: &DurableContext| {
+        Box::pin(async move {
+            // Same name, now a String: `1` does not deserialize as one.
+            let s: String = ctx
+                .step("a", |_| async { Ok::<_, Error>("x".to_string()) })
+                .await?;
+            Ok(s.len() as i64)
+        })
     })
     .await?
     .verify_replay(ID)
@@ -936,14 +961,16 @@ async fn a_recorded_value_that_no_longer_decodes_is_a_failure() -> Result<()> {
 /// operation and its internal deadline. Dropping it must leave history missing.
 async fn dropped_wait_leaves_deadline_missing(use_event: bool) -> Result<()> {
     let provider = provider();
-    let running = engine(&provider, move |ctx: DurableContext| async move {
-        if use_event {
-            ctx.get_event::<i64>(ID, "unset", Duration::from_secs(3_600))
-                .await?;
-        } else {
-            ctx.recv::<i64>("empty", Duration::from_secs(3_600)).await?;
-        }
-        Ok(0)
+    let running = engine(&provider, move |ctx: &DurableContext| {
+        Box::pin(async move {
+            if use_event {
+                ctx.get_event::<i64>(ID, "unset", Duration::from_secs(3_600))
+                    .await?;
+            } else {
+                ctx.recv::<i64>("empty", Duration::from_secs(3_600)).await?;
+            }
+            Ok(0)
+        })
     })
     .await?;
     let _handle = running
@@ -961,13 +988,15 @@ async fn dropped_wait_leaves_deadline_missing(use_event: bool) -> Result<()> {
         "only the deadline is recorded while the wait is pending"
     );
 
-    let report = engine(&provider, move |ctx: DurableContext| async move {
-        if use_event {
-            drop(ctx.get_event::<i64>(ID, "unset", Duration::from_secs(3_600)));
-        } else {
-            drop(ctx.recv::<i64>("empty", Duration::from_secs(3_600)));
-        }
-        Ok(0)
+    let report = engine(&provider, move |ctx: &DurableContext| {
+        Box::pin(async move {
+            if use_event {
+                drop(ctx.get_event::<i64>(ID, "unset", Duration::from_secs(3_600)));
+            } else {
+                drop(ctx.recv::<i64>("empty", Duration::from_secs(3_600)));
+            }
+            Ok(0)
+        })
     })
     .await?
     .verify_replay(ID)

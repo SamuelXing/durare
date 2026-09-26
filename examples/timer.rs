@@ -35,7 +35,7 @@ async fn charge(ctx: &DurableContext, month: u32, cents: i64) -> Result<i64> {
 async fn subscription(ctx: &DurableContext, months: u32) -> Result<i64> {
     let mut total = 0;
     for m in 1..=months {
-        total += charge(&ctx, m, 999).await?;
+        total += charge(ctx, m, 999).await?;
         if m < months {
             // The durable nap. Persisted wake instant → a crash here resumes the
             // remaining wait on recovery, and never re-charges the months above.

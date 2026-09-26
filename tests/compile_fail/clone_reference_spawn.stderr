@@ -1,0 +1,13 @@
+error[E0521]: borrowed data escapes outside of function
+ --> tests/compile_fail/clone_reference_spawn.rs:4:5
+  |
+2 | async fn workflow(ctx: &DurableContext, _: ()) -> Result<()> {
+  |                   ---  - let's call the lifetime of this reference `'1`
+  |                   |
+  |                   `ctx` is a reference that is only valid in the function body
+3 |     let copy = Clone::clone(&ctx);
+4 |     tokio::spawn(async move { copy.step("escaped", |_| async { Ok(()) }).await }).await.unwrap()
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |     |
+  |     `ctx` escapes the function body here
+  |     argument requires that `'1` must outlive `'static`
