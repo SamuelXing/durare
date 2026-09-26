@@ -115,7 +115,10 @@
 //! reserved prefix or portable errors named `durare.RecordedError`: they predate
 //! escaping and cannot be distinguished from SDK records. Recognized records
 //! with malformed or unknown payloads return a serialization error instead of
-//! rerunning the failed body.
+//! rerunning the failed body. Unknown error codes are rejected too: silently
+//! mapping one to an unknown/application category could change the workflow's
+//! next branch. Adding a code requires compatible readers before new writes;
+//! `non_exhaustive` supports source evolution, not wire forward compatibility.
 //! No schema migration is required.
 //!
 //! These rules describe recorded outcomes. They do not make a checkpoint write

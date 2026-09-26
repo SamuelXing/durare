@@ -98,6 +98,7 @@ struct OwnedError(#[serde(with = "ErrorWire")] Error);
 #[derive(Deserialize)]
 struct Payload {
     version: u32,
+    #[serde(default)]
     error: serde_json::Value,
 }
 
@@ -341,6 +342,42 @@ mod tests {
         let error = restore_error(Some(crate::serialize::PORTABLE), foreign);
         assert!(
             matches!(error, Error::Portable(pe) if pe.code == Some(json!(400)) && pe.data == Some(json!({"field":"email"})))
+        );
+    }
+
+    #[test]
+    fn legacy_fieldless_authorization_records_use_the_documented_typed_decode() {
+        let stored = r#"{"name":"DBOSNotAuthorizedError","message":"denied"}"#;
+        let error = restore_error(Some(crate::serialize::PORTABLE), stored);
+        assert!(matches!(error, Error::NotAuthorized(ref message) if message == "denied"));
+        assert_eq!(error.code(), ErrorCode::NotAuthorized);
+        let structured = r#"{"name":"DBOSNotAuthorizedError","message":"denied","code":403}"#;
+        assert!(matches!(
+            restore_error(Some(crate::serialize::PORTABLE), structured),
+            Error::Portable(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_codes_are_rejected_instead_of_changing_workflow_branches() {
+        let error = Error::Db(sqlx::Error::PoolTimedOut);
+        let mut record: serde_json::Value =
+            serde_json::from_str(&encode_error(&Serializer::Portable, &error)).unwrap();
+        record["data"]["error"]["data"]["code"] = json!("future_code");
+        let restored = restore_error(Some(crate::serialize::PORTABLE), &record.to_string());
+        assert_eq!(restored.code(), ErrorCode::Serialization);
+        assert!(restored.to_string().contains("future_code"));
+    }
+
+    #[test]
+    fn version_is_checked_before_the_version_specific_shape() {
+        let record = json!({"name": NAME, "message": "future", "data": {"version": 2}});
+        let error = restore_error(Some(crate::serialize::PORTABLE), &record.to_string());
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported recorded error version 2"),
+            "{error}"
         );
     }
 

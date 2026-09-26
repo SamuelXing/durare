@@ -1458,7 +1458,17 @@ impl StateProvider for InMemoryProvider {
                     StepRow {
                         name: col_str(op, "function_name").unwrap_or_default(),
                         output: col_str(op, "output").and_then(|v| serde_json::from_str(&v).ok()),
-                        error: col_str(op, "error"),
+                        error: col_str(op, "error").map(|stored| {
+                            let (message, info) = crate::serialize::decode_error(
+                                col_str(op, "serialization").as_deref(),
+                                &stored,
+                            );
+                            crate::serialize::encode_stored_error(
+                                &crate::Serializer::Json,
+                                &message,
+                                info.as_ref(),
+                            )
+                        }),
                         child_workflow_id: col_str(op, "child_workflow_id"),
                         started_at_ms: col_i64(op, "started_at_epoch_ms"),
                         completed_at_ms: col_i64(op, "completed_at_epoch_ms"),

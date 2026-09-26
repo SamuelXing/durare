@@ -350,6 +350,13 @@ impl Error {
         }
     }
 
+    // Internal transaction recovery is only for a live driver failure. A saved
+    // diagnostic cannot clear when the transaction is retried; it belongs to
+    // the caller's bounded retry policy even if its historical flags are true.
+    pub(crate) fn should_retry_live_transaction(&self) -> bool {
+        matches!(self, Self::Db(_)) && (self.is_tx_conflict() || self.is_retryable())
+    }
+
     /// Whether this wraps a database unique-constraint violation.
     pub fn is_unique_violation(&self) -> bool {
         if let Self::Recorded(error) = self {
@@ -370,6 +377,8 @@ impl Error {
     /// connection loss, a closed/timed-out pool, or a busy/locked database.
     /// Serialization failures are *not* included — those need the whole
     /// transaction retried, which is the caller's decision.
+    /// For [`Error::Recorded`], this describes the original failure; it does
+    /// not authorize the engine's unbounded live-database retry loop.
     pub fn is_retryable(&self) -> bool {
         if let Self::Recorded(error) = self {
             return error.retryable;

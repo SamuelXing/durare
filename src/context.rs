@@ -1195,7 +1195,7 @@ impl DurableContext {
                             .replay_completion_row(seq, &opts.name, row, started)
                             .await;
                     }
-                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                    Err(e) if e.should_retry_live_transaction() => {
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
@@ -1373,7 +1373,7 @@ impl DurableContext {
                         tracing::Span::current().record("dbos.step.replayed", true);
                         return Ok(serde_json::from_value(value)?);
                     }
-                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                    Err(e) if e.should_retry_live_transaction() => {
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }

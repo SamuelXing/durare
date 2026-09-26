@@ -18,7 +18,7 @@ async fn assert_error_replays_on(
     let mut engine = DurableEngine::new(provider).await?;
     engine.register(
         "error-replay",
-        move |ctx: DurableContext, _: ()| async move {
+        move |ctx: DurableContext, _: serde_json::Value| async move {
             let error = ctx
                 .step("fail", || async { Err::<(), _>(make_error()) })
                 .await
@@ -275,6 +275,18 @@ async fn postgres_step_transaction_and_handle_errors_are_stable() -> Result<()> 
                 .with_serializer(serializer),
         );
         assert_error_replays_on(provider.clone(), || Error::Timeout).await?;
+        let exported = provider.export_workflow("error-replay", false).await?;
+        let memory = Arc::new(InMemoryProvider::new());
+        memory.import_workflow(&exported).await?;
+        assert_error_replays_on(memory, || Error::Timeout).await?;
+        let (import_admin, import_url, import_db) =
+            common::hermetic_pg_db(&base, "durare_error_import").await;
+        let imported = Arc::new(durare::PostgresProvider::connect(&import_url).await?);
+        let importer = DurableEngine::new(imported.clone()).await?;
+        imported.import_workflow(&exported).await?;
+        assert_error_replays_on(imported.clone(), || Error::Timeout).await?;
+        drop((importer, imported));
+        common::drop_hermetic_pg_db(&import_admin, &import_db).await;
         let ds = provider.system_datasource();
         let mut engine = DurableEngine::new(provider.clone()).await?;
         engine.register("transactions", move |ctx: DurableContext, _: ()| {
@@ -318,6 +330,99 @@ async fn postgres_step_transaction_and_handle_errors_are_stable() -> Result<()> 
         );
         drop((engine, provider));
         common::drop_hermetic_pg_db(&admin, &dbname).await;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn portable_step_errors_survive_memory_import_and_reexport() -> Result<()> {
+    let provider = Arc::new(
+        durare::SqliteProvider::connect("sqlite::memory:")
+            .await?
+            .with_serializer(durare::Serializer::Portable),
+    );
+    assert_error_replays_on(provider.clone(), || Error::Timeout).await?;
+    let exported = provider.export_workflow("error-replay", false).await?;
+    let sqlite = Arc::new(durare::SqliteProvider::connect("sqlite::memory:").await?);
+    let _imported_engine = DurableEngine::new(sqlite.clone()).await?;
+    sqlite.import_workflow(&exported).await?;
+    assert_error_replays_on(sqlite, || Error::Timeout).await?;
+    let memory = InMemoryProvider::new();
+    memory.import_workflow(&exported).await?;
+    let second = InMemoryProvider::new();
+    second
+        .import_workflow(&memory.export_workflow("error-replay", false).await?)
+        .await?;
+    for provider in [memory, second] {
+        assert_error_replays_on(Arc::new(provider), || Error::Timeout).await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn recorded_database_failures_use_the_user_transaction_retry_budget() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for mode in 0..3 {
+        for conflict in [false, true] {
+            let provider = Arc::new(durare::SqliteProvider::connect("sqlite::memory:").await?);
+            let ds = if mode == 2 {
+                durare::SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?)
+                    .await?
+            } else {
+                provider.system_datasource()
+            };
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = calls.clone();
+            let mut engine = DurableEngine::new(provider).await?;
+            engine.register("recorded-retry", move |ctx: DurableContext, _: ()| {
+                let (calls, ds) = (calls.clone(), ds.clone());
+                async move {
+                    let make_error = move || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Error::Recorded(Box::new(
+                            serde_json::from_value(serde_json::json!({
+                                "code": "database", "message": "saved failure",
+                                "retryable": !conflict, "tx_conflict": conflict,
+                                "unique_violation": false, "foreign_key_violation": false
+                            }))
+                            .unwrap(),
+                        ))
+                    };
+                    let opts = durare::TransactionOptions::new("reraised")
+                        .max_retries(1)
+                        .retry_if(|e: &Error| e.is_retryable() || e.is_tx_conflict());
+                    if mode == 0 {
+                        ctx.transaction_with(opts, move |_| {
+                            let error = make_error();
+                            Box::pin(async move { Err::<(), _>(error) })
+                        })
+                        .await
+                    } else {
+                        ctx.transaction_on_with(
+                            &ds,
+                            opts,
+                            async move |_| Err::<(), _>(make_error()),
+                        )
+                        .await
+                    }
+                }
+            });
+            let handle = engine
+                .start::<_, ()>("recorded-retry", (), WorkflowOptions::default())
+                .await?;
+            let error = tokio::time::timeout(std::time::Duration::from_secs(3), handle.result())
+                .await
+                .expect("a saved failure must not enter the unbounded database retry loop")
+                .unwrap_err();
+            assert!(matches!(error, Error::Recorded(_)));
+            assert_eq!(
+                observed.load(Ordering::SeqCst),
+                2,
+                "mode {mode}, conflict {conflict}"
+            );
+        }
     }
     Ok(())
 }

@@ -1309,7 +1309,7 @@ impl StateProvider for PostgresProvider {
                         // or transient DB error retries on a fresh tx, and an
                         // application error is left for the outer user-retry loop,
                         // which records it only once the budget is exhausted.
-                        Err(e) if e.is_tx_conflict() || e.is_retryable() => Err(e),
+                        Err(e) if e.should_retry_live_transaction() => Err(e),
                         Err(e) => {
                             tx.rollback().await?;
                             Err(e)
@@ -1324,7 +1324,7 @@ impl StateProvider for PostgresProvider {
                     // transaction, unbounded, backing off and bailing if the workflow
                     // is cancelled. Matches Go/Python, which retry these until they
                     // clear rather than surfacing a spurious failure under contention.
-                    Err(e) if e.is_tx_conflict() || e.is_retryable() => {
+                    Err(e) if e.should_retry_live_transaction() => {
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
@@ -2861,8 +2861,8 @@ impl StateProvider for PostgresProvider {
                 sqlx::query(&format!(
                     "INSERT INTO {operation_outputs}
                          (workflow_uuid, function_id, function_name, output, error,
-                          child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                          child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                     operation_outputs = self.tables.operation_outputs
                 ))
                 .bind(col_str(op, "workflow_uuid"))
@@ -2873,6 +2873,7 @@ impl StateProvider for PostgresProvider {
                 .bind(col_str(op, "child_workflow_id"))
                 .bind(col_i64(op, "started_at_epoch_ms"))
                 .bind(col_i64(op, "completed_at_epoch_ms"))
+                .bind(col_str(op, "serialization"))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -2997,6 +2998,7 @@ fn export_op_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
         "output",
         "error",
         "child_workflow_id",
+        "serialization",
     ] {
         m.insert(c.to_string(), s_col(row, c));
     }
