@@ -931,3 +931,67 @@ async fn a_recorded_value_that_no_longer_decodes_is_a_failure() -> Result<()> {
     assert!(report.into_result().is_err());
     Ok(())
 }
+
+/// Building a wait reserves positions, but only polling it verifies the
+/// operation and its internal deadline. Dropping it must leave history missing.
+async fn dropped_wait_leaves_deadline_missing(use_event: bool) -> Result<()> {
+    let provider = provider();
+    let running = engine(&provider, move |ctx: DurableContext| async move {
+        if use_event {
+            ctx.get_event::<i64>(ID, "unset", Duration::from_secs(3_600))
+                .await?;
+        } else {
+            ctx.recv::<i64>("empty", Duration::from_secs(3_600)).await?;
+        }
+        Ok(0)
+    })
+    .await?;
+    let _handle = running
+        .start::<_, i64>(NAME, (), WorkflowOptions::with_id(ID))
+        .await?;
+    for _ in 0..400 {
+        if !running.get_workflow_steps(ID).await?.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        common::recorded(&running, ID).await?,
+        [(1, "DBOS.sleep".to_owned())],
+        "only the deadline is recorded while the wait is pending"
+    );
+
+    let report = engine(&provider, move |ctx: DurableContext| async move {
+        if use_event {
+            drop(ctx.get_event::<i64>(ID, "unset", Duration::from_secs(3_600)));
+        } else {
+            drop(ctx.recv::<i64>("empty", Duration::from_secs(3_600)));
+        }
+        Ok(0)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+
+    assert!(!report.complete);
+    assert_eq!(report.recorded, 1);
+    assert_eq!(report.matched, 0, "an unpolled wait verifies no records");
+    assert_eq!(
+        report.divergence,
+        Some(Divergence::Missing {
+            position: 1,
+            recorded: "DBOS.sleep".to_owned(),
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dropped_recv_does_not_verify_its_deadline() -> Result<()> {
+    dropped_wait_leaves_deadline_missing(false).await
+}
+
+#[tokio::test]
+async fn a_dropped_get_event_does_not_verify_its_deadline() -> Result<()> {
+    dropped_wait_leaves_deadline_missing(true).await
+}

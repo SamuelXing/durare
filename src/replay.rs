@@ -179,8 +179,9 @@ struct Seen {
     /// verified. What was *served* is the only honest measure of what was
     /// checked.
     served: BTreeSet<i32>,
-    /// Positions the re-run claimed for a record it may never ask for, and the
-    /// operation a record there has to be.
+    /// Internal positions accounted for by waits the re-run actually polled,
+    /// and the operation a record there has to be. Construction alone does not
+    /// account for them: a built-and-dropped wait verifies nothing.
     ///
     /// A wait (`recv`, `get_event`) takes two positions: its outcome, and a
     /// deadline it fixes on its first miss. Once the outcome is recorded, a

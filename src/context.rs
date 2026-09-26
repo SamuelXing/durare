@@ -2088,8 +2088,11 @@ impl DurableContext {
         let position = claim!(self, "recv");
         let seq = position.seq();
         let deadline_seq = self.next_seq();
-        self.reserved_record(deadline_seq, "DBOS.sleep");
         PendingStep::new(position, async move {
+            // Construction reserves positions; only a polled wait accounts for
+            // its deadline during verification. Do this before the replay gate,
+            // which may stop at an in-flight wait with only a deadline recorded.
+            self.reserved_record(deadline_seq, "DBOS.sleep");
             if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
                 return Ok(stored);
             }
@@ -2225,8 +2228,11 @@ impl DurableContext {
         let position = claim!(self, "get_event");
         let seq = position.seq();
         let deadline_seq = self.next_seq();
-        self.reserved_record(deadline_seq, "DBOS.sleep");
         PendingStep::new(position, async move {
+            // Construction reserves positions; only a polled wait accounts for
+            // its deadline during verification. Do this before the replay gate,
+            // which may stop at an in-flight wait with only a deadline recorded.
+            self.reserved_record(deadline_seq, "DBOS.sleep");
             if let Some(stored) = self
                 .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")
                 .await?
