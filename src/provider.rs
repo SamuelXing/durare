@@ -475,12 +475,12 @@ pub struct WorkflowStatus {
     /// Present once the workflow reaches `SUCCESS`.
     pub output: Option<Value>,
     /// Present once the workflow reaches `ERROR`: the human-readable message.
-    /// For a `portable_json` row this is the envelope's `message` field.
+    /// For a structured record this is the envelope's `message` field.
     pub error: Option<String>,
-    /// The structured error for a workflow that failed under portable
-    /// serialization — `name`/`code`/`data` as written by any SDK (a Rust error
-    /// carries the generic name [`crate::PortableWorkflowError`] documents).
-    /// `None` for a non-portable row or a workflow that did not fail.
+    /// The stored structured error: a portable envelope or a versioned durare
+    /// error record, including in the default format. `None` for legacy bare
+    /// text or a workflow that did not fail. Result readers reconstruct the
+    /// error from this envelope; its `data` may contain SDK record metadata.
     pub error_info: Option<crate::PortableWorkflowError>,
     /// The executor (process) that owns this run; empty until claimed.
     pub executor_id: String,
@@ -996,29 +996,26 @@ pub struct StepInfo {
 pub enum StepOutcome {
     /// The step succeeded; carries its decoded output.
     Output(Value),
-    /// The step failed; carries the human message and — for a portable row — the
-    /// structured error, mirroring [`WorkflowStatus::error`]/`error_info`.
+    /// The step failed; carries the human message and any structured envelope,
+    /// mirroring [`WorkflowStatus::error`]/`error_info`.
     Failure {
         /// Human-readable error message.
         message: String,
-        /// Structured error, present when the row used portable serialization.
+        /// Structured error, present for portable or versioned error records.
         info: Option<crate::PortableWorkflowError>,
     },
 }
 
 impl StepOutcome {
     /// The value this outcome represents: a recorded `Output` is returned as
-    /// `Ok`, a recorded `Failure` as the reconstructed `Err` — the structured
-    /// [`Error::Portable`] when the row carried one, else a plain application
-    /// error. Used to surface a replayed step result (output or error) to its
-    /// caller.
+    /// `Ok`, a recorded `Failure` as the reconstructed `Err`. Versioned records
+    /// restore built-in variants; legacy text remains an application error.
     pub(crate) fn into_value_result(self) -> Result<Value> {
         match self {
             StepOutcome::Output(v) => Ok(v),
-            StepOutcome::Failure { message, info } => Err(match info {
-                Some(pe) => Error::Portable(Box::new(pe)),
-                None => Error::app(message),
-            }),
+            StepOutcome::Failure { message, info } => {
+                Err(crate::recorded_error::from_parts(message, info))
+            }
         }
     }
 }
@@ -1343,7 +1340,7 @@ pub trait StateProvider: Send + Sync {
     /// encoded at the engine because they carry a structured type the
     /// [`set_workflow_status`](Self::set_workflow_status) `&str` channel cannot —
     /// so a portable provider writes the cross-language error envelope. Defaults
-    /// to [`Serializer::Json`](crate::Serializer::Json) (bare error strings); the SQL providers return
+    /// to [`Serializer::Json`](crate::Serializer::Json); the SQL providers return
     /// their configured serializer.
     fn serializer(&self) -> crate::serialize::Serializer {
         crate::serialize::Serializer::Json

@@ -1507,6 +1507,13 @@ impl DurableContext {
     ) -> Result<T> {
         tracing::Span::current().record("dbos.step.replayed", true);
         if let Some(err_text) = row.error.as_deref() {
+            let (message, info) =
+                crate::serialize::decode_error(row.serialization.as_deref(), err_text);
+            let encoded = crate::serialize::encode_stored_error(
+                &self.provider.serializer(),
+                &message,
+                info.as_ref(),
+            );
             let stored = self
                 .provider
                 .record_step_result(
@@ -1514,7 +1521,7 @@ impl DurableContext {
                     seq,
                     name,
                     Value::Null,
-                    Some(err_text),
+                    Some(&encoded),
                     Some(started),
                     Some(self.runtime.executor_id()),
                 )
@@ -1719,10 +1726,8 @@ impl DurableContext {
     }
 
     /// Durably record a failed step's error under `(workflow_id, seq)`. Returns
-    /// the original `err` once recorded (preserving its concrete type on this
-    /// first execution); if a concurrent execution recorded a *success* first,
-    /// that canonical output is returned instead. On any later replay the recorded
-    /// failure is reconstructed by [`replay_or_guard`], so the step never re-runs.
+    /// the recorded outcome, using the same error representation as replay.
+    /// A concurrent writer's canonical result takes precedence over `err`.
     async fn record_failure<T: DeserializeOwned>(
         &self,
         seq: i32,
@@ -1743,10 +1748,7 @@ impl DurableContext {
                 Some(self.runtime.executor_id()),
             )
             .await?;
-        match outcome {
-            StepOutcome::Failure { .. } => Err(err),
-            StepOutcome::Output(v) => Ok(serde_json::from_value(v)?),
-        }
+        outcome_value(outcome)
     }
 
     /// Drive `f` to success, retrying on error per `opts` with exponential

@@ -723,7 +723,7 @@ impl StateProvider for SqliteProvider {
             }
             // A body error reached the user-retry policy: retry the whole body if
             // the budget allows and the predicate accepts, otherwise record the
-            // failure durably and surface the original error.
+            // failure durably and surface the same representation as replay.
             if opts.should_user_retry(&body_err, user_attempt) {
                 let delay = opts.user_retry_backoff(user_attempt);
                 tracing::warn!(
@@ -770,7 +770,10 @@ impl StateProvider for SqliteProvider {
                 )
                 .await?;
             }
-            return Err(body_err);
+            return Err(serialize::restore_error(
+                Some(self.serializer.name()),
+                &encoded_err,
+            ));
         }
     }
 

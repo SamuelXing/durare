@@ -1345,7 +1345,7 @@ impl StateProvider for PostgresProvider {
             // A body error reached the user-retry policy. Retry the whole body if
             // the budget allows and the predicate accepts; otherwise record the
             // failure durably (outside any transaction) so a replay returns it
-            // without re-running, and surface the original error.
+            // without re-running, and surface the same recorded error.
             if opts.should_user_retry(&body_err, user_attempt) {
                 let delay = opts.user_retry_backoff(user_attempt);
                 tracing::warn!(
@@ -1393,7 +1393,10 @@ impl StateProvider for PostgresProvider {
                 )
                 .await?;
             }
-            return Err(body_err);
+            return Err(serialize::restore_error(
+                Some(self.serializer.name()),
+                &encoded_err,
+            ));
         }
     }
 

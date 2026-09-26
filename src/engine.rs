@@ -3343,9 +3343,8 @@ async fn run_to_completion(
             Err(Error::Cancelled(id))
         }
         Err(e) => {
-            // Encode the error in the provider's format: a portable provider
-            // stores the cross-language envelope (carrying a structured
-            // `Error::Portable`'s name/code/data), others store the bare message.
+            // Encode once and return the same representation a polling handle
+            // or recovered execution will read, rather than the live error.
             let stored = crate::serialize::encode_error(&provider.serializer(), &e);
             let landed = provider
                 .set_workflow_status(&id, STATUS_ERROR, None, Some(&stored))
@@ -3355,7 +3354,10 @@ async fn run_to_completion(
             }
             recorder.record("dbos.workflow.status", STATUS_ERROR);
             recorder.record("otel.status_code", "ERROR");
-            Err(e)
+            Err(crate::serialize::restore_error(
+                Some(provider.serializer().name()),
+                &stored,
+            ))
         }
     }
     }
@@ -3402,14 +3404,12 @@ async fn adopt_recorded_outcome(
                 STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
                     Err(Error::MaxRecoveryAttemptsExceeded(id.to_string()))
                 }
-                _ => Err(match status.error_info {
-                    Some(info) => Error::Portable(Box::new(info)),
-                    None => Error::app(
-                        status
-                            .error
-                            .unwrap_or_else(|| "workflow failed".to_string()),
-                    ),
-                }),
+                _ => Err(crate::recorded_error::from_parts(
+                    status
+                        .error
+                        .unwrap_or_else(|| "workflow failed".to_string()),
+                    status.error_info,
+                )),
             };
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

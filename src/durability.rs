@@ -77,6 +77,50 @@
 //! fixes, the types that are safe to store and send, and where dependencies
 //! live.
 //!
+//! # Recorded errors
+//!
+//! A failed step returns the error reconstructed from its checkpoint on the
+//! initial execution too. Built-in errors such as [`Error::Timeout`] keep their
+//! variant and fields. Errors containing live driver, migration, or JSON source
+//! objects become [`Error::Recorded`]: their message, [`Error::code`], and `is_*`
+//! classifications are saved, but the original object is not. Live step retry
+//! predicates still inspect the original error before final recording.
+//!
+//! An [`Error::app_source`] loses its source when it crosses that durable
+//! boundary, on the initial return as well as replay. Use the saved fields for
+//! workflow decisions, not source downcasts. In portable mode an ordinary
+//! application message returns the generic [`Error::Portable`] envelope on
+//! both executions; structured application envelopes keep their data in either
+//! serializer. Recorded `ERROR` workflow outcomes and polling handles use the
+//! same decoder. Cancellation and workflow-deadline control outcomes are separate.
+//!
+//! **Storage and upgrades.** New built-in failures use a version-1
+//! `durare.RecordedError` envelope. Its `data` holds `version` and a tagged
+//! `error`. Portable rows store that JSON directly; other formats store it after
+//! the reserved `__DURARE_ERROR__:` prefix. Ordinary application messages retain
+//! their old format. New messages beginning with the prefix, and application
+//! envelopes using the reserved class name, are escaped in an outer record.
+//!
+//! Old bare errors are still application errors: missing types cannot be
+//! recovered by guessing from their messages. Foreign portable envelopes remain
+//! readable. The fieldless `DBOSNotAuthorizedError` envelope is recognized as
+//! [`Error::NotAuthorized`]; user-supplied portable errors with that exact shape
+//! are escaped so their application meaning is preserved.
+//!
+//! Older durare versions cannot reconstruct new typed records. Foreign SDKs can
+//! read a portable record's message/data but do not acquire Rust's classifications.
+//! Upgrade all readers/recovery workers for the affected application before
+//! recording new failures; do not replay those runs on older binaries. Before
+//! upgrading legacy histories, check for application text starting with the
+//! reserved prefix or portable errors named `durare.RecordedError`: they predate
+//! escaping and cannot be distinguished from SDK records. Recognized records
+//! with malformed or unknown payloads return a serialization error instead of
+//! rerunning the failed body.
+//! No schema migration is required.
+//!
+//! These rules describe recorded outcomes. They do not make a checkpoint write
+//! succeed or change the engine's handling of infrastructure failures.
+//!
 //! # Crash recovery
 //!
 //! On startup, call [`DurableEngine::recover`]: it finds every workflow this

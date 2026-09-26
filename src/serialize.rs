@@ -267,37 +267,41 @@ pub const PORTABLE_ERROR_NAME: &str = "Portable Error";
 /// In [`Serializer::Portable`] mode a failed workflow's stored error is written
 /// in this shape so a DBOS app in another language can read it as a structured
 /// error — a type/class name, the human message, and optional `code`/`data` —
-/// rather than an opaque string. A native error carries no user-defined name, so
-/// it is stored under the generic [`PORTABLE_ERROR_NAME`] with its display text as
-/// `message`, and `code`/`data` are omitted when absent. The envelope is read
+/// rather than an opaque string. Plain application errors use the generic
+/// [`PORTABLE_ERROR_NAME`]; typed SDK errors use a versioned record in `data`.
+/// `code`/`data` are omitted when absent. The envelope is read
 /// tolerantly: a value another SDK wrote — which may carry the concrete error
 /// type's name and its own `code`/`data` — still decodes here.
 ///
 /// This type is surfaced on [`crate::WorkflowStatus::error_info`] when reading a
-/// portable error written by any SDK.
+/// portable error written by any SDK or a versioned durare error record.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PortableWorkflowError {
-    /// Error type/class name (the generic [`PORTABLE_ERROR_NAME`] for a native error).
+    /// Error type/class name, or the reserved SDK record name.
     pub name: String,
     /// Human-readable error message.
     pub message: String,
     /// Optional application-level error code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<Value>,
-    /// Optional structured, application-level error payload.
+    /// Optional structured application payload or SDK record metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
-/// Encode a failed workflow's **error** for storage. In [`Serializer::Portable`]
-/// mode it becomes the cross-language envelope: a structured [`Error::Portable`]
-/// is written with the type name and `code`/`data` its author supplied; any other
-/// error is wrapped under the generic [`PORTABLE_ERROR_NAME`] with its display
-/// text as `message`. Other formats store the bare display text. This mirrors the
-/// other SDKs' `serializeWorkflowError`, called at workflow completion — so only
-/// the error outcome is encoded here; cancellation/timeout reasons are stored bare
-/// by their own call sites.
+/// Encode a step or workflow failure. Built-in errors use a versioned record
+/// that preserves their classification and fields. Driver errors save their
+/// message and classification as [`Error::Recorded`]. Portable mode uses a JSON
+/// envelope; other formats prefix the envelope with `__DURARE_ERROR__:`.
+///
+/// Plain application messages retain the legacy bare-text/portable envelope
+/// representation, except when escaping the reserved prefix. Structured
+/// [`Error::Portable`] values retain their data in either format. See the
+/// [durability guide](crate::durability#recorded-errors) for rollout limits.
 pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
+    if let Some(recorded) = crate::recorded_error::encode(serializer, err) {
+        return recorded;
+    }
     if matches!(serializer, Serializer::Portable) {
         let env = match err {
             Error::Portable(pe) => (**pe).clone(),
@@ -324,19 +328,74 @@ pub fn encode_error(serializer: &Serializer, err: &Error) -> String {
 }
 
 /// Decode a stored workflow **error**, returning its human message and — for a
-/// `portable_json` row that holds a structured envelope — the full
-/// [`PortableWorkflowError`] (name/code/data) another SDK wrote, or the generic
-/// envelope Rust wrote. A non-portable row, or any value that is not a valid
-/// envelope, decodes to a plain message with no structure, matching the other
-/// SDKs (which only deserialize the envelope in portable mode and otherwise fall
-/// back to the raw string).
+/// portable row or a versioned durare record — the full
+/// [`PortableWorkflowError`]. Legacy non-portable text has no structure. This
+/// function exposes stored metadata; step/workflow result readers additionally
+/// validate the versioned payload and reconstruct its concrete error.
 pub fn decode_error(format: Option<&str>, stored: &str) -> (String, Option<PortableWorkflowError>) {
+    if let Some(encoded) = stored.strip_prefix(crate::recorded_error::PREFIX) {
+        if let Ok(env) = serde_json::from_str::<PortableWorkflowError>(encoded) {
+            if env.name == crate::recorded_error::NAME {
+                return (env.message.clone(), Some(env));
+            }
+        }
+        // Keep the reserved marker so the result reader reports corrupt data,
+        // rather than silently interpreting it as an application failure.
+        return (stored.to_string(), None);
+    }
     if format == Some(PORTABLE) {
         if let Ok(env) = serde_json::from_str::<PortableWorkflowError>(stored) {
             return (env.message.clone(), Some(env));
         }
+        // A recognized SDK envelope with missing fields is corrupt, not legacy
+        // application text. Keep its identity for the strict result decoder.
+        if let Ok(value) = serde_json::from_str::<Value>(stored) {
+            if value.get("name").and_then(Value::as_str) == Some(crate::recorded_error::NAME) {
+                return (
+                    stored.to_string(),
+                    Some(PortableWorkflowError {
+                        name: crate::recorded_error::NAME.into(),
+                        message: stored.into(),
+                        code: None,
+                        data: None,
+                    }),
+                );
+            }
+        }
     }
     (stored.to_string(), None)
+}
+
+/// Restore exactly the representation a persisted failure will expose.
+pub(crate) fn restore_error(format: Option<&str>, stored: &str) -> Error {
+    let (message, info) = decode_error(format, stored);
+    crate::recorded_error::from_parts(message, info)
+}
+
+/// Copy a decoded record to another serializer without interpreting a future
+/// version's payload. Used by witness backfill and in-memory export.
+pub(crate) fn encode_stored_error(
+    serializer: &Serializer,
+    message: &str,
+    info: Option<&PortableWorkflowError>,
+) -> String {
+    match info {
+        Some(info) if info.name == crate::recorded_error::NAME => {
+            let encoded = serde_json::to_string(info).expect("an error envelope is JSON-safe");
+            if matches!(serializer, Serializer::Portable) {
+                encoded
+            } else {
+                format!("{}{encoded}", crate::recorded_error::PREFIX)
+            }
+        }
+        Some(info) => encode_error(
+            serializer,
+            &crate::recorded_error::from_parts(message.into(), Some(info.clone())),
+        ),
+        // Keep legacy text (and a corrupt reserved record) as-is. Upgrading it
+        // to a new error would invent information or conceal corruption.
+        None => message.into(),
+    }
 }
 
 /// `decode_error` over an optional column: an absent error yields `(None, None)`.
@@ -511,12 +570,13 @@ mod tests {
 
     #[test]
     fn json_error_stays_bare() {
-        // Default (non-portable) mode stores and reads the plain message — no
-        // envelope, no structured info — even for a typed error.
+        // Ordinary application text retains its legacy representation. Typed
+        // errors now use a record instead of losing their fields.
         assert_eq!(encode_error(&Serializer::Json, &Error::app("boom")), "boom");
-        assert_eq!(
-            encode_error(&Serializer::Json, &Error::portable("Validation", "boom")),
-            "boom"
+        let stored = encode_error(&Serializer::Json, &Error::portable("Validation", "boom"));
+        assert!(
+            matches!(restore_error(Some(DBOS_JSON), &stored), Error::Portable(pe)
+            if pe.name == "Validation" && pe.message == "boom")
         );
         assert_eq!(
             decode_error(Some(DBOS_JSON), "boom"),

@@ -1,12 +1,14 @@
 use crate::replay::Divergence;
 use crate::serialize::PortableWorkflowError;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A stable, programmatic classification of an [`Error`](enum@Error), returned by
 /// [`Error::code`]. Lets callers branch on *what kind* of failure occurred
 /// without matching every concrete variant. Non-exhaustive: new codes may be
 /// added as the SDK grows, so always include a `_` arm when matching.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorCode {
     /// A database query or connection failed.
@@ -61,6 +63,12 @@ pub enum ErrorCode {
 /// the `is_*` helpers to classify the underlying database failure.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A persisted driver, migration, or JSON error. Its message, [`code`](Self::code),
+    /// and `is_*` classifications survive replay; its original source object does
+    /// not. A durable boundary returns this on the initial execution too.
+    #[error("{0}")]
+    Recorded(Box<RecordedError>),
+
     /// A database error from the underlying `sqlx` driver.
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -213,14 +221,14 @@ pub enum Error {
 
     /// An error raised by user code inside a step or workflow, with an optional
     /// underlying `source` so `{:?}` and error-reporting tools can walk the
-    /// cause chain. The `source` is a live, in-process detail — a checkpointed
-    /// error stores only its `message`, so the chain does not survive a replay.
+    /// cause chain inside the body or its retry predicate. The source is not
+    /// persisted: a durable boundary removes it from the initial return as well
+    /// as replay, so the caller sees the same representation in both cases.
     #[error("{message}")]
     App {
         /// The error message.
         message: String,
-        /// Optional underlying cause. An in-process detail only — it is not
-        /// checkpointed, so it does not survive a replay.
+        /// Optional underlying cause, available before the error is recorded.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync + 'static>>,
     },
@@ -229,8 +237,8 @@ pub enum Error {
     /// `name`, a human `message`, and optional app-level `code`/`data`. Under
     /// portable serialization it is stored as the [`PortableWorkflowError`]
     /// envelope so an observer in any language reads its structure; the display
-    /// form is the message (like the other SDKs' `Error()`). A workflow that
-    /// failed under portable mode is read back as this variant.
+    /// form is the message. Application envelopes are read back with their
+    /// fields; typed SDK records are reconstructed as the corresponding variant.
     // Boxed so this (otherwise large) structured envelope — its two
     // `Option<Value>` fields dominate the enum's size — does not inflate every
     // `Result<_, Error>` that flows through the hot path.
@@ -250,7 +258,9 @@ impl Error {
     /// Like [`app`](Self::app), but keeping an underlying error as the
     /// [`source`](std::error::Error::source) so `{:?}` and error-reporting tools
     /// can walk the cause chain — instead of flattening it into the message.
-    /// Only the message is persisted on a checkpoint; the source is in-process.
+    /// Only the message is persisted. After a successful checkpoint the caller
+    /// receives the recorded representation, without this source, on both the
+    /// initial execution and replay. Live retry predicates still see the source.
     pub fn app_source(
         msg: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -317,6 +327,7 @@ impl Error {
     /// The stable [`ErrorCode`] for this error, for programmatic handling.
     pub fn code(&self) -> ErrorCode {
         match self {
+            Error::Recorded(error) => error.code,
             Error::Db(_) => ErrorCode::Database,
             Error::Migrate(_) => ErrorCode::Initialization,
             Error::Serde(_) | Error::Serialization(_) => ErrorCode::Serialization,
@@ -341,11 +352,17 @@ impl Error {
 
     /// Whether this wraps a database unique-constraint violation.
     pub fn is_unique_violation(&self) -> bool {
+        if let Self::Recorded(error) = self {
+            return error.unique_violation;
+        }
         matches!(self, Error::Db(sqlx::Error::Database(e)) if e.is_unique_violation())
     }
 
     /// Whether this wraps a database foreign-key violation.
     pub fn is_foreign_key_violation(&self) -> bool {
+        if let Self::Recorded(error) = self {
+            return error.foreign_key_violation;
+        }
         matches!(self, Error::Db(sqlx::Error::Database(e)) if e.is_foreign_key_violation())
     }
 
@@ -354,6 +371,9 @@ impl Error {
     /// Serialization failures are *not* included — those need the whole
     /// transaction retried, which is the caller's decision.
     pub fn is_retryable(&self) -> bool {
+        if let Self::Recorded(error) = self {
+            return error.retryable;
+        }
         let Error::Db(e) = self else { return false };
         match e {
             sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => true,
@@ -368,10 +388,40 @@ impl Error {
     /// transaction on a fresh one: Postgres `40001` serialization_failure / `40P01`
     /// deadlock_detected, or SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`.
     pub fn is_tx_conflict(&self) -> bool {
+        if let Self::Recorded(error) = self {
+            return error.tx_conflict;
+        }
         let Error::Db(sqlx::Error::Database(db)) = self else {
             return false;
         };
         db.code().map(|c| is_tx_conflict_code(&c)).unwrap_or(false)
+    }
+}
+
+/// The durable diagnostic behind [`Error::Recorded`]. Use [`Error::code`] and
+/// its `is_*` helpers to inspect the saved classifications. Unlike a live driver
+/// error, this value has no downcastable source or connection to the driver.
+#[derive(Debug, Serialize, Deserialize, Error)]
+#[error("{message}")]
+pub struct RecordedError {
+    code: ErrorCode,
+    message: String,
+    retryable: bool,
+    tx_conflict: bool,
+    unique_violation: bool,
+    foreign_key_violation: bool,
+}
+
+impl RecordedError {
+    pub(crate) fn capture(error: &Error) -> Self {
+        Self {
+            code: error.code(),
+            message: error.to_string(),
+            retryable: error.is_retryable(),
+            tx_conflict: error.is_tx_conflict(),
+            unique_violation: error.is_unique_violation(),
+            foreign_key_violation: error.is_foreign_key_violation(),
+        }
     }
 }
 

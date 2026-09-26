@@ -155,7 +155,9 @@ impl StateProvider for InMemoryProvider {
                 row.output = Some(o.clone());
             }
             if let Some(e) = error {
-                row.error = Some(e.to_string());
+                let (message, info) = crate::serialize::decode_error(None, e);
+                row.error = Some(message);
+                row.error_info = info;
             }
             let now = Utc::now();
             if is_terminal(status) {
@@ -1083,7 +1085,10 @@ impl StateProvider for InMemoryProvider {
                 step_id: *seq,
                 name: row.name.clone(),
                 output: row.output.clone(),
-                error: row.error.clone(),
+                error: row
+                    .error
+                    .as_deref()
+                    .map(|e| crate::serialize::decode_error(None, e).0),
                 child_workflow_id: row.child_workflow_id.clone(),
                 started_at: row.started_at_ms.and_then(DateTime::from_timestamp_millis),
                 completed_at: row
@@ -1527,7 +1532,14 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
         "output".into(),
         w.output.as_ref().map_or(Value::Null, payload_str),
     );
-    m.insert("error".into(), json!(w.error));
+    let stored_error = w.error.as_deref().map(|message| {
+        crate::serialize::encode_stored_error(
+            &crate::Serializer::Json,
+            message,
+            w.error_info.as_ref(),
+        )
+    });
+    m.insert("error".into(), json!(stored_error));
     m.insert("executor_id".into(), json!(w.executor_id));
     m.insert("created_at".into(), json!(w.created_at.timestamp_millis()));
     m.insert("updated_at".into(), json!(w.updated_at.timestamp_millis()));
@@ -1598,14 +1610,14 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
 }
 
 /// The [`StepOutcome`] a recorded [`StepRow`] represents: a recorded `error` is a
-/// failure (stored bare — the single-process store does no portable encoding),
-/// otherwise its `output`. Mirrors the SQL backends' `step_outcome_from`.
+/// failure (legacy text or a versioned error), otherwise its `output`.
+/// Mirrors the SQL backends' `step_outcome_from`.
 fn step_row_outcome(r: &StepRow) -> StepOutcome {
     match &r.error {
-        Some(e) => StepOutcome::Failure {
-            message: e.clone(),
-            info: None,
-        },
+        Some(e) => {
+            let (message, info) = crate::serialize::decode_error(None, e);
+            StepOutcome::Failure { message, info }
+        }
         None => StepOutcome::Output(r.output.clone().unwrap_or(Value::Null)),
     }
 }
