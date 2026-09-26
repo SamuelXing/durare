@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod common;
+
 /// The one workflow name these tests use, and the one id.
 const NAME: &str = "wf";
 const ID: &str = "wf-1";
@@ -41,12 +43,7 @@ where
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<i64>> + Send + 'static,
 {
-    engine(provider, body)
-        .await?
-        .start::<_, i64>(NAME, (), WorkflowOptions::with_id(ID))
-        .await?
-        .result()
-        .await?;
+    common::run_body(provider, NAME, ID, body).await?;
     Ok(())
 }
 
@@ -513,9 +510,7 @@ async fn a_completed_history_is_complete() -> Result<()> {
 #[tokio::test]
 async fn an_added_transaction_is_refused_not_run() -> Result<()> {
     static RAN: AtomicUsize = AtomicUsize::new(0);
-    let mut path = std::env::temp_dir();
-    path.push(format!("durare-verify-{}.db", uuid::Uuid::new_v4()));
-    let url = format!("sqlite://{}", path.display());
+    let (url, path) = common::temp_db_url("verify");
     let provider: Arc<dyn StateProvider> = Arc::new(SqliteProvider::connect(&url).await?);
 
     record(&provider, steps(&["a"])).await?;
@@ -549,9 +544,7 @@ async fn an_added_transaction_is_refused_not_run() -> Result<()> {
     assert_eq!(RAN.load(Ordering::SeqCst), 0, "the transaction body ran");
     assert_eq!((before, after), (1, 1), "verification wrote a checkpoint");
     drop(verifier);
-    for ext in ["", "-wal", "-shm"] {
-        std::fs::remove_file(format!("{}{ext}", path.display())).ok();
-    }
+    common::remove_sqlite_files(&path);
     Ok(())
 }
 

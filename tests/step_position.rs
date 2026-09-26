@@ -7,19 +7,21 @@
 //! order — which `tokio::select!` randomises and an out-of-order await reverses —
 //! so these pin it to the source instead.
 
-use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{
+    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, WorkflowOptions,
+};
 use std::sync::Arc;
 
-/// The `(position, operation)` pairs a workflow recorded, in position order.
+mod common;
+
+const WORKFLOW: &str = "probe";
+const ID: &str = "wf";
+
+/// The `(position, operation)` pairs the workflow recorded, in position order.
 /// A position nothing was written at is simply absent, which is how a call that
 /// claimed one without running shows up.
 async fn recorded(engine: &DurableEngine) -> Result<Vec<(i32, String)>> {
-    Ok(engine
-        .get_workflow_steps("wf")
-        .await?
-        .into_iter()
-        .map(|step| (step.step_id, step.name))
-        .collect())
+    common::recorded(engine, ID).await
 }
 
 /// Runs `body` as a workflow and reports which operation landed at each position.
@@ -28,13 +30,8 @@ where
     F: Fn(DurableContext) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<i64>> + Send + 'static,
 {
-    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("probe", move |ctx: DurableContext, _: ()| body(ctx));
-    engine
-        .start::<_, i64>("probe", (), WorkflowOptions::with_id("wf"))
-        .await?
-        .result()
-        .await?;
+    let provider: Arc<dyn StateProvider> = Arc::new(InMemoryProvider::new());
+    let engine = common::run_body(&provider, WORKFLOW, ID, body).await?;
     recorded(&engine).await
 }
 
@@ -187,10 +184,10 @@ async fn a_refused_nested_transaction_leaves_the_counter_alone() -> Result<()> {
     use durare::SqliteProvider;
     use std::time::Duration;
 
-    let path = std::env::temp_dir().join(format!("durare-nested-seq-{}.db", uuid::Uuid::new_v4()));
-    let provider = SqliteProvider::connect(&format!("sqlite://{}", path.display())).await?;
+    let (url, path) = common::temp_db_url("nested-seq");
+    let provider = SqliteProvider::connect(&url).await?;
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    engine.register("probe", |ctx: DurableContext, _: ()| async move {
+    engine.register(WORKFLOW, |ctx: DurableContext, _: ()| async move {
         let nested_ctx = ctx.clone();
         ctx.transaction::<(), _>("outer", move |_tx| {
             let nested_ctx = nested_ctx.clone();
@@ -209,7 +206,7 @@ async fn a_refused_nested_transaction_leaves_the_counter_alone() -> Result<()> {
     });
     engine.launch().await?;
     engine
-        .start::<_, i64>("probe", (), WorkflowOptions::with_id("wf"))
+        .start::<_, i64>(WORKFLOW, (), WorkflowOptions::with_id(ID))
         .await?
         .result()
         .await?;
@@ -221,6 +218,6 @@ async fn a_refused_nested_transaction_leaves_the_counter_alone() -> Result<()> {
     );
 
     engine.shutdown(Duration::from_secs(1)).await?;
-    let _ = std::fs::remove_file(&path);
+    common::remove_sqlite_files(&path);
     Ok(())
 }
