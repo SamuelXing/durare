@@ -3014,7 +3014,7 @@ async fn pg_fork_routes_to_named_queue() -> Result<()> {
 /// instead of silently returning the wrong step's checkpoint.
 #[tokio::test]
 async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
-    use durare::{StateProvider, WorkflowStatus, STATUS_PENDING};
+    use durare::{StateProvider, WorkflowQueue, WorkflowStatus, STATUS_PENDING};
     let Some(url) = database_url() else {
         eprintln!("skipping pg_renamed_step_fails_as_unexpected_step: DATABASE_URL unset");
         return Ok(());
@@ -3029,6 +3029,8 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
         ctx.step("renamed", || async { Ok::<_, Error>(1_i64) })
             .await
     });
+    let queue = format!("evolved-q-{tag}");
+    engine.register_queue(WorkflowQueue::new(&queue));
     engine.launch().await?;
 
     // Seed a PENDING run whose step 0 was checkpointed under the OLD name.
@@ -3046,8 +3048,12 @@ async fn pg_renamed_step_fails_as_unexpected_step() -> Result<()> {
         .record_step_result(&id, 0, "first", serde_json::json!(1), None, None, None)
         .await?;
 
-    let h = engine.resume_workflow::<i64>(&id).await?;
-    let err = h.result().await.expect_err("replay must fail");
+    // Other tests have different workflow registries: do not share their queue.
+    let h = engine.resume_workflow_on::<i64>(&id, &queue).await?;
+    let err = tokio::time::timeout(Duration::from_secs(10), h.result())
+        .await
+        .expect("replay must settle")
+        .expect_err("replay must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("non-deterministic") && msg.contains("renamed") && msg.contains("first"),
