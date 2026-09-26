@@ -121,6 +121,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `DurableEngine::verify_replay(workflow_id)`: re-runs a recorded workflow's
+  function against the code in this binary and reports whether it still issues
+  the same durable operations in the same order — the pre-deploy check for a
+  changed workflow body. A replay serves each operation from the record at its
+  position, so an edited function is the one change a test suite cannot judge:
+  the new code passes its own tests and the runs already in flight fail at
+  recovery time, half-finished, on the first position whose recorded name no
+  longer matches.
+
+  The pass runs nothing. Every operation is served from its record, and the first
+  one with nothing recorded at its position stops the run instead of executing
+  it: no step or transaction body, no send, no child workflow, no marker, no
+  checkpoint, status row or executor id. A recorded timer is read, not waited
+  out.
+
+  It returns a `ReplayReport` — `recorded` / `matched` counts, whether the
+  recorded run had finished, and the first `Divergence`: `Mismatch` (a position
+  changed operation), `Extra` (an operation a completed history does not hold) or
+  `Missing` (a recorded operation the code no longer reaches). `into_result()`
+  turns it into a `?` for a test or a CI step. A workflow that is still running
+  has a history that legitimately ends early, so only a `Mismatch` is reported
+  against one.
+
+  The report, not the error the refused call returns, is authoritative: a
+  workflow body is free to swallow a step error (`let _ = ..`, `.ok()`, a
+  `match`), so the divergence is recorded in a cell shared by every clone of the
+  verifying context before the error is handed back. What it cannot see: it
+  observes the sequence of durable operations, so non-determinism that does not
+  change that sequence passes, and a durable call made from a `tokio::spawn`ed
+  task is not attributed to the body that spawned it (the nesting guard's
+  task-local does not reach one either).
+
 - `PostgresProvider::from_pool_with_schema(pool, schema)`: a caller-owned
   pool with the system tables pinned to an explicit schema — created on
   `init`, every system query schema-qualified — closing the hole where

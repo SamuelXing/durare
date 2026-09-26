@@ -133,6 +133,13 @@
 //!   re-run a fixed version of a failed workflow without repeating its
 //!   completed work.
 //!
+//! Before any of them: [`DurableEngine::verify_replay`] re-runs a recorded
+//! workflow against the new code and reports the first durable operation the two
+//! disagree about, without executing or writing anything — the pre-deploy check
+//! for exactly this change. The [determinism
+//! guide](crate::determinism#checking-a-change-before-you-ship-it) covers what it
+//! does and does not see.
+//!
 //! [sleeps]: DurableContext::sleep
 //! [sends]: DurableContext::send
 //! [child starts]: DurableContext::start_workflow

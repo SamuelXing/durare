@@ -106,6 +106,31 @@
 //! What a body may do is call ordinary functions, as deeply as it likes. The
 //! rule is about durable calls, not about nesting code.
 //!
+//! # Checking a change before you ship it
+//!
+//! Every rule above is about the body you are writing. The other half of the
+//! problem is the runs already recorded: a workflow function is pinned to the
+//! operations its own runs issued, and if you edit it, the half-finished runs in
+//! flight are what find out — at recovery time, in production.
+//!
+//! [`DurableEngine::verify_replay`] answers that question first. It re-runs one
+//! recorded workflow's function against the code in the binary and reports the
+//! first durable operation the two disagree about: a
+//! [`Mismatch`](Divergence::Mismatch) where a position changed operation, an
+//! [`Extra`](Divergence::Extra) the completed history does not hold, a
+//! [`Missing`](Divergence::Missing) the code no longer reaches. The pass runs
+//! nothing — every operation is served from its record, and the first one with
+//! nothing recorded at its position stops it — so no step body executes, no
+//! message is sent, no child workflow starts, and nothing is written. Run it
+//! over the workflows you are about to carry across a deploy, in a test or a CI
+//! step, with [`ReplayReport::into_result`].
+//!
+//! It is a check, not a proof, and it is worth knowing what it cannot see: it
+//! observes the *sequence* of durable operations, so non-determinism that leaves
+//! that sequence alone — a clock read no branch turns on, a `HashMap` whose
+//! iteration happens to come out in the recorded order — passes it. The rules
+//! above remain yours to keep.
+//!
 //! # Durable-safe data
 //!
 //! Every value that crosses a durable boundary — a workflow's input and output,
@@ -192,4 +217,4 @@
 //! even across a replay.
 
 #[allow(unused_imports)]
-use crate::{DurableContext, Error, Serializer};
+use crate::{Divergence, DurableContext, DurableEngine, Error, ReplayReport, Serializer};
