@@ -71,16 +71,48 @@ where
 
 /// A position the nesting guard has already cleared.
 ///
-/// Only [`DurableContext::claim_position`] can make one, and [`PendingStep`]
-/// cannot be built holding a position without one, so a durable operation that
-/// forgot to run the check does not compile rather than silently claiming a
-/// position inside a body. It carries the operation's name so that each call
-/// site spells it once.
-#[derive(Clone, Copy)]
-struct Position {
-    seq: i32,
-    operation: &'static str,
+/// Its own module, so that its fields cannot be filled in from anywhere else in
+/// this file: [`Position::claim`] is the only way to make one, and it runs the
+/// check. Since [`PendingStep`] cannot be built holding a position without one,
+/// a durable operation that skips the guard cannot be written by *omission* —
+/// there is nothing to pass. It also carries the operation's name, so each call
+/// site spells it once rather than two or three times.
+mod position {
+    use super::{DurableContext, Result};
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Position {
+        seq: i32,
+        operation: &'static str,
+    }
+
+    impl Position {
+        /// Claim the next position for `operation`, refusing to claim one
+        /// inside another durable operation's body.
+        ///
+        /// The refusal happens before the counter moves, so the calls around a
+        /// refused one keep the positions they would have had — the failure is
+        /// as deterministic as the code that caused it, and a replay refuses in
+        /// the same place.
+        pub(super) fn claim(ctx: &DurableContext, operation: &'static str) -> Result<Self> {
+            ctx.refuse_inside_body(operation)?;
+            Ok(Self {
+                seq: ctx.next_seq(),
+                operation,
+            })
+        }
+
+        pub(super) fn seq(self) -> i32 {
+            self.seq
+        }
+
+        pub(super) fn operation(self) -> &'static str {
+            self.operation
+        }
+    }
 }
+
+use position::Position;
 
 /// Claim the position for a durable operation, or hand the refusal straight
 /// back to the caller as an already-failed call.
@@ -276,30 +308,31 @@ impl DurableContext {
         &self.auth.authenticated_roles
     }
 
+    /// Take the next position, with no check.
+    ///
+    /// Not the way to claim one: [`Position::claim`] is, and going through it is
+    /// what keeps a durable call from claiming a position inside another
+    /// operation's body. The four callers left here are all already past that
+    /// check — [`patch`](Self::patch) and
+    /// [`deprecate_patch`](Self::deprecate_patch), whose position depends on a
+    /// database read and so cannot be claimed when they are built, and the
+    /// second slot [`recv`](Self::recv) and [`get_event`](Self::get_event) take
+    /// for their deadline.
     fn next_seq(&self) -> i32 {
         self.seq.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Claim the next position for `operation`, refusing to claim one inside
-    /// another durable operation's body.
-    ///
-    /// The refusal happens before the counter moves, so the calls around a
-    /// refused one keep the positions they would have had — the failure is as
-    /// deterministic as the code that caused it, and a replay refuses in the
-    /// same place.
+    /// another durable operation's body. See [`Position::claim`].
     fn claim_position(&self, operation: &'static str) -> Result<Position> {
-        self.refuse_inside_body(operation)?;
-        Ok(Position {
-            seq: self.next_seq(),
-            operation,
-        })
+        Position::claim(self, operation)
     }
 
     /// The check itself, for the two durable calls that take their position at
     /// poll time rather than at construction ([`patch`](Self::patch) and
     /// [`deprecate_patch`](Self::deprecate_patch)) and so cannot go through
     /// [`claim_position`](Self::claim_position).
-    fn refuse_inside_body(&self, operation: &'static str) -> Result<()> {
+    pub(super) fn refuse_inside_body(&self, operation: &'static str) -> Result<()> {
         if in_a_body() {
             return Err(Error::NestedDurableCall {
                 workflow_id: self.workflow_id.clone(),
@@ -491,7 +524,7 @@ impl DurableContext {
         };
         let name = name.to_owned();
         let position = claim!(self, "start_workflow");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             // Replay: re-attach to the child already started at this step. A
             // different workflow name recorded here means the parent is
@@ -597,7 +630,7 @@ impl DurableContext {
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let position = claim!(self, "step");
-        let seq = position.seq;
+        let seq = position.seq();
         let span = self.op_span("step", name, seq);
         let name = name.to_owned();
         PendingStep::new(position, async move {
@@ -656,7 +689,7 @@ impl DurableContext {
         Fut: Future<Output = Result<T>> + Send + 'a,
     {
         let position = claim!(self, "step");
-        let seq = position.seq;
+        let seq = position.seq();
         let span = self.op_span("step", &opts.name, seq);
         PendingStep::new(position, async move {
             let out = async {
@@ -766,7 +799,7 @@ impl DurableContext {
         // one workflow, which the guard cannot see, because a task-local scope
         // is not set while a body is between polls.
         let position = claim!(self, "transaction");
-        let seq = position.seq;
+        let seq = position.seq();
         let span = self.op_span("transaction", &opts.name, seq);
         PendingStep::new(position, async move {
             let _guard = self.begin_transaction()?;
@@ -913,7 +946,7 @@ impl DurableContext {
         T: Serialize + DeserializeOwned + 'static,
         F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
-        let seq = self.claim_position("transaction")?.seq;
+        let seq = self.claim_position("transaction")?.seq();
         let _guard = self.begin_transaction()?;
 
         let span = self.op_span("transaction", &opts.name, seq);
@@ -1449,7 +1482,7 @@ impl DurableContext {
             return PendingStep::failed(Error::app("select requires at least one branch"));
         }
         let position = claim!(self, "select");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if let Some(stored) = self
                 .replay_or_guard::<(usize, T)>(seq, "DBOS.select")
@@ -1638,7 +1671,7 @@ impl DurableContext {
     #[doc(alias = "delay")]
     pub fn sleep(&self, dur: Duration) -> PendingStep<'_, ()> {
         let position = claim!(self, "sleep");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             let wake_at = self.durable_wake_at(seq, dur).await?;
             let now = chrono::Utc::now();
@@ -1745,7 +1778,10 @@ impl DurableContext {
             Ok(position) => position,
             Err(e) => return PendingStep::failed(e),
         };
-        PendingStep::new(position, self.durable_value_at(position.seq, name, produce))
+        PendingStep::new(
+            position,
+            self.durable_value_at(position.seq(), name, produce),
+        )
     }
 
     /// [`durable_value`](Self::durable_value)'s run, once the position is claimed.
@@ -1825,7 +1861,7 @@ impl DurableContext {
         let destination_id = destination_id.to_owned();
         let topic = topic.to_owned();
         let position = claim!(self, "send");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
                 return Ok(());
@@ -1867,7 +1903,7 @@ impl DurableContext {
     ) -> PendingStep<'_, ()> {
         let id = id.to_owned();
         let position = claim!(self, "set_workflow_attributes");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if let Some(_done) = self
                 .replay_or_guard::<Value>(seq, "DBOS.updateWorkflowAttributes")
@@ -1915,7 +1951,7 @@ impl DurableContext {
             Err(e) => return PendingStep::failed(e),
         };
         let position = claim!(self, "send_bulk");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send_bulk").await? {
                 return Ok(());
@@ -1970,7 +2006,7 @@ impl DurableContext {
     ) -> PendingStep<'a, Option<T>> {
         let topic = topic.to_owned();
         let position = claim!(self, "recv");
-        let seq = position.seq;
+        let seq = position.seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(position, async move {
             if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
@@ -2049,7 +2085,7 @@ impl DurableContext {
         };
         let key = key.to_owned();
         let position = claim!(self, "set_event");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.setEvent").await? {
                 return Ok(());
@@ -2103,7 +2139,7 @@ impl DurableContext {
         let target_workflow_id = target_workflow_id.to_owned();
         let key = key.to_owned();
         let position = claim!(self, "get_event");
-        let seq = position.seq;
+        let seq = position.seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(position, async move {
             if let Some(stored) = self
@@ -2199,7 +2235,7 @@ impl DurableContext {
         };
         let key = key.to_owned();
         let position = claim!(self, "write_stream");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if self
                 .replay_or_guard::<Value>(seq, "DBOS.writeStream")
@@ -2233,7 +2269,7 @@ impl DurableContext {
     pub fn close_stream(&self, key: &str) -> PendingStep<'_, ()> {
         let key = key.to_owned();
         let position = claim!(self, "close_stream");
-        let seq = position.seq;
+        let seq = position.seq();
         PendingStep::new(position, async move {
             if self
                 .replay_or_guard::<Value>(seq, "DBOS.closeStream")
@@ -2471,7 +2507,7 @@ impl<'a, T> PendingStep<'a, T> {
     fn new(position: Position, running: impl Future<Output = Result<T>> + Send + 'a) -> Self {
         Self {
             running: Box::pin(running),
-            claimed: Some(position.operation),
+            claimed: Some(position.operation()),
         }
     }
 
