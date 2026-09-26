@@ -8,6 +8,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: checkpoint storage failures stop the execution with
+  `Error::RecoveryRequired` instead of finalizing a business failure.** Catching
+  the error no longer permits the workflow to finish successfully or continue
+  durable work. Schedule recovery after restoring storage access; committed
+  records replay, while uncommitted plain steps may repeat. User-body database
+  errors remain ordinary recorded failures. Lost terminal-write responses are
+  reconciled with the stored workflow status. Exhaustive matches on `Error`
+  need an arm for the new variant.
+
 - **Breaking: recorded failures return the same error representation on the
   initial execution and replay.** Built-in variants retain their fields;
   live driver, migration, and JSON errors become `Error::Recorded`, preserving

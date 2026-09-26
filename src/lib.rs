@@ -187,6 +187,7 @@ mod datasource;
 mod debounce;
 mod engine;
 mod error;
+mod execution;
 mod handle;
 mod memory;
 #[cfg(feature = "postgres")]
@@ -277,3 +278,8 @@ pub use durare_macros::transaction;
 /// from user crates without them depending on `inventory` directly.
 #[doc(hidden)]
 pub use inventory;
+
+#[cfg(test)]
+extern crate self as durare;
+#[cfg(test)]
+mod checkpoint_recovery_tests;

@@ -3258,7 +3258,14 @@ async fn run_to_completion(
     // write below — which would strand the row PENDING with observers waiting
     // forever (finding F1). Steps catch their own panics (subject to retry);
     // this handles a panic in the workflow body itself.
+    let execution = ctx.execution();
     let run = AssertUnwindSafe(handler(ctx, input)).catch_unwind();
+    let run = async {
+        tokio::select! {
+            result = run => result,
+            error = execution.failed() => Ok(Err(error)),
+        }
+    };
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
     // future is dropped (cancelled at its next await) and the workflow is
@@ -3274,9 +3281,8 @@ async fn run_to_completion(
             match tokio::time::timeout(Duration::from_millis(remaining), run).await {
                 Ok(caught) => caught,
                 Err(_elapsed) => {
-                    let landed = provider
-                        .set_workflow_status(&id, STATUS_CANCELLED, None, Some("deadline exceeded"))
-                        .await?;
+                    execution.check()?;
+                    let landed = write_terminal_status(&provider, &id, STATUS_CANCELLED, None, Some("deadline exceeded")).await?;
                     if !landed {
                         // The row completed (or was moved) before the deadline
                         // write landed; the recorded outcome wins.
@@ -3299,6 +3305,9 @@ async fn run_to_completion(
     // checkpoints, bounded by the recovery-attempt cap (a deterministic panic
     // eventually dead-letters). Surface the panic to the owning caller, but write
     // no terminal status.
+    // A handled error is still a failed execution: no terminal status may be
+    // invented after a checkpoint read/write or decoding failure.
+    execution.check()?;
     let result = match caught {
         Ok(returned) => returned,
         Err(payload) => {
@@ -3312,9 +3321,7 @@ async fn run_to_completion(
 
     match result {
         Ok(output) => {
-            let landed = provider
-                .set_workflow_status(&id, STATUS_SUCCESS, Some(&output), None)
-                .await?;
+            let landed = write_terminal_status(&provider, &id, STATUS_SUCCESS, Some(&output), None).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
             }
@@ -3332,9 +3339,7 @@ async fn run_to_completion(
         Err(Error::Cancelled(_)) => {
             // The workflow stopped because it was cancelled; reflect that
             // terminal state rather than ERROR.
-            let landed = provider
-                .set_workflow_status(&id, STATUS_CANCELLED, None, Some("cancelled"))
-                .await?;
+            let landed = write_terminal_status(&provider, &id, STATUS_CANCELLED, None, Some("cancelled")).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
             }
@@ -3346,9 +3351,7 @@ async fn run_to_completion(
             // Encode once and return the same representation a polling handle
             // or recovered execution will read, rather than the live error.
             let stored = crate::serialize::encode_error(&provider.serializer(), &e);
-            let landed = provider
-                .set_workflow_status(&id, STATUS_ERROR, None, Some(&stored))
-                .await?;
+            let landed = write_terminal_status(&provider, &id, STATUS_ERROR, None, Some(&stored)).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
             }
@@ -3363,6 +3366,31 @@ async fn run_to_completion(
     }
     .instrument(span)
     .await
+}
+
+async fn write_terminal_status(
+    provider: &Arc<dyn StateProvider>,
+    id: &str,
+    status: &str,
+    output: Option<&Value>,
+    error: Option<&str>,
+) -> Result<bool> {
+    match provider
+        .set_workflow_status(id, status, output, error)
+        .await
+    {
+        Ok(landed) => Ok(landed),
+        Err(error) => {
+            // The commit may have succeeded. A terminal readback is evidence;
+            // an unavailable/nonterminal read is not permission to finalize.
+            if let Ok(Some(recorded)) = provider.get_workflow_status(id).await {
+                if is_terminal(&recorded.status) {
+                    return Ok(false); // the caller adopts the stored outcome
+                }
+            }
+            Err(Error::RecoveryRequired(Arc::new(error)))
+        }
+    }
 }
 
 /// Park a losing execution on the recorded outcome: poll the status row until
