@@ -23,6 +23,8 @@ pub(crate) const NAME: &str = "durare.RecordedError";
 #[allow(dead_code)]
 enum ErrorWire {
     #[serde(skip)]
+    RecoveryRequired(std::sync::Arc<Error>),
+    #[serde(skip)]
     Db(sqlx::Error),
     #[serde(skip)]
     Migrate(sqlx::migrate::MigrateError),
@@ -124,7 +126,7 @@ pub(crate) fn encode(serializer: &Serializer, error: &Error) -> Option<String> {
     }
     let captured;
     let recordable = match error {
-        Error::Db(_) | Error::Migrate(_) | Error::Serde(_) => {
+        Error::Db(_) | Error::Migrate(_) | Error::Serde(_) | Error::RecoveryRequired(_) => {
             captured = Error::Recorded(Box::new(RecordedError::capture(error)));
             &captured
         }
@@ -148,6 +150,15 @@ pub(crate) fn encode(serializer: &Serializer, error: &Error) -> Option<String> {
 /// Decode a stored failure only once: escaped application errors can themselves
 /// contain the prefix or reserved portable name, without recursive interpretation.
 pub(crate) fn from_parts(message: String, info: Option<PortableWorkflowError>) -> Error {
+    try_from_parts(message, info).unwrap_or_else(|error| error)
+}
+
+/// Separate an unreadable record from the business error that a valid record
+/// contains. Only the former interrupts execution instead of replaying a result.
+pub(crate) fn try_from_parts(
+    message: String,
+    info: Option<PortableWorkflowError>,
+) -> crate::Result<Error> {
     match info {
         Some(info) if info.name == NAME => {
             let decode = || -> crate::Result<Error> {
@@ -160,7 +171,7 @@ pub(crate) fn from_parts(message: String, info: Option<PortableWorkflowError>) -
                 }
                 Ok(serde_json::from_value::<OwnedError>(payload.error)?.0)
             };
-            decode().unwrap_or_else(|error| {
+            decode().map_err(|error| {
                 Error::Serialization(format!("cannot decode recorded error: {error}"))
             })
         }
@@ -169,16 +180,18 @@ pub(crate) fn from_parts(message: String, info: Option<PortableWorkflowError>) -
                 && info.code.is_none()
                 && info.data.is_none() =>
         {
-            Error::NotAuthorized(info.message)
+            Ok(Error::NotAuthorized(info.message))
         }
-        Some(info) => Error::Portable(Box::new(info)),
+        Some(info) => Ok(Error::Portable(Box::new(info))),
         None if message.starts_with(PREFIX) => {
             match serde_json::from_str::<PortableWorkflowError>(&message[PREFIX.len()..]) {
-                Ok(info) if info.name == NAME => from_parts(info.message.clone(), Some(info)),
-                _ => Error::Serialization("cannot decode recorded error envelope".into()),
+                Ok(info) if info.name == NAME => try_from_parts(info.message.clone(), Some(info)),
+                _ => Err(Error::Serialization(
+                    "cannot decode recorded error envelope".into(),
+                )),
             }
         }
-        None => Error::app(message),
+        None => Ok(Error::app(message)),
     }
 }
 

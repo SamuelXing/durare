@@ -81,10 +81,11 @@ where
 mod position {
     use super::{DurableContext, Result};
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     pub(super) struct Position {
         seq: i32,
         operation: &'static str,
+        pub(super) execution: crate::execution::Execution,
     }
 
     impl Position {
@@ -100,14 +101,15 @@ mod position {
             Ok(Self {
                 seq: ctx.next_seq(),
                 operation,
+                execution: ctx.execution.clone(),
             })
         }
 
-        pub(super) fn seq(self) -> i32 {
+        pub(super) fn seq(&self) -> i32 {
             self.seq
         }
 
-        pub(super) fn operation(self) -> &'static str {
+        pub(super) fn operation(&self) -> &'static str {
             self.operation
         }
     }
@@ -281,6 +283,7 @@ pub struct DurableContext {
     // points at is shared, which is the point — a divergence a clone runs into
     // has to be visible to the verifier.
     verify: Option<Arc<Verification>>,
+    execution: crate::execution::Execution,
 }
 
 impl DurableContext {
@@ -293,6 +296,7 @@ impl DurableContext {
             seq: Arc::new(AtomicI32::new(0)),
             in_transaction: Arc::new(AtomicBool::new(false)),
             verify: None,
+            execution: Default::default(),
         }
     }
 
@@ -314,6 +318,10 @@ impl DurableContext {
             verify: Some(verification),
             ..Self::new(workflow_id, runtime, auth)
         }
+    }
+
+    pub(crate) fn execution(&self) -> crate::execution::Execution {
+        self.execution.clone()
     }
 
     /// The id of the workflow this context belongs to.
@@ -366,6 +374,7 @@ impl DurableContext {
     /// [`deprecate_patch`](Self::deprecate_patch)) and so cannot go through
     /// [`claim_position`](Self::claim_position).
     pub(super) fn refuse_inside_body(&self, operation: &'static str) -> Result<()> {
+        self.execution.check()?;
         if in_a_body() {
             return Err(Error::NestedDurableCall {
                 workflow_id: self.workflow_id.clone(),
@@ -543,14 +552,20 @@ impl DurableContext {
         self.refuse_inside_body("patch")?;
         let seq = self.current_step_id();
         let marker = format!("{PATCH_PREFIX}{name}");
-        let patched = match self.provider.get_step_name(&self.workflow_id, seq).await? {
+        let patched = match self
+            .provider
+            .get_step_name(&self.workflow_id, seq)
+            .await
+            .map_err(|error| self.execution.record(error))?
+        {
             // Not seen before: record the marker and take the new path. The
             // marker is a write, so a verification run stops here instead.
             None => {
                 self.refuse_live_work(seq, &marker)?;
                 self.provider
                     .record_patch(&self.workflow_id, seq, &marker)
-                    .await?;
+                    .await
+                    .map_err(|error| self.execution.record(error))?;
                 true
             }
             // Our own marker (a replay/recovery of a patched run): new path.
@@ -584,7 +599,8 @@ impl DurableContext {
         if self
             .provider
             .get_step_name(&self.workflow_id, seq)
-            .await?
+            .await
+            .map_err(|error| self.execution.record(error))?
             .as_deref()
             == Some(marker.as_str())
         {
@@ -661,7 +677,8 @@ impl DurableContext {
             if let Some((child_id, recorded)) = self
                 .provider
                 .check_child_workflow(&self.workflow_id, seq)
-                .await?
+                .await
+                .map_err(|error| self.execution.record(error))?
             {
                 self.check_recorded(seq, &name, &recorded)?;
                 return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
@@ -708,10 +725,12 @@ impl DurableContext {
                     &self.workflow_id,
                     child_auth,
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_child_workflow(&self.workflow_id, seq, &name, &child_id)
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
 
             Ok(WorkflowHandle::polling(child_id, self.provider.clone()))
         })
@@ -953,11 +972,28 @@ impl DurableContext {
                         Ok::<_, Error>(serde_json::to_value(out)?)
                     })
                 });
-                let value = self
+                let result = self
                     .provider
                     .run_transaction_step(&self.workflow_id, seq, started, &opts, body)
-                    .await?;
-                Ok(serde_json::from_value(value)?)
+                    .await;
+                match result {
+                    Ok(value) => self.recorded_value(StepOutcome::Output(value)),
+                    Err(error) if !crate::execution::is_storage_failure(&error) => Err(error),
+                    Err(error) => {
+                        // The provider API returns both recorded body errors and
+                        // storage failures as Err. Only a durable row establishes
+                        // an outcome; it also resolves a lost commit response.
+                        let recorded = self
+                            .execution
+                            .storage(self.provider.get_step_result(&self.workflow_id, seq).await)?;
+                        if let Some(recorded) = recorded {
+                            self.check_recorded(seq, &opts.name, &recorded.name)?;
+                            self.recorded_value(recorded.outcome)
+                        } else {
+                            Err(self.execution.record(error))
+                        }
+                    }
+                }
             }
             .instrument(span.clone())
             .await;
@@ -1155,7 +1191,10 @@ impl DurableContext {
         // Layer 2: a completion row without a checkpoint — the application
         // transaction committed but the run crashed before the system commit.
         // Replay the stored outcome without re-running the body.
-        if let Some(row) = ds.fetch_completion(&self.workflow_id, seq).await? {
+        if let Some(row) = self
+            .execution
+            .storage(ds.fetch_completion(&self.workflow_id, seq).await)?
+        {
             return self
                 .replay_completion_row(seq, &opts.name, row, started)
                 .await;
@@ -1174,6 +1213,7 @@ impl DurableContext {
             let outcome = loop {
                 match self.datasource_attempt(ds, opts, f, seq, &ser).await {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
+                    Ok(DsAttempt::BodyFailed(error)) => break Err(error),
                     // Another execution committed this step first. An identical
                     // stored row is a replay/retry of this same logical write —
                     // converge on it. A divergent one is a live rival execution:
@@ -1182,13 +1222,17 @@ impl DurableContext {
                     Ok(DsAttempt::AlreadyCompleted { value }) => {
                         let row = ds
                             .fetch_completion(&self.workflow_id, seq)
-                            .await?
+                            .await
+                            .map_err(|error| self.execution.record(error))?
                             .ok_or_else(|| {
-                                Error::app(
+                                self.execution.interrupt(Error::app(
                                     "transaction_completion row vanished after a duplicate insert",
-                                )
+                                ))
                             })?;
-                        if !completion_row_matches(&ser, &row, &value)? {
+                        if !self
+                            .execution
+                            .storage(completion_row_matches(&ser, &row, &value))?
+                        {
                             return Err(Error::WorkflowConflict(self.workflow_id.clone()));
                         }
                         return self
@@ -1199,7 +1243,7 @@ impl DurableContext {
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
-                    Err(e) => break Err(e),
+                    Err(e) => return Err(self.execution.record(e)),
                 }
             };
             match outcome {
@@ -1218,8 +1262,9 @@ impl DurableContext {
                             Some(started),
                             Some(self.runtime.executor_id()),
                         )
-                        .await?;
-                    return outcome_value(stored);
+                        .await
+                        .map_err(|error| self.execution.record(error))?;
+                    return self.recorded_value(stored);
                 }
                 Err(e) if opts.should_user_retry(&e, user_attempt) => {
                     let delay = opts.user_retry_backoff(user_attempt);
@@ -1277,14 +1322,20 @@ impl DurableContext {
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
         match in_body(|| f(&mut *tx)).await {
             Ok(v) => {
-                let value = serde_json::to_value(v)?;
+                let value = match serde_json::to_value(v) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = ds.rollback(tx).await;
+                        return Ok(DsAttempt::BodyFailed(error.into()));
+                    }
+                };
                 // A body that ended our transaction via raw SQL would make the
                 // completion row commit separately from the writes it
                 // witnesses — detect and refuse instead of breaking atomicity.
                 if let Some(expected) = &fingerprint {
                     if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
                         let _ = ds.rollback(tx).await;
-                        return Err(Error::app(TX_TERMINATED_MSG));
+                        return Ok(DsAttempt::BodyFailed(Error::app(TX_TERMINATED_MSG)));
                     }
                 }
                 // A read-only body writes nothing, so there is nothing for
@@ -1316,7 +1367,11 @@ impl DurableContext {
             }
             Err(e) => {
                 let _ = ds.rollback(tx).await;
-                Err(e)
+                if e.should_retry_live_transaction() {
+                    Err(e)
+                } else {
+                    Ok(DsAttempt::BodyFailed(e))
+                }
             }
         }
     }
@@ -1351,6 +1406,7 @@ impl DurableContext {
                     .await
                 {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
+                    Ok(DsAttempt::BodyFailed(error)) => break Err(error),
                     // Another execution checkpointed this step first. An
                     // identical recorded output is a replay/retry of this same
                     // logical write — converge on it. Anything else is a live
@@ -1361,9 +1417,12 @@ impl DurableContext {
                         let rec = self
                             .provider
                             .get_step_result(&self.workflow_id, seq)
-                            .await?
+                            .await
+                            .map_err(|error| self.execution.record(error))?
                             .ok_or_else(|| {
-                                Error::app("checkpoint row vanished after a duplicate insert")
+                                self.execution.interrupt(Error::app(
+                                    "checkpoint row vanished after a duplicate insert",
+                                ))
                             })?;
                         self.check_recorded(seq, &opts.name, &rec.name)?;
                         if !matches!(&rec.outcome, StepOutcome::Output(stored) if *stored == value)
@@ -1371,13 +1430,13 @@ impl DurableContext {
                             return Err(Error::WorkflowConflict(self.workflow_id.clone()));
                         }
                         tracing::Span::current().record("dbos.step.replayed", true);
-                        return Ok(serde_json::from_value(value)?);
+                        return self.recorded_value(StepOutcome::Output(value));
                     }
                     Err(e) if e.should_retry_live_transaction() => {
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
-                    Err(e) => break Err(e),
+                    Err(e) => return Err(self.execution.record(e)),
                 }
             };
             match outcome {
@@ -1398,10 +1457,11 @@ impl DurableContext {
                                 Some(started),
                                 Some(self.runtime.executor_id()),
                             )
-                            .await?;
-                        return outcome_value(stored);
+                            .await
+                            .map_err(|error| self.execution.record(error))?;
+                        return self.recorded_value(stored);
                     }
-                    return Ok(serde_json::from_value(value)?);
+                    return self.recorded_value(StepOutcome::Output(value));
                 }
                 Err(e) if opts.should_user_retry(&e, user_attempt) => {
                     let delay = opts.user_retry_backoff(user_attempt);
@@ -1447,13 +1507,19 @@ impl DurableContext {
         let fingerprint = ds.tx_fingerprint(&mut *tx).await?;
         match in_body(|| f(&mut *tx)).await {
             Ok(v) => {
-                let value = serde_json::to_value(v)?;
+                let value = match serde_json::to_value(v) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = ds.rollback(tx).await;
+                        return Ok(DsAttempt::BodyFailed(error.into()));
+                    }
+                };
                 // Ending our transaction via raw SQL would split the writes
                 // from their checkpoint — detect and refuse.
                 if let Some(expected) = &fingerprint {
                     if ds.tx_fingerprint(&mut *tx).await?.as_ref() != Some(expected) {
                         let _ = ds.rollback(tx).await;
-                        return Err(Error::app(TX_TERMINATED_MSG));
+                        return Ok(DsAttempt::BodyFailed(Error::app(TX_TERMINATED_MSG)));
                     }
                 }
                 // A read-only body has no writes to make atomic with the
@@ -1489,7 +1555,11 @@ impl DurableContext {
             }
             Err(e) => {
                 let _ = ds.rollback(tx).await;
-                Err(e)
+                if e.should_retry_live_transaction() {
+                    Err(e)
+                } else {
+                    Ok(DsAttempt::BodyFailed(e))
+                }
             }
         }
     }
@@ -1509,11 +1579,10 @@ impl DurableContext {
         if let Some(err_text) = row.error.as_deref() {
             let (message, info) =
                 crate::serialize::decode_error(row.serialization.as_deref(), err_text);
-            let encoded = crate::serialize::encode_stored_error(
-                &self.provider.serializer(),
-                &message,
-                info.as_ref(),
-            );
+            let error = self
+                .execution
+                .storage(crate::recorded_error::try_from_parts(message, info))?;
+            let encoded = crate::serialize::encode_error(&self.provider.serializer(), &error);
             let stored = self
                 .provider
                 .record_step_result(
@@ -1525,15 +1594,21 @@ impl DurableContext {
                     Some(started),
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
-            return outcome_value(stored);
+                .await
+                .map_err(|error| self.execution.record(error))?;
+            return self.recorded_value(stored);
         }
-        let output = row
-            .output
-            .as_deref()
-            .ok_or_else(|| Error::app("transaction completion row has neither output nor error"))?;
+        let output = row.output.as_deref().ok_or_else(|| {
+            self.execution.interrupt(Error::app(
+                "transaction completion row has neither output nor error",
+            ))
+        })?;
         let ser = self.provider.serializer();
-        let value = crate::serialize::decode(&ser, row.serialization.as_deref(), output)?;
+        let value = self.execution.storage(crate::serialize::decode(
+            &ser,
+            row.serialization.as_deref(),
+            output,
+        ))?;
         let stored = self
             .provider
             .record_step_result(
@@ -1545,8 +1620,9 @@ impl DurableContext {
                 Some(started),
                 Some(self.runtime.executor_id()),
             )
-            .await?;
-        outcome_value(stored)
+            .await
+            .map_err(|error| self.execution.record(error))?;
+        self.recorded_value(stored)
     }
 
     /// Back off after an application-database conflict, bailing out if the
@@ -1555,7 +1631,10 @@ impl DurableContext {
     /// actually cancelled.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
     async fn datasource_conflict_wait(&self, attempt: u32) -> Result<()> {
-        if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
+        if let Some(status) = self
+            .execution
+            .storage(self.provider.get_workflow_status(&self.workflow_id).await)?
+        {
             if status.status == STATUS_CANCELLED {
                 return Err(Error::Cancelled(self.workflow_id.clone()));
             }
@@ -1663,7 +1742,8 @@ impl DurableContext {
         if let Some(rec) = self
             .provider
             .get_step_result(&self.workflow_id, seq)
-            .await?
+            .await
+            .map_err(|error| self.execution.record(error))?
         {
             self.check_recorded(seq, expected, &rec.name)?;
             // Mark the enclosing operation span; a no-op for callers without
@@ -1671,7 +1751,7 @@ impl DurableContext {
             tracing::Span::current().record("dbos.step.replayed", true);
             // A recorded failure replays as its error, so a failed step is not
             // re-run (and a non-deterministic step cannot succeed on replay).
-            return Ok(Some(outcome_value(rec.outcome)?));
+            return Ok(Some(self.recorded_value(rec.outcome)?));
         }
         // Nothing recorded here: a live run proceeds from this position, a
         // verification run stops at it.
@@ -1690,12 +1770,29 @@ impl DurableContext {
         if let Some(stored) = self.serve_recorded(seq, expected).await? {
             return Ok(Some(stored));
         }
-        if let Some(status) = self.provider.get_workflow_status(&self.workflow_id).await? {
+        if let Some(status) = self
+            .execution
+            .storage(self.provider.get_workflow_status(&self.workflow_id).await)?
+        {
             if status.status == STATUS_CANCELLED {
                 return Err(Error::Cancelled(self.workflow_id.clone()));
             }
         }
         Ok(None)
+    }
+
+    fn recorded_value<T: DeserializeOwned>(&self, outcome: StepOutcome) -> Result<T> {
+        match outcome {
+            // Converting an already-recorded JSON value to the user's type is
+            // an ordinary, repeatable API error, not failure to read storage.
+            StepOutcome::Output(value) => serde_json::from_value(value).map_err(Error::from),
+            StepOutcome::Failure { message, info } => {
+                let error = self
+                    .execution
+                    .storage(crate::recorded_error::try_from_parts(message, info))?;
+                Err(error)
+            }
+        }
     }
 
     /// Durably record a successful `result` under `(workflow_id, seq)` and return
@@ -1709,7 +1806,17 @@ impl DurableContext {
         result: T,
         started_at_ms: Option<i64>,
     ) -> Result<T> {
-        let json = serde_json::to_value(&result)?;
+        self.execution.check()?;
+        let json = match serde_json::to_value(&result) {
+            Ok(value) => value,
+            Err(error) => {
+                // The body already ran. Persist this deterministic result
+                // encoding failure so recovery does not repeat its effects.
+                return self
+                    .record_failure(seq, name, error.into(), started_at_ms)
+                    .await;
+            }
+        };
         let outcome = self
             .provider
             .record_step_result(
@@ -1721,8 +1828,9 @@ impl DurableContext {
                 started_at_ms,
                 Some(self.runtime.executor_id()),
             )
-            .await?;
-        outcome_value(outcome)
+            .await
+            .map_err(|error| self.execution.record(error))?;
+        self.recorded_value(outcome)
     }
 
     /// Durably record a failed step's error under `(workflow_id, seq)`. Returns
@@ -1735,6 +1843,7 @@ impl DurableContext {
         err: Error,
         started_at_ms: Option<i64>,
     ) -> Result<T> {
+        self.execution.check()?;
         let encoded = crate::serialize::encode_error(&self.provider.serializer(), &err);
         let outcome = self
             .provider
@@ -1747,8 +1856,9 @@ impl DurableContext {
                 started_at_ms,
                 Some(self.runtime.executor_id()),
             )
-            .await?;
-        outcome_value(outcome)
+            .await
+            .map_err(|error| self.execution.record(error))?;
+        self.recorded_value(outcome)
     }
 
     /// Drive `f` to success, retrying on error per `opts` with exponential
@@ -1881,10 +1991,8 @@ impl DurableContext {
             Ok(position) => position,
             Err(e) => return PendingStep::failed(e),
         };
-        PendingStep::new(
-            position,
-            self.durable_value_at(position.seq(), name, produce),
-        )
+        let seq = position.seq();
+        PendingStep::new(position, self.durable_value_at(seq, name, produce))
     }
 
     /// [`durable_value`](Self::durable_value)'s run, once the position is
@@ -1950,7 +2058,8 @@ impl DurableContext {
             }
             self.provider
                 .insert_notification(&destination_id, &topic, encoded, None)
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_step_result(
                     &self.workflow_id,
@@ -1961,7 +2070,8 @@ impl DurableContext {
                     None,
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             Ok(())
         })
     }
@@ -1995,7 +2105,8 @@ impl DurableContext {
             }
             self.provider
                 .set_workflow_attributes(&id, attributes.as_ref())
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_step_result(
                     &self.workflow_id,
@@ -2006,7 +2117,8 @@ impl DurableContext {
                     None,
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             Ok(())
         })
     }
@@ -2038,7 +2150,10 @@ impl DurableContext {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send_bulk").await? {
                 return Ok(());
             }
-            self.provider.insert_notifications(&rows).await?;
+            self.provider
+                .insert_notifications(&rows)
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_step_result(
                     &self.workflow_id,
@@ -2049,7 +2164,8 @@ impl DurableContext {
                     None,
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             Ok(())
         })
     }
@@ -2104,9 +2220,10 @@ impl DurableContext {
                 if let Some(msg) = self
                     .provider
                     .consume_notification(&self.workflow_id, &topic, seq, "DBOS.recv")
-                    .await?
+                    .await
+                    .map_err(|error| self.execution.record(error))?
                 {
-                    return Ok(Some(serde_json::from_value(msg)?));
+                    return self.recorded_value(StepOutcome::Output(msg)).map(Some);
                 }
 
                 // Mailbox empty: fix the durable deadline (first miss only), then
@@ -2130,7 +2247,8 @@ impl DurableContext {
                             None,
                             Some(self.runtime.executor_id()),
                         )
-                        .await?;
+                        .await
+                        .map_err(|error| self.execution.record(error))?;
                     return Ok(None);
                 }
                 let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
@@ -2181,7 +2299,8 @@ impl DurableContext {
             }
             self.provider
                 .upsert_event(&self.workflow_id, &key, encoded)
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_step_result(
                     &self.workflow_id,
@@ -2192,7 +2311,8 @@ impl DurableContext {
                     None,
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             Ok(())
         })
     }
@@ -2247,7 +2367,8 @@ impl DurableContext {
                 if let Some(value) = self
                     .provider
                     .get_event_value(&target_workflow_id, &key)
-                    .await?
+                    .await
+                    .map_err(|error| self.execution.record(error))?
                 {
                     let outcome = self
                         .provider
@@ -2260,8 +2381,9 @@ impl DurableContext {
                             None,
                             Some(self.runtime.executor_id()),
                         )
-                        .await?;
-                    return Ok(Some(outcome_value(outcome)?));
+                        .await
+                        .map_err(|error| self.execution.record(error))?;
+                    return Ok(Some(self.recorded_value(outcome)?));
                 }
 
                 let deadline = match deadline {
@@ -2283,7 +2405,8 @@ impl DurableContext {
                             None,
                             Some(self.runtime.executor_id()),
                         )
-                        .await?;
+                        .await
+                        .map_err(|error| self.execution.record(error))?;
                     return Ok(None);
                 }
                 let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
@@ -2342,7 +2465,8 @@ impl DurableContext {
             }
             self.provider
                 .write_stream(&self.workflow_id, &key, Some(encoded), seq)
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_step_result(
                     &self.workflow_id,
@@ -2353,7 +2477,8 @@ impl DurableContext {
                     None,
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             Ok(())
         })
     }
@@ -2376,7 +2501,8 @@ impl DurableContext {
             }
             self.provider
                 .write_stream(&self.workflow_id, &key, None, seq)
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_step_result(
                     &self.workflow_id,
@@ -2387,7 +2513,8 @@ impl DurableContext {
                     None,
                     Some(self.runtime.executor_id()),
                 )
-                .await?;
+                .await
+                .map_err(|error| self.execution.record(error))?;
             Ok(())
         })
     }
@@ -2507,6 +2634,8 @@ impl Drop for TxFlagGuard<'_> {
 enum DsAttempt {
     /// The body ran and its transaction committed; carries the JSON output.
     Committed(Value),
+    /// A user body failure, distinct from transaction/checkpoint machinery.
+    BodyFailed(Error),
     /// A completion row already existed — another execution committed this
     /// step first, and this attempt rolled back. Carries the output this
     /// attempt computed, so the caller can classify the stored row: identical
@@ -2537,13 +2666,6 @@ fn completion_row_matches(
     }
     let stored = crate::serialize::decode(ser, row.serialization.as_deref(), output)?;
     Ok(stored == *value)
-}
-
-/// Turn a recorded step outcome into the typed value a step returns: a recorded
-/// output is deserialized; a recorded failure is surfaced as its reconstructed
-/// error (so a replayed failed step returns the same error without re-running).
-fn outcome_value<T: DeserializeOwned>(outcome: StepOutcome) -> Result<T> {
-    Ok(serde_json::from_value(outcome.into_value_result()?)?)
 }
 
 /// The absolute instant a durable timer started now would fire at. A duration
@@ -2604,6 +2726,7 @@ pub struct PendingStep<'a, T> {
     /// before it claimed one. A refusal must report why it was refused wherever
     /// it is awaited, rather than being refused a second time for being there.
     claimed: Option<&'static str>,
+    execution: Option<crate::execution::Execution>,
 }
 
 impl<'a, T> PendingStep<'a, T> {
@@ -2612,6 +2735,7 @@ impl<'a, T> PendingStep<'a, T> {
         Self {
             running: Box::pin(running),
             claimed: Some(position.operation()),
+            execution: Some(position.execution),
         }
     }
 
@@ -2621,6 +2745,7 @@ impl<'a, T> PendingStep<'a, T> {
         Self {
             running: Box::pin(async move { Err(e) }),
             claimed: None,
+            execution: None,
         }
     }
 }
@@ -2641,6 +2766,11 @@ impl<T> Future for PendingStep<'_, T> {
         if let Some(operation) = self.claimed {
             if in_a_body() {
                 return Poll::Ready(Err(Error::DurableCallCrossedBody(operation.to_owned())));
+            }
+        }
+        if let Some(execution) = &self.execution {
+            if let Err(error) = execution.check() {
+                return Poll::Ready(Err(error));
             }
         }
         self.running.as_mut().poll(cx)

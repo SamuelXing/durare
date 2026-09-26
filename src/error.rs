@@ -11,6 +11,9 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorCode {
+    /// Storage or decoding failed during execution; recovery must reconcile
+    /// durable state before the workflow can continue.
+    RecoveryRequired,
     /// A database query or connection failed.
     Database,
     /// Setting up the system database (e.g. running migrations) failed.
@@ -63,6 +66,12 @@ pub enum ErrorCode {
 /// the `is_*` helpers to classify the underlying database failure.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// The execution stopped at a storage or decoding boundary. This is not a
+    /// recorded business failure. The workflow remains recoverable unless a
+    /// concurrent terminal transition already committed. See the durability guide.
+    #[error("workflow execution requires recovery: {0}")]
+    RecoveryRequired(#[source] std::sync::Arc<Error>),
+
     /// A persisted driver, migration, or JSON error. Its message, [`code`](Self::code),
     /// and `is_*` classifications survive replay; its original source object does
     /// not. A durable boundary returns this on the initial execution too.
@@ -327,6 +336,7 @@ impl Error {
     /// The stable [`ErrorCode`] for this error, for programmatic handling.
     pub fn code(&self) -> ErrorCode {
         match self {
+            Error::RecoveryRequired(_) => ErrorCode::RecoveryRequired,
             Error::Recorded(error) => error.code,
             Error::Db(_) => ErrorCode::Database,
             Error::Migrate(_) => ErrorCode::Initialization,

@@ -121,8 +121,41 @@
 //! `non_exhaustive` supports source evolution, not wire forward compatibility.
 //! No schema migration is required.
 //!
-//! These rules describe recorded outcomes. They do not make a checkpoint write
-//! succeed or change the engine's handling of infrastructure failures.
+//! # Storage failures during execution
+//!
+//! A checkpoint read/write failure or unreadable stored envelope is not a
+//! business outcome.
+//! The execution stops with [`Error::RecoveryRequired`], retaining the original
+//! cause. The engine does not write `ERROR` or `SUCCESS` for that execution,
+//! even if workflow code catches the error. Further durable calls on the same
+//! context (including its clones and already-built calls) refuse to run.
+//! An in-flight database commit or an external effect can still finish; stopping
+//! the execution does not undo either one.
+//!
+//! Recovery reads durable state again. If a checkpoint committed but its reply
+//! was lost, recovery serves that record. If no checkpoint committed, the body
+//! can run again: use an idempotency key or an atomic transaction for side
+//! effects. A failed terminal-status write is read back too; an existing
+//! terminal outcome wins, otherwise the caller receives `RecoveryRequired`.
+//! Concurrent cancellation/completion may already have changed the stored status.
+//!
+//! Recovery must be scheduled through the engine's existing recovery APIs; this
+//! error does not start an automatic retry loop. Every execution path emits an
+//! error event with `workflow_id`, `workflow`, `error`, and `recovery_required=true`,
+//! including queued, scheduled, child and recovered runs without an owning handle.
+//! Launch-time recovery does not automatically pick up new failures in a live
+//! process. Persistent decoding failures require a compatible reader or repaired
+//! data before recovery can succeed.
+//!
+//! Errors returned by user step/transaction bodies remain business outcomes,
+//! including database errors. Failure to encode a body's return value is saved
+//! as a step failure, so recovery does not repeat the body merely to reproduce
+//! that encoding error. This still requires the failure checkpoint to commit.
+//! Provider semantic rejections (for example a missing message destination or
+//! closed stream) and conversion of a recorded value to an incompatible requested
+//! Rust type remain catchable API errors. The provider's storage error contract
+//! is defined by [`StateProvider`](crate::StateProvider); error variants alone
+//! do not classify errors returned by arbitrary user code.
 //!
 //! # Crash recovery
 //!
