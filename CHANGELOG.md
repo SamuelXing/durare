@@ -134,15 +134,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one with nothing recorded at its position stops the run instead of executing
   it: no step or transaction body, no send, no child workflow, no marker, no
   checkpoint, status row or executor id. A recorded timer is read, not waited
-  out.
+  out. A plain `transaction`'s own replay check lives inside the provider, in
+  the database transaction it opens; a verification run consults the record
+  before that point, so an unrecorded transaction is refused rather than run.
 
   It returns a `ReplayReport` — `recorded` / `matched` counts, whether the
   recorded run had finished, and the first `Divergence`: `Mismatch` (a position
-  changed operation), `Extra` (an operation a completed history does not hold) or
-  `Missing` (a recorded operation the code no longer reaches). `into_result()`
-  turns it into a `?` for a test or a CI step. A workflow that is still running
-  has a history that legitimately ends early, so only a `Mismatch` is reported
-  against one.
+  changed operation), `Extra` (an operation a completed history does not hold),
+  `Missing` (a recorded operation the code no longer reaches) or `Failed` (the
+  recorded run succeeded but the re-run failed or panicked with every operation
+  agreeing — most often a recorded value that no longer decodes as the type now
+  expected under the same name). `into_result()` turns it into a `?` for a test
+  or a CI step. A workflow that is still running has a history that legitimately
+  ends early, so only a `Mismatch` is reported against one.
+
+  `matched`, and the `Missing` check, count recorded positions the re-run
+  actually asked for by name — not positions the counter moved past. A call that
+  is built and dropped claims a position without consulting the record there,
+  and must not count as having verified it.
 
   The report, not the error the refused call returns, is authoritative: a
   workflow body is free to swallow a step error (`let _ = ..`, `.ok()`, a

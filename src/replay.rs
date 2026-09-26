@@ -14,9 +14,9 @@
 //! the code in the binary you are about to ship.
 
 use crate::error::{Error, Result};
+use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// The outcome of re-running one recorded workflow against the current code —
 /// see [`DurableEngine::verify_replay`](crate::DurableEngine::verify_replay),
@@ -80,6 +80,18 @@ pub enum Divergence {
         /// The operation recorded there.
         recorded: String,
     },
+    /// The recorded run succeeded, but the re-run failed or panicked without
+    /// any operation disagreeing.
+    ///
+    /// No body ran, so the failure came from the re-run itself: most often a
+    /// recorded value that no longer decodes as the type the code now expects
+    /// at the same name, or code between operations that now fails. A history
+    /// that ended in an error is expected to replay as that error and is not
+    /// reported here.
+    Failed {
+        /// What the re-run failed with.
+        error: String,
+    },
 }
 
 impl fmt::Display for Divergence {
@@ -106,6 +118,10 @@ impl fmt::Display for Divergence {
             } => write!(
                 f,
                 "step {position}: the code no longer reaches `{recorded}`, which is recorded there"
+            ),
+            Divergence::Failed { error } => write!(
+                f,
+                "the recorded run succeeded, but the re-run failed: {error}"
             ),
         }
     }
@@ -154,10 +170,14 @@ impl ReplayReport {
 #[derive(Default)]
 pub(crate) struct Verification {
     divergence: OnceLock<Divergence>,
-    /// Recorded operations served to the re-run, name matched. A tally, so
-    /// `Relaxed` — it publishes no other memory, and the run is awaited to
-    /// completion before it is read.
-    matched: AtomicUsize,
+    /// The recorded positions the re-run reached and matched by name.
+    ///
+    /// A set of positions, not a count and not the position counter: a call
+    /// that is built and dropped claims a position without ever asking for the
+    /// record at it, so the counter moves past history the re-run never
+    /// verified. What was *served* is the only honest measure of what was
+    /// checked.
+    served: Mutex<BTreeSet<i32>>,
 }
 
 impl Verification {
@@ -166,14 +186,20 @@ impl Verification {
         let _ = self.divergence.set(divergence);
     }
 
-    /// Book one recorded operation served to the re-run.
-    pub(crate) fn served_record(&self) {
-        self.matched.fetch_add(1, Ordering::Relaxed);
+    /// Book one recorded operation served to the re-run at `seq`.
+    pub(crate) fn served_record(&self, seq: i32) {
+        self.served
+            .lock()
+            .expect("verification served-set mutex poisoned")
+            .insert(seq);
     }
 
-    /// How many recorded operations the re-run reached and matched.
-    pub(crate) fn matched(&self) -> usize {
-        self.matched.load(Ordering::Relaxed)
+    /// The recorded positions the re-run reached and matched.
+    pub(crate) fn served(&self) -> BTreeSet<i32> {
+        self.served
+            .lock()
+            .expect("verification served-set mutex poisoned")
+            .clone()
     }
 
     /// The first divergence, if the run found one.

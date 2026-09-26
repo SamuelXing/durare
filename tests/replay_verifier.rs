@@ -7,8 +7,8 @@
 //! history says about the second engine's code.
 
 use durare::{
-    Divergence, DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider,
-    WorkflowOptions, STATUS_SUCCESS,
+    params, Divergence, DurableContext, DurableEngine, Error, InMemoryProvider, Result,
+    SqliteProvider, StateProvider, WorkflowOptions, STATUS_SUCCESS,
 };
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -439,5 +439,117 @@ async fn a_completed_history_is_terminal() -> Result<()> {
         .pop()
         .expect("the recorded workflow exists");
     assert_eq!(status.status, STATUS_SUCCESS);
+    Ok(())
+}
+
+/// A transaction the history does not hold must be refused like any other
+/// operation, not executed. A transaction's own replay check lives inside the
+/// provider, in the database transaction it opens, which is too late for a run
+/// that must not open one; the verifier consults the record first. On SQLite,
+/// since transactions need a SQL backend.
+#[tokio::test]
+async fn an_added_transaction_is_refused_not_run() -> Result<()> {
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    let mut path = std::env::temp_dir();
+    path.push(format!("durare-verify-{}.db", uuid::Uuid::new_v4()));
+    let url = format!("sqlite://{}", path.display());
+    let provider: Arc<dyn StateProvider> = Arc::new(SqliteProvider::connect(&url).await?);
+
+    record(&provider, steps(&["a"])).await?;
+
+    let verifier = engine(&provider, |ctx: DurableContext| async move {
+        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.transaction("tx", |tx| {
+            Box::pin(async move {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                tx.execute("SELECT 1", &params![]).await?;
+                Ok(2_i64)
+            })
+        })
+        .await?;
+        Ok(0)
+    })
+    .await?;
+
+    let before = verifier.get_workflow_steps(ID).await?.len();
+    let report = verifier.verify_replay(ID).await?;
+    let after = verifier.get_workflow_steps(ID).await?.len();
+
+    assert_eq!(
+        report.divergence,
+        Some(Divergence::Extra {
+            position: 1,
+            operation: "tx".into(),
+        }),
+        "{report:?}"
+    );
+    assert_eq!(RAN.load(Ordering::SeqCst), 0, "the transaction body ran");
+    assert_eq!((before, after), (1, 1), "verification wrote a checkpoint");
+    drop(verifier);
+    for ext in ["", "-wal", "-shm"] {
+        std::fs::remove_file(format!("{}{ext}", path.display())).ok();
+    }
+    Ok(())
+}
+
+/// A call that is built and dropped claims a position without ever asking for
+/// the record at it. That must not count as having verified the history there:
+/// the recorded operation was never reached, whatever the position counter says.
+#[tokio::test]
+async fn a_built_and_dropped_call_does_not_verify_the_history_under_it() -> Result<()> {
+    let provider = provider();
+    record(&provider, steps(&["a"])).await?;
+
+    let report = engine(&provider, |ctx: DurableContext| async move {
+        // Claims position 0 and never polls it. Under a frontier-based check the
+        // counter would read 1 and the history would look fully covered.
+        drop(ctx.step("renamed", || async { Ok::<_, Error>(1_i64) }));
+        Ok(0)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+
+    assert_eq!(report.matched, 0);
+    assert_eq!(
+        report.divergence,
+        Some(Divergence::Missing {
+            position: 0,
+            recorded: "a".into(),
+        }),
+        "{report:?}"
+    );
+    Ok(())
+}
+
+/// The same operation name with a changed return type: the name check passes,
+/// the recorded value no longer decodes, and the body returns the decode error.
+/// The recorded run succeeded, so a re-run that fails is not a clean pass even
+/// though no operation disagreed.
+#[tokio::test]
+async fn a_recorded_value_that_no_longer_decodes_is_a_failure() -> Result<()> {
+    let provider = provider();
+    record(&provider, steps(&["a"])).await?; // records the integer 1 at `a`
+
+    let report = engine(&provider, |ctx: DurableContext| async move {
+        // Same name, now a String: `1` does not deserialize as one.
+        let s: String = ctx
+            .step("a", || async { Ok::<_, Error>("x".to_string()) })
+            .await?;
+        Ok(s.len() as i64)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+
+    assert_eq!(
+        report.matched, 1,
+        "the name matched before the value was decoded"
+    );
+    assert!(
+        matches!(report.divergence, Some(Divergence::Failed { .. })),
+        "a failed re-run of a successful history must not pass: {report:?}"
+    );
+    assert!(report.into_result().is_err());
     Ok(())
 }

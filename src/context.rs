@@ -400,7 +400,7 @@ impl DurableContext {
                 recorded,
             ));
         }
-        self.served_record();
+        self.served_record(seq);
         Ok(())
     }
 
@@ -414,9 +414,9 @@ impl DurableContext {
     /// Book one recorded operation served to a verification run, where the name
     /// is already known to match and there is nothing to compare — the
     /// [`patch`](Self::patch) marker paths. A no-op in a normal run.
-    fn served_record(&self) {
+    fn served_record(&self, seq: i32) {
         if let Some(verify) = &self.verify {
-            verify.served_record();
+            verify.served_record(seq);
         }
     }
 
@@ -540,7 +540,7 @@ impl DurableContext {
             }
             // Our own marker (a replay/recovery of a patched run): new path.
             Some(recorded) if recorded == marker => {
-                self.served_record();
+                self.served_record(seq);
                 true
             }
             // A different step already occupies this slot (a pre-patch run): old path.
@@ -575,7 +575,7 @@ impl DurableContext {
         {
             // The marker's slot is consumed, not re-recorded: read-only on every
             // run, verification included.
-            self.served_record();
+            self.served_record(seq);
             self.next_seq();
         }
         Ok(())
@@ -912,6 +912,16 @@ impl DurableContext {
         let seq = position.seq();
         let span = self.op_span("transaction", &opts.name, seq);
         PendingStep::new(position, async move {
+            // A transaction's own replay check runs inside the provider, in the
+            // database transaction it is about to open — too late for a
+            // verification run, which must not open one. Consult the record
+            // here first: a recorded outcome is served, and nothing recorded at
+            // this position stops the run before the body can execute.
+            if self.verifying() {
+                if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
+                    return Ok(stored);
+                }
+            }
             let _guard = self.begin_transaction()?;
             let started = chrono::Utc::now().timestamp_millis();
             // Separate the call from the `async move`: `f(tx)` borrows `f` and yields

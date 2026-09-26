@@ -2252,22 +2252,19 @@ impl DurableEngine {
             AuthContext::from_status(&status),
             verification.clone(),
         );
-        // A clone, kept to read the position counter once the run is over: the
-        // context itself goes into the handler, and the counter is shared.
-        let counter = ctx.clone();
         // Panics are caught the way a real execution catches them, so a body
         // that panics on an operation it was refused is reported rather than
         // taken out on the caller.
-        let panicked = AssertUnwindSafe(handler(ctx, status.input))
+        let outcome = AssertUnwindSafe(handler(ctx, status.input))
             .catch_unwind()
-            .await
-            .err();
+            .await;
 
-        // What the body *returned* is deliberately ignored. A workflow is free
-        // to swallow a step's error — `let _ = ctx.step(..).await;`, `.ok()`, a
-        // `match` that logs and moves on — so the refusal that stops a
-        // verification may never reach here. The divergence cell is the channel;
-        // the error is a courtesy.
+        // What the body *returned* is not how a divergence is found. A workflow
+        // is free to swallow a step's error — `let _ = ctx.step(..).await;`,
+        // `.ok()`, a `match` that logs and moves on — so the refusal that stops
+        // a verification may never reach here. The divergence cell is the
+        // channel; the error is a courtesy. The return value is consulted once,
+        // below, for a failure the cell cannot see.
         let mut divergence = verification.divergence();
 
         // An incomplete history holds a prefix of the run's operations, so a
@@ -2279,15 +2276,13 @@ impl DurableEngine {
         }
 
         // The other end: a complete history holding operations this run never
-        // reached. Whether a position was reached is the counter's answer, not
-        // `matched`'s — `recv` claims two positions and records one row (or two,
-        // if it timed out), so no count of rows can be compared against a count
-        // of positions. The counter is only consulted here, on a run that
-        // diverged nowhere, so its having already moved past a refused position
-        // does not come into it.
+        // asked for. Asked for, not reached — a call that is built and dropped
+        // claims its position without ever consulting the record there, so the
+        // position counter is no evidence that anything was verified. The set of
+        // positions actually served is.
+        let served = verification.served();
         if complete && divergence.is_none() {
-            let frontier = counter.current_step_id();
-            if let Some(unreached) = recorded.iter().find(|op| op.step_id >= frontier) {
+            if let Some(unreached) = recorded.iter().find(|op| !served.contains(&op.step_id)) {
                 divergence = Some(Divergence::Missing {
                     position: unreached.step_id,
                     recorded: unreached.name.clone(),
@@ -2295,24 +2290,29 @@ impl DurableEngine {
             }
         }
 
-        if let (None, Some(payload)) = (&divergence, panicked) {
-            return Err(Error::app(format!(
-                "workflow `{workflow_id}` panicked during replay verification: {}",
-                panic_message(&*payload)
-            )));
+        // A run that agreed with its history at every operation and still did
+        // not end the way the recorded run did. No body ran, so the difference
+        // is in the re-run itself: a recorded value that no longer decodes as
+        // the type now expected under the same name, code between operations
+        // that now fails, or a panic. A history that ended in an error is
+        // expected to replay as that error; a history that succeeded is not.
+        if divergence.is_none() {
+            let error = match &outcome {
+                Err(payload) => Some(format!("panicked: {}", panic_message(&**payload))),
+                Ok(Err(e)) if status.status == STATUS_SUCCESS => Some(e.to_string()),
+                Ok(_) => None,
+            };
+            if let Some(error) = error {
+                divergence = Some(Divergence::Failed { error });
+            }
         }
 
         Ok(ReplayReport {
             workflow_id: workflow_id.to_string(),
             workflow_name: status.name,
             recorded: recorded.len(),
-            // Recorded rows served, not positions claimed: this is the count
-            // that stays honest when a divergence stops the run early. A refused
-            // position has already moved the counter, and a claimed position is
-            // not always a recorded row anyway (see above) — whereas every
-            // increment here is one recorded operation the re-run asked for by
-            // the name it was stored under.
-            matched: verification.matched(),
+            // Recorded rows served by name, not positions claimed (see above).
+            matched: served.len(),
             terminal: complete,
             divergence,
         })
