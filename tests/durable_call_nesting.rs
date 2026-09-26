@@ -1,26 +1,11 @@
 //! A durable call belongs to the workflow body, and is awaited where it is built.
 //!
-//! A position is claimed where a durable call is written, and a replay finds the
-//! recorded outcome by asking for the position the first run asked for. Both
-//! halves break when a call is made inside another durable operation's body — a
-//! step inside a step, or a durable call inside a [`select`] branch. The inner
-//! call claims a position and writes there on the first run; on a replay the
-//! body never runs, because the outer operation is served from its record, so
-//! nothing claims that position and every later call shifts onto it. Whether
-//! anything notices depends only on the name: a different name fails somewhere
-//! unrelated with `UnexpectedStep`, on code that did not change between the two
-//! runs, and the same name silently serves the inner call's value as the outer
-//! call's.
-//!
-//! So the engine refuses both, at the call, before the counter moves:
-//!
-//! - **Creating** a durable call while a body is being polled is
-//!   `Error::NestedDurableCall`. It claims no position, so the calls around it
-//!   keep the positions they would have had.
-//! - **Polling** a durable call in a body other than the one it was built in is
-//!   `Error::DurableCallCrossedBody`. Its position was claimed outside, where
-//!   every replay claims it again, but the body it is awaited in does not run on
-//!   a replay.
+//! A durable operation created inside another operation's body is
+//! `Error::NestedDurableCall`, and one built outside a body and awaited inside
+//! it is `Error::DurableCallCrossedBody`. Both are refused at the call, before
+//! the position counter moves, so the calls around a refused one keep the
+//! positions they would have had. The argument for the rule is in the crate's
+//! determinism guide; what is here is the evidence.
 //!
 //! The check is a task-local scope around the body's poll rather than a flag
 //! held for the body's lifetime, which is what `a_sibling_built_while_a_body_is

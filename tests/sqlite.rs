@@ -2071,9 +2071,9 @@ async fn sqlite_nested_transaction_is_rejected() -> Result<()> {
         .await
         .expect("nested transaction must be rejected, not deadlock");
     let err = res.expect_err("nesting a transaction is an error");
-    assert!(
-        err.to_string()
-            .contains("transaction inside another transaction"),
+    assert_eq!(
+        err.code(),
+        durare::ErrorCode::NestedDurableCall,
         "clear nesting error, got: {err}"
     );
 

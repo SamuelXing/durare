@@ -6,8 +6,8 @@
 //! crash window between the two commits.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, Serializer, SqliteDataSource,
-    TransactionOptions, WorkflowOptions,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, Serializer,
+    SqliteDataSource, TransactionOptions, WorkflowOptions,
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -296,10 +296,11 @@ async fn nested_transaction_is_rejected() -> Result<()> {
         .await?
         .await
         .expect_err("nested transaction");
-    assert!(
-        err.to_string()
-            .contains("cannot start a transaction inside another transaction"),
-        "{err}"
+    assert_eq!(
+        err.code(),
+        ErrorCode::NestedDurableCall,
+        "a transaction opened inside a transaction body is refused as a nested \
+         durable call, like any other durable call made in a body: {err}"
     );
     Ok(())
 }

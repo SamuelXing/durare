@@ -32,11 +32,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call itself, not only around the future, and covers `transaction` bodies as
   well as steps, `select` branches and `transaction_on`.
 
+  A transaction opened inside a transaction body now reports this error too,
+  rather than the previous `Error::app("cannot start a transaction inside
+  another transaction")` — one mistake, one error. The in-transaction flag keeps
+  what it alone catches, two transactions running *at once* in one workflow,
+  which a poll-scoped check cannot see, and says so: "a transaction is already
+  running in this workflow".
+
   The check is a task-local scope around the body's poll, not a flag held for
   the body's lifetime: a lifetime flag cannot tell a body that is *running* from
   one that is merely *in flight*, and would refuse a sibling call the workflow
   body makes while another step is parked mid-await. The scope is restored
   however a poll ends, including an early `?` and a panic unwinding through it.
+
+  The check is task-local, so it does not reach a task spawned from inside a
+  body; `tokio::spawn` of durable work remains a documented rule with no
+  mechanism behind it.
 
   Bodies may still call ordinary functions as deeply as they like. What changes
   is durable calls: do the body's work plainly, and keep the durable operations

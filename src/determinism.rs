@@ -79,6 +79,11 @@
 //! [`Error::NestedDurableCall`] and [`Error::DurableCallCrossedBody`]. The calls
 //! around a refused one keep the positions they would have had.
 //!
+//! **The check does not reach a spawned task.** It is task-local, so a durable
+//! call made from a task the body spawned is outside it and is not refused —
+//! the `tokio::spawn` row above still applies, and still has no mechanism
+//! behind it.
+//!
 //! ```no_run
 //! # use durare::{DurableContext, Error, Result};
 //! # async fn charge(ctx: &DurableContext) -> Result<i64> { Ok(0) }
