@@ -420,6 +420,14 @@ impl DurableContext {
         }
     }
 
+    /// Book position `seq` as claimed for an `operation` record this call may
+    /// never ask for — a wait's deadline. A no-op in a normal run.
+    fn reserved_record(&self, seq: i32, operation: &'static str) {
+        if let Some(verify) = &self.verify {
+            verify.reserved_record(seq, operation);
+        }
+    }
+
     /// The point where a run that found nothing recorded at `seq` would start
     /// doing the work itself.
     ///
@@ -2080,6 +2088,7 @@ impl DurableContext {
         let position = claim!(self, "recv");
         let seq = position.seq();
         let deadline_seq = self.next_seq();
+        self.reserved_record(deadline_seq, "DBOS.sleep");
         PendingStep::new(position, async move {
             if let Some(stored) = self.replay_or_guard::<Option<T>>(seq, "DBOS.recv").await? {
                 return Ok(stored);
@@ -2216,6 +2225,7 @@ impl DurableContext {
         let position = claim!(self, "get_event");
         let seq = position.seq();
         let deadline_seq = self.next_seq();
+        self.reserved_record(deadline_seq, "DBOS.sleep");
         PendingStep::new(position, async move {
             if let Some(stored) = self
                 .replay_or_guard::<Option<T>>(seq, "DBOS.getEvent")

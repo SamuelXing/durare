@@ -7,7 +7,7 @@ use crate::provider::StepInfo;
 use crate::STATUS_ERROR;
 use serde_json::Value;
 use std::any::Any;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
 
@@ -179,6 +179,25 @@ struct Seen {
     /// verified. What was *served* is the only honest measure of what was
     /// checked.
     served: BTreeSet<i32>,
+    /// Positions the re-run claimed for a record it may never ask for, and the
+    /// operation a record there has to be.
+    ///
+    /// A wait (`recv`, `get_event`) takes two positions: its outcome, and a
+    /// deadline it fixes on its first miss. Once the outcome is recorded, a
+    /// replay is served it and returns without asking for the deadline; a run
+    /// stopped at the outcome's position has not reached the deadline either.
+    /// Both leave a deadline record that the re-run did not walk past but that
+    /// belongs to an operation it did account for.
+    reserved: BTreeMap<i32, &'static str>,
+}
+
+impl Seen {
+    /// Whether the re-run accounted for recorded operation `op`: served it, or
+    /// reserved its position for exactly that operation.
+    fn accounts_for(&self, op: &StepInfo) -> bool {
+        self.served.contains(&op.step_id)
+            || self.reserved.get(&op.step_id) == Some(&op.name.as_str())
+    }
 }
 
 /// Where a verification run books what it saw, shared by every clone of the
@@ -238,15 +257,21 @@ impl Verification {
         self.seen().served.insert(seq);
     }
 
+    /// Book position `seq` as one the code claimed for an `operation` record it
+    /// may never ask for (see [`Seen::reserved`]).
+    pub(crate) fn reserved_record(&self, seq: i32, operation: &'static str) {
+        self.seen().reserved.insert(seq, operation);
+    }
+
     /// The report for a re-run of `history` that ended in `outcome`.
     ///
     /// One decision, in this order: a divergence the run booked wins. Then how
     /// the run ended — but only if it ended on its own: a run the verifier
     /// stopped at the frontier of an incomplete history ended because of the
     /// verifier, and a body that panics on that stop has not failed
-    /// ([`failed`]). Then, whichever way it ended, what it never asked for
-    /// ([`missing`]): reaching the frontier does not excuse a recorded position
-    /// the re-run walked past on the way.
+    /// ([`failed`]). Then, whichever way it ended, what it never accounted for
+    /// ([`unaccounted`]): reaching the frontier does not excuse a recorded
+    /// position the re-run walked past on the way.
     pub(crate) fn report(&self, history: History<'_>, outcome: RunOutcome) -> ReplayReport {
         let seen = self.seen();
         let own_failure = if seen.stopped_at.is_some() {
@@ -258,12 +283,16 @@ impl Verification {
             .divergence
             .clone()
             .or(own_failure)
-            .or_else(|| missing(history.recorded, &seen.served));
+            .or_else(|| unaccounted(history.recorded, &seen));
         ReplayReport {
             workflow_id: history.id.to_owned(),
             workflow_name: history.name.to_owned(),
             recorded: history.recorded.len(),
-            matched: seen.served.len(),
+            matched: history
+                .recorded
+                .iter()
+                .filter(|op| seen.accounts_for(op))
+                .count(),
             complete: self.complete,
             divergence,
         }
@@ -292,20 +321,28 @@ fn failed(status: &str, outcome: &RunOutcome) -> Option<Divergence> {
     Some(Divergence::Failed { error })
 }
 
-/// A history holding an operation the re-run never asked for.
+/// A history holding an operation the re-run never accounted for.
 ///
-/// Asked for, not reached: a call that is built and dropped claims its position
-/// without ever consulting the record there, so the position counter is no
-/// evidence that anything was verified. The set of positions actually served
-/// is. This holds against a prefix as much as against a complete history — a
-/// recorded position the re-run walked past without asking is not one it
-/// verified, whatever comes after it.
-fn missing(recorded: &[StepInfo], served: &BTreeSet<i32>) -> Option<Divergence> {
-    recorded
-        .iter()
-        .find(|op| !served.contains(&op.step_id))
-        .map(|op| Divergence::Missing {
+/// Accounted for, not reached: a call that is built and dropped claims its
+/// position without ever consulting the record there, so the position counter
+/// is no evidence that anything was verified. The set of positions actually
+/// served is, plus the positions a served operation reserved for its own
+/// internal record ([`Seen::reserved`]) — under the recorded name; a record of
+/// another name in a reserved position is a mismatch. This holds against a
+/// prefix as much as against a complete history — a recorded position the
+/// re-run walked past without asking is not one it verified, whatever comes
+/// after it.
+fn unaccounted(recorded: &[StepInfo], seen: &Seen) -> Option<Divergence> {
+    let op = recorded.iter().find(|op| !seen.accounts_for(op))?;
+    Some(match seen.reserved.get(&op.step_id) {
+        Some(expected) => Divergence::Mismatch {
+            position: op.step_id,
+            expected: (*expected).to_owned(),
+            recorded: op.name.clone(),
+        },
+        None => Divergence::Missing {
             position: op.step_id,
             recorded: op.name.clone(),
-        })
+        },
+    })
 }

@@ -428,6 +428,108 @@ async fn a_built_and_dropped_call_is_missing_against_a_running_history_too() -> 
     Ok(())
 }
 
+/// `recv` and `get_event` take two positions: the outcome, and a deadline the
+/// wait fixes on its first miss. Once the outcome is recorded, a replay is
+/// served it and never asks for the deadline again — so the deadline record is
+/// not one the re-run walked past, and unchanged code that timed out passes.
+#[tokio::test]
+async fn an_unchanged_wait_that_timed_out_passes() -> Result<()> {
+    let provider = provider();
+    record(&provider, |ctx: DurableContext| async move {
+        ctx.recv::<i64>("empty", Duration::ZERO).await?;
+        ctx.get_event::<i64>(ID, "unset", Duration::ZERO).await?;
+        Ok(0)
+    })
+    .await?;
+    let recorded = common::recorded(&engine(&provider, steps(&[])).await?, ID).await?;
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["DBOS.recv", "DBOS.sleep", "DBOS.getEvent", "DBOS.sleep"],
+        "both waits recorded their deadline"
+    );
+
+    let report = engine(&provider, |ctx: DurableContext| async move {
+        ctx.recv::<i64>("empty", Duration::ZERO).await?;
+        ctx.get_event::<i64>(ID, "unset", Duration::ZERO).await?;
+        Ok(0)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+    assert_eq!(report.divergence, None, "{report:?}");
+    assert_eq!(
+        report.matched, 4,
+        "the deadlines are accounted for by their wait"
+    );
+    Ok(())
+}
+
+/// A workflow parked in `recv` has recorded its deadline but no outcome yet.
+/// The re-run stops at the outcome's position, before the deadline; the
+/// deadline still belongs to that wait and is not missing.
+#[tokio::test]
+async fn a_wait_still_in_flight_owns_its_recorded_deadline() -> Result<()> {
+    let provider = provider();
+    let body = |ctx: DurableContext| async move {
+        ctx.recv::<i64>("never", Duration::from_secs(3_600)).await?;
+        Ok(0)
+    };
+    let running = engine(&provider, body).await?;
+    let _handle = running
+        .start::<_, i64>(NAME, (), WorkflowOptions::with_id(ID))
+        .await?;
+    for _ in 0..400 {
+        if !running.get_workflow_steps(ID).await?.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        common::recorded(&running, ID).await?,
+        [(1, "DBOS.sleep".to_owned())],
+        "only the deadline is recorded while the wait is in flight"
+    );
+
+    let report = engine(&provider, body).await?.verify_replay(ID).await?;
+    assert!(!report.complete);
+    assert_eq!(report.divergence, None, "{report:?}");
+    Ok(())
+}
+
+/// A reserved position accounts only for the record the wait itself would
+/// write there. Anything else recorded in it is a disagreement, not a record
+/// the re-run may skip.
+#[tokio::test]
+async fn a_reserved_position_holding_another_record_is_a_mismatch() -> Result<()> {
+    let provider = provider();
+    // A message that is already waiting is received on the first look, so the
+    // deadline position stays empty: `send`, `recv`, then nothing at 2.
+    let body = |ctx: DurableContext| async move {
+        ctx.send(ID, 1_i64, "ready").await?;
+        ctx.recv::<i64>("ready", Duration::ZERO).await?;
+        Ok(0)
+    };
+    record(&provider, body).await?;
+    provider
+        .record_step_result(ID, 2, "b", serde_json::json!(2), None, None, None)
+        .await?;
+
+    let report = engine(&provider, body).await?.verify_replay(ID).await?;
+    assert_eq!(
+        report.divergence,
+        Some(Divergence::Mismatch {
+            position: 2,
+            expected: "DBOS.sleep".into(),
+            recorded: "b".into(),
+        }),
+        "{report:?}"
+    );
+    Ok(())
+}
+
 /// A recorded value that no longer decodes is a failure against a running
 /// history too. The history being a prefix excuses the operations it does not
 /// hold yet, not a re-run that fails on one it does hold.
