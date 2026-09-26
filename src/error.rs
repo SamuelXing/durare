@@ -40,6 +40,9 @@ pub enum ErrorCode {
     /// A replay found a different step recorded at this position — the
     /// workflow function is non-deterministic.
     UnexpectedStep,
+    /// A durable operation was created or polled inside another durable
+    /// operation's body, where it cannot hold its position across a replay.
+    NestedDurableCall,
     /// Another live execution of the same workflow id checkpointed this step
     /// first; this execution no longer owns the workflow.
     WorkflowConflict,
@@ -142,6 +145,42 @@ pub enum Error {
         /// The operation recorded at this position by the original execution.
         recorded: String,
     },
+
+    /// A durable operation was **created** inside another durable operation's
+    /// body — a step inside a step, a durable call inside a
+    /// [`select`](crate::DurableContext::select) branch, or anything reached
+    /// while a transaction body is running.
+    ///
+    /// Do the work the body needs with a plain function call, or move the
+    /// durable operation out into the workflow body. Why a body may not contain
+    /// one is in [the determinism
+    /// guide](crate::determinism#a-durable-call-belongs-to-the-workflow-body).
+    #[error(
+        "workflow `{workflow_id}`: `{operation}` was created inside another \
+         durable operation's body — a durable call cannot hold its position there"
+    )]
+    NestedDurableCall {
+        /// The workflow whose body made the call.
+        workflow_id: String,
+        /// The operation that was refused.
+        operation: String,
+    },
+
+    /// A durable operation built in the workflow body was **polled** inside a
+    /// step, a transaction or a [`select`](crate::DurableContext::select)
+    /// branch.
+    ///
+    /// Its position is claimed on every replay, but the body it is awaited in
+    /// does not run on one, so its outcome would be recorded for an execution
+    /// that never asked for it. Retry, cancellation and timeout have no owner
+    /// across that boundary either. Await a durable call where it was built; see
+    /// [the determinism
+    /// guide](crate::determinism#a-durable-call-belongs-to-the-workflow-body).
+    #[error(
+        "`{0}` was built outside the durable body it is being awaited in — \
+         await it where it was built"
+    )]
+    DurableCallCrossedBody(String),
 
     /// Another live execution of workflow `{0}` checkpointed the step this
     /// execution was about to record: two executions of the same workflow id
@@ -273,6 +312,9 @@ impl Error {
             Error::ConflictingRegistration(_) => ErrorCode::ConflictingRegistration,
             Error::Timeout => ErrorCode::Timeout,
             Error::UnexpectedStep { .. } => ErrorCode::UnexpectedStep,
+            Error::NestedDurableCall { .. } | Error::DurableCallCrossedBody { .. } => {
+                ErrorCode::NestedDurableCall
+            }
             Error::WorkflowConflict(_) => ErrorCode::WorkflowConflict,
             Error::App { .. } | Error::Portable(_) => ErrorCode::Application,
         }
