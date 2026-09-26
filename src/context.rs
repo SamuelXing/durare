@@ -426,26 +426,33 @@ impl DurableContext {
     /// Nothing to refuse in a normal run: that position is the replay frontier,
     /// and reaching it is how a replay becomes a live execution again. A
     /// verification run may not execute, write, or emit anything, so this is
-    /// where it stops — the history does not hold the operation the code now
-    /// issues.
+    /// where it stops. Against a complete history that is a
+    /// [`Divergence::Extra`]; against one still being written it is the end of
+    /// what there is to check, booked as a fact rather than a divergence.
     ///
-    /// The returned error is a courtesy that usually ends the run early. It is
-    /// not the channel: a body may swallow it and keep going, so the divergence
-    /// is booked before the error is handed back.
+    /// The returned error is a courtesy, not the channel — a body may swallow it
+    /// (see [`Verification`]) — so what was seen is booked before it is handed
+    /// back.
     fn refuse_live_work(&self, seq: i32, operation: &str) -> Result<()> {
         let Some(verify) = &self.verify else {
             return Ok(());
         };
-        let divergence = Divergence::Extra {
-            position: seq,
-            operation: operation.to_owned(),
-        };
-        let stopped = Error::app(format!(
-            "replay verification of workflow `{}` stopped at {divergence}",
+        if verify.complete() {
+            let divergence = Divergence::Extra {
+                position: seq,
+                operation: operation.to_owned(),
+            };
+            verify.saw(divergence.clone());
+            return Err(Error::ReplayDiverged {
+                workflow_id: self.workflow_id.clone(),
+                divergence,
+            });
+        }
+        verify.stopped(seq, operation);
+        Err(Error::app(format!(
+            "replay verification of workflow `{}` reached the end of the recorded history at step {seq}",
             self.workflow_id
-        ));
-        verify.saw(divergence);
-        Err(stopped)
+        )))
     }
 
     /// What the in-transaction flag reports.

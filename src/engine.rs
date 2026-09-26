@@ -8,7 +8,7 @@ use crate::provider::{
     STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
-use crate::replay::{Divergence, ReplayReport, Verification};
+use crate::replay::{History, ReplayReport, Verification};
 use crate::schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
 };
@@ -2183,9 +2183,12 @@ impl DurableEngine {
     ///
     /// A workflow that is still running can be verified too, and often should
     /// be — those are the runs a deploy has to carry. Its history is a prefix,
-    /// though, so reaching the end of it is not a divergence and only a
-    /// [`Mismatch`](Divergence::Mismatch) can be reported against one; see
-    /// [`ReplayReport::terminal`].
+    /// though, so reaching the end of it stops the re-run and is not a
+    /// divergence: a [`Mismatch`](crate::Divergence::Mismatch),
+    /// [`Missing`](crate::Divergence::Missing) or
+    /// [`Failed`](crate::Divergence::Failed) can be reported against one, an
+    /// [`Extra`](crate::Divergence::Extra) cannot; see
+    /// [`ReplayReport::complete`].
     ///
     /// # It runs nothing
     ///
@@ -2221,9 +2224,10 @@ impl DurableEngine {
     ///
     /// [`Error::UnknownWorkflow`] if `workflow_id` does not exist, or if its
     /// recorded name is not registered on this engine. A panic in the workflow
-    /// body is caught: it is returned as an error only when nothing diverged,
-    /// since a divergence is the better explanation for a body that panicked on
-    /// an operation it did not get.
+    /// body is caught and goes into the report: as
+    /// [`Failed`](crate::Divergence::Failed) when nothing else diverged, and
+    /// otherwise not at all, since a divergence is the better explanation for a
+    /// body that panicked on an operation it did not get.
     pub async fn verify_replay(&self, workflow_id: &str) -> Result<ReplayReport> {
         let status = self
             .provider
@@ -2245,7 +2249,7 @@ impl DurableEngine {
         // operations it does not hold are not the code's fault.
         let complete = matches!(status.status.as_str(), STATUS_SUCCESS | STATUS_ERROR);
 
-        let verification = Arc::new(Verification::default());
+        let verification = Arc::new(Verification::new(complete));
         let ctx = DurableContext::new_verifying(
             workflow_id.to_string(),
             rt,
@@ -2259,63 +2263,15 @@ impl DurableEngine {
             .catch_unwind()
             .await;
 
-        // What the body *returned* is not how a divergence is found. A workflow
-        // is free to swallow a step's error — `let _ = ctx.step(..).await;`,
-        // `.ok()`, a `match` that logs and moves on — so the refusal that stops
-        // a verification may never reach here. The divergence cell is the
-        // channel; the error is a courtesy. The return value is consulted once,
-        // below, for a failure the cell cannot see.
-        let mut divergence = verification.divergence();
-
-        // An incomplete history holds a prefix of the run's operations, so a
-        // position it does not have is simply work the recorded run had not
-        // reached: nothing to report. (Only a *mismatch* is a real divergence
-        // against such a history.)
-        if !complete && matches!(divergence, Some(Divergence::Extra { .. })) {
-            divergence = None;
-        }
-
-        // The other end: a complete history holding operations this run never
-        // asked for. Asked for, not reached — a call that is built and dropped
-        // claims its position without ever consulting the record there, so the
-        // position counter is no evidence that anything was verified. The set of
-        // positions actually served is.
-        let served = verification.served();
-        if complete && divergence.is_none() {
-            if let Some(unreached) = recorded.iter().find(|op| !served.contains(&op.step_id)) {
-                divergence = Some(Divergence::Missing {
-                    position: unreached.step_id,
-                    recorded: unreached.name.clone(),
-                });
-            }
-        }
-
-        // A run that agreed with its history at every operation and still did
-        // not end the way the recorded run did. No body ran, so the difference
-        // is in the re-run itself: a recorded value that no longer decodes as
-        // the type now expected under the same name, code between operations
-        // that now fails, or a panic. A history that ended in an error is
-        // expected to replay as that error; a history that succeeded is not.
-        if divergence.is_none() {
-            let error = match &outcome {
-                Err(payload) => Some(format!("panicked: {}", panic_message(&**payload))),
-                Ok(Err(e)) if status.status == STATUS_SUCCESS => Some(e.to_string()),
-                Ok(_) => None,
-            };
-            if let Some(error) = error {
-                divergence = Some(Divergence::Failed { error });
-            }
-        }
-
-        Ok(ReplayReport {
-            workflow_id: workflow_id.to_string(),
-            workflow_name: status.name,
-            recorded: recorded.len(),
-            // Recorded rows served by name, not positions claimed (see above).
-            matched: served.len(),
-            terminal: complete,
-            divergence,
-        })
+        Ok(verification.report(
+            History {
+                id: workflow_id,
+                name: &status.name,
+                status: &status.status,
+                recorded: &recorded,
+            },
+            outcome,
+        ))
     }
 
     /// All `(key, value)` events a workflow has set (`set_event`), ordered by key.

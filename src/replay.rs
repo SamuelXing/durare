@@ -1,31 +1,24 @@
 //! What [`verify_replay`](crate::DurableEngine::verify_replay) reports: a
 //! recorded workflow re-run against the current code, and the first place the
-//! two disagree.
-//!
-//! A replay serves each durable operation from the record at its position, so a
-//! workflow function is pinned to the sequence of operations it issued when it
-//! first ran. Editing that function while runs are in flight is the one change
-//! a test suite does not catch: the new code passes its own tests, and the old
-//! run fails on the first position whose recorded name no longer matches — in
-//! production, at recovery time, on a workflow that was already half-finished.
-//!
-//! [`ReplayReport`] answers that question before the deploy instead of after
-//! it: it is the outcome of re-running one recorded workflow's function against
-//! the code in the binary you are about to ship.
+//! two disagree. The argument for the check is on that method.
 
-use crate::error::{Error, Result};
+use crate::error::{panic_message, Error, Result};
+use crate::provider::StepInfo;
+use crate::STATUS_ERROR;
+use serde_json::Value;
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 
 /// The outcome of re-running one recorded workflow against the current code —
 /// see [`DurableEngine::verify_replay`](crate::DurableEngine::verify_replay),
 /// which documents what the check does and does not catch.
 ///
 /// The counts are there to tell a clean pass from a vacuous one: a report with
-/// `recorded: 0` is deterministic in the same sense an empty test suite is
-/// green, and one whose `matched` stops well short of `recorded` says the
-/// verification did not get far, whatever the divergence field holds.
+/// `recorded: 0` passes in the same sense an empty test suite is green, and one
+/// whose `matched` stops well short of `recorded` says the verification did not
+/// get far, whatever the divergence field holds.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplayReport {
     /// The workflow that was verified.
@@ -36,15 +29,12 @@ pub struct ReplayReport {
     pub recorded: usize,
     /// Recorded operations the re-run reached and matched, in order.
     pub matched: usize,
-    /// Whether the recorded workflow had finished. A workflow still running has
-    /// a history that legitimately ends early, so reaching its end is not a
-    /// divergence.
-    ///
-    /// "Finished" means the run ended on its own — `SUCCESS` or `ERROR`. A
-    /// cancelled or dead-lettered run is stopped from the outside, wherever it
-    /// happened to be, so its history ends early too and it is reported here as
-    /// `false` like a running one.
-    pub terminal: bool,
+    /// Whether the recorded run ended on its own (`SUCCESS` or `ERROR`). A
+    /// running, cancelled or dead-lettered workflow has a history that
+    /// legitimately ends early, so only a [`Mismatch`](Divergence::Mismatch),
+    /// [`Missing`](Divergence::Missing) or [`Failed`](Divergence::Failed) is
+    /// reported against it, never [`Extra`](Divergence::Extra).
+    pub complete: bool,
     /// The first place the re-run and the history disagreed, if they did.
     pub divergence: Option<Divergence>,
 }
@@ -80,14 +70,15 @@ pub enum Divergence {
         /// The operation recorded there.
         recorded: String,
     },
-    /// The recorded run succeeded, but the re-run failed or panicked without
-    /// any operation disagreeing.
+    /// The re-run failed or panicked without any operation disagreeing, where
+    /// the recorded run had not failed.
     ///
     /// No body ran, so the failure came from the re-run itself: most often a
     /// recorded value that no longer decodes as the type the code now expects
     /// at the same name, or code between operations that now fails. A history
-    /// that ended in an error is expected to replay as that error and is not
-    /// reported here.
+    /// that ended in `ERROR` is expected to replay as that error, so nothing is
+    /// reported against one whichever way its re-run ends — a run that no longer
+    /// fails is not a recovery hazard.
     Failed {
         /// What the re-run failed with.
         error: String,
@@ -119,23 +110,22 @@ impl fmt::Display for Divergence {
                 f,
                 "step {position}: the code no longer reaches `{recorded}`, which is recorded there"
             ),
-            Divergence::Failed { error } => write!(
-                f,
-                "the recorded run succeeded, but the re-run failed: {error}"
-            ),
+            Divergence::Failed { error } => {
+                write!(f, "the recorded run did not fail, but the re-run did — {error}")
+            }
         }
     }
 }
 
 impl ReplayReport {
-    /// `true` when the re-run issued the recorded operations, in order, and
-    /// nothing else.
-    pub fn is_deterministic(&self) -> bool {
+    /// `true` when nothing diverged: the re-run issued the recorded operations,
+    /// in order, nothing else, and did not fail where the recorded run had not.
+    pub fn passes(&self) -> bool {
         self.divergence.is_none()
     }
 
-    /// `Ok(())` when deterministic, otherwise a descriptive error — for `?` in a
-    /// test or a CI step:
+    /// `Ok(())` when the report [`passes`](Self::passes), otherwise
+    /// [`Error::ReplayDiverged`] — for `?` in a test or a CI step:
     ///
     /// ```no_run
     /// # use durare::DurableEngine;
@@ -147,13 +137,48 @@ impl ReplayReport {
     pub fn into_result(self) -> Result<()> {
         match self.divergence {
             None => Ok(()),
-            Some(divergence) => Err(Error::app(format!(
-                "workflow `{}` (`{}`) no longer replays its recorded history: {divergence} \
-                 ({} of {} recorded operations matched)",
-                self.workflow_id, self.workflow_name, self.matched, self.recorded
-            ))),
+            Some(divergence) => Err(Error::ReplayDiverged {
+                workflow_id: self.workflow_id,
+                divergence,
+            }),
         }
     }
+}
+
+/// The recorded run a verification is judged against.
+pub(crate) struct History<'a> {
+    /// The workflow's id.
+    pub(crate) id: &'a str,
+    /// The registered name its function is looked up under.
+    pub(crate) name: &'a str,
+    /// The status row's `status`.
+    pub(crate) status: &'a str,
+    /// Its recorded durable operations, in position order.
+    pub(crate) recorded: &'a [StepInfo],
+}
+
+/// How the re-run of the workflow body ended: what it returned, or the panic
+/// payload `catch_unwind` handed back.
+pub(crate) type RunOutcome = std::result::Result<Result<Value>, Box<dyn Any + Send>>;
+
+/// What a verification run has seen so far, under one lock so a divergence,
+/// the stop at the frontier and the served set cannot disagree with each other.
+#[derive(Default)]
+struct Seen {
+    /// The first divergence, if the run found one.
+    divergence: Option<Divergence>,
+    /// Where the run reached the end of an incomplete history: the position and
+    /// the operation the code issued there. A fact about how far the re-run got,
+    /// not a divergence — the recorded run had not got there either.
+    stopped_at: Option<(i32, String)>,
+    /// The recorded positions the re-run reached and matched by name.
+    ///
+    /// A set of positions, not a count and not the position counter: a call
+    /// that is built and dropped claims a position without ever asking for the
+    /// record at it, so the counter moves past history the re-run never
+    /// verified. What was *served* is the only honest measure of what was
+    /// checked.
+    served: BTreeSet<i32>,
 }
 
 /// Where a verification run books what it saw, shared by every clone of the
@@ -162,48 +187,118 @@ impl ReplayReport {
 /// It is the authoritative channel, not the errors the refused calls return: a
 /// workflow body may write `let _ = ctx.step(..).await;` or `.ok()` and carry
 /// on, so nothing guarantees a refusal reaches the caller. Whatever the body
-/// does with the error, the divergence is already recorded here.
+/// does with the error, the divergence is already recorded here — the cell is
+/// the channel, the error is a courtesy.
 ///
 /// A body can also reach the same position from several tasks, so first write
-/// wins and later ones are dropped: [`OnceLock::set`] is exactly that, and the
-/// first divergence is the one worth reporting anyway.
-#[derive(Default)]
+/// wins and later ones are dropped: the first divergence is the one worth
+/// reporting anyway.
 pub(crate) struct Verification {
-    divergence: OnceLock<Divergence>,
-    /// The recorded positions the re-run reached and matched by name.
-    ///
-    /// A set of positions, not a count and not the position counter: a call
-    /// that is built and dropped claims a position without ever asking for the
-    /// record at it, so the counter moves past history the re-run never
-    /// verified. What was *served* is the only honest measure of what was
-    /// checked.
-    served: Mutex<BTreeSet<i32>>,
+    /// Whether the history is complete — the recorded run ended on its own. An
+    /// unrecorded operation is [`Divergence::Extra`] against a complete history
+    /// and the frontier of an incomplete one.
+    complete: bool,
+    seen: Mutex<Seen>,
 }
 
 impl Verification {
+    /// A fresh cell for a history that is `complete` or not (see
+    /// [`ReplayReport::complete`]).
+    pub(crate) fn new(complete: bool) -> Self {
+        Self {
+            complete,
+            seen: Mutex::new(Seen::default()),
+        }
+    }
+
+    fn seen(&self) -> MutexGuard<'_, Seen> {
+        self.seen.lock().expect("verification state mutex poisoned")
+    }
+
+    /// Whether the history being verified is complete.
+    pub(crate) fn complete(&self) -> bool {
+        self.complete
+    }
+
     /// Book a divergence, if it is the first.
     pub(crate) fn saw(&self, divergence: Divergence) {
-        let _ = self.divergence.set(divergence);
+        self.seen().divergence.get_or_insert(divergence);
+    }
+
+    /// Book that the re-run reached the end of an incomplete history at `seq`,
+    /// where the code issues `operation`, if it is the first time.
+    pub(crate) fn stopped(&self, seq: i32, operation: &str) {
+        self.seen()
+            .stopped_at
+            .get_or_insert_with(|| (seq, operation.to_owned()));
     }
 
     /// Book one recorded operation served to the re-run at `seq`.
     pub(crate) fn served_record(&self, seq: i32) {
-        self.served
-            .lock()
-            .expect("verification served-set mutex poisoned")
-            .insert(seq);
+        self.seen().served.insert(seq);
     }
 
-    /// The recorded positions the re-run reached and matched.
-    pub(crate) fn served(&self) -> BTreeSet<i32> {
-        self.served
-            .lock()
-            .expect("verification served-set mutex poisoned")
-            .clone()
+    /// The report for a re-run of `history` that ended in `outcome`.
+    ///
+    /// One decision, in this order: a divergence the run booked wins; a run the
+    /// verifier stopped at the frontier of an incomplete history is clean; a run
+    /// that ended on its own is judged first by how it ended ([`failed`]) and
+    /// then by what it never asked for ([`missing`]).
+    pub(crate) fn report(&self, history: History<'_>, outcome: RunOutcome) -> ReplayReport {
+        let seen = self.seen();
+        let divergence = seen.divergence.clone().or_else(|| {
+            if seen.stopped_at.is_some() {
+                return None;
+            }
+            failed(history.status, &outcome).or_else(|| missing(history.recorded, &seen.served))
+        });
+        ReplayReport {
+            workflow_id: history.id.to_owned(),
+            workflow_name: history.name.to_owned(),
+            recorded: history.recorded.len(),
+            matched: seen.served.len(),
+            complete: self.complete,
+            divergence,
+        }
     }
+}
 
-    /// The first divergence, if the run found one.
-    pub(crate) fn divergence(&self) -> Option<Divergence> {
-        self.divergence.get().cloned()
+/// A run that agreed with its history at every operation and still did not end
+/// the way the recorded run did.
+///
+/// No body ran, so the difference is in the re-run itself: a recorded value
+/// that no longer decodes as the type now expected under the same name, code
+/// between operations that now fails, or a panic. A history that ended in
+/// `ERROR` is expected to replay as that error, so an `Err` against one is not
+/// reported; nor is an `Ok`, since a run that no longer fails is not a
+/// recovery hazard. Against any other status — a completed success as much as
+/// a run still in flight — a failing re-run is a failure.
+fn failed(status: &str, outcome: &RunOutcome) -> Option<Divergence> {
+    if status == STATUS_ERROR {
+        return None;
     }
+    let error = match outcome {
+        Err(payload) => format!("workflow panicked: {}", panic_message(&**payload)),
+        Ok(Err(e)) => e.to_string(),
+        Ok(Ok(_)) => return None,
+    };
+    Some(Divergence::Failed { error })
+}
+
+/// A history holding an operation the re-run never asked for.
+///
+/// Asked for, not reached: a call that is built and dropped claims its position
+/// without ever consulting the record there, so the position counter is no
+/// evidence that anything was verified. The set of positions actually served
+/// is. This holds against a prefix as much as against a complete history — a
+/// recorded position the re-run walked past without asking is not one it
+/// verified, whatever comes after it.
+fn missing(recorded: &[StepInfo], served: &BTreeSet<i32>) -> Option<Divergence> {
+    recorded
+        .iter()
+        .find(|op| !served.contains(&op.step_id))
+        .map(|op| Divergence::Missing {
+            position: op.step_id,
+            recorded: op.name.clone(),
+        })
 }

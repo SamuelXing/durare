@@ -78,10 +78,10 @@ async fn unchanged_code_is_deterministic() -> Result<()> {
         .verify_replay(ID)
         .await?;
 
-    assert!(report.is_deterministic(), "{report:?}");
+    assert!(report.passes(), "{report:?}");
     assert_eq!(report.recorded, 3);
     assert_eq!(report.matched, 3);
-    assert!(report.terminal);
+    assert!(report.complete);
     assert_eq!(report.divergence, None);
     report.into_result()
 }
@@ -105,7 +105,7 @@ async fn swapped_steps_are_a_mismatch() -> Result<()> {
             recorded: "b".into(),
         })
     );
-    assert!(!report.is_deterministic());
+    assert!(!report.passes());
     // Position 0 matched and nothing past 1 was reached.
     assert_eq!(report.matched, 1);
     assert_eq!(report.recorded, 3);
@@ -315,41 +315,16 @@ async fn snapshot(engine: &DurableEngine) -> Result<Snapshot> {
 #[tokio::test]
 async fn a_running_workflow_may_end_its_history_early() -> Result<()> {
     let provider = provider();
-
-    // Parked on a long durable timer: the row stays PENDING with `a` and the
-    // timer recorded.
-    let running = engine(&provider, |ctx: DurableContext| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.sleep(Duration::from_secs(3_600)).await?;
-        ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await?;
-        Ok(0)
-    })
-    .await?;
-    let _handle = running
-        .start::<_, i64>(NAME, (), WorkflowOptions::with_id(ID))
-        .await?;
-    for _ in 0..400 {
-        if running.get_workflow_steps(ID).await?.len() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    let recorded = running.get_workflow_steps(ID).await?;
-    assert_eq!(recorded.len(), 2, "expected `a` and the timer recorded");
+    let _running = park_on_timer(&provider).await?;
 
     // The same code: it walks the history and then asks for `b`, which the
     // history does not hold *yet*. Not a divergence.
-    let report = engine(&provider, |ctx: DurableContext| async move {
-        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
-        ctx.sleep(Duration::from_secs(3_600)).await?;
-        ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await?;
-        Ok(0)
-    })
-    .await?
-    .verify_replay(ID)
-    .await?;
-    assert!(!report.terminal);
-    assert!(report.is_deterministic(), "{report:?}");
+    let report = engine(&provider, parked_body)
+        .await?
+        .verify_replay(ID)
+        .await?;
+    assert!(!report.complete);
+    assert!(report.passes(), "{report:?}");
     assert_eq!(report.matched, 2);
 
     // Changed code over the same partial history still diverges.
@@ -364,6 +339,94 @@ async fn a_running_workflow_may_end_its_history_early() -> Result<()> {
             expected: "z".into(),
             recorded: "a".into(),
         })
+    );
+    Ok(())
+}
+
+/// The workflow the running-history tests verify: a step, a long durable timer,
+/// a step. Parked on the timer, its row stays `PENDING` with `a` and the timer
+/// recorded and `b` not yet reached.
+fn parked_body(ctx: DurableContext) -> futures_util::future::BoxFuture<'static, Result<i64>> {
+    Box::pin(async move {
+        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.sleep(Duration::from_secs(3_600)).await?;
+        ctx.step("b", || async { Ok::<_, Error>(2_i64) }).await?;
+        Ok(0)
+    })
+}
+
+/// Starts [`parked_body`] under `ID` and returns once `a` and the timer are
+/// recorded. The engine is handed back so the parked run outlives the caller's
+/// verification.
+async fn park_on_timer(provider: &Arc<dyn StateProvider>) -> Result<DurableEngine> {
+    let running = engine(provider, parked_body).await?;
+    let _handle = running
+        .start::<_, i64>(NAME, (), WorkflowOptions::with_id(ID))
+        .await?;
+    for _ in 0..400 {
+        if running.get_workflow_steps(ID).await?.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let recorded = running.get_workflow_steps(ID).await?;
+    assert_eq!(recorded.len(), 2, "expected `a` and the timer recorded");
+    Ok(running)
+}
+
+/// Reaching the end of a running workflow's history stops the re-run, and the
+/// stop is not the body's failure. Unchanged code that `.expect()`s the call
+/// past the frontier panics on the verifier's own stop, and must still pass:
+/// nothing about the code diverged from the history it was checked against.
+#[tokio::test]
+async fn a_body_that_panics_on_the_frontier_of_a_running_history_passes() -> Result<()> {
+    let provider = provider();
+    let _running = park_on_timer(&provider).await?;
+
+    let report = engine(&provider, |ctx: DurableContext| async move {
+        ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+        ctx.sleep(Duration::from_secs(3_600)).await?;
+        ctx.step("b", || async { Ok::<_, Error>(2_i64) })
+            .await
+            .expect("b");
+        Ok(0)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+
+    assert_eq!(report.divergence, None, "{report:?}");
+    assert_eq!(report.matched, 2, "`a` and the timer were both served");
+    Ok(())
+}
+
+/// A recorded value that no longer decodes is a failure against a running
+/// history too. The history being a prefix excuses the operations it does not
+/// hold yet, not a re-run that fails on one it does hold.
+#[tokio::test]
+async fn a_value_that_no_longer_decodes_fails_against_a_running_history() -> Result<()> {
+    let provider = provider();
+    let _running = park_on_timer(&provider).await?;
+
+    let report = engine(&provider, |ctx: DurableContext| async move {
+        // Same name, now a String: the recorded `1` does not deserialize as one.
+        let s: String = ctx
+            .step("a", || async { Ok::<_, Error>("x".to_string()) })
+            .await?;
+        ctx.sleep(Duration::from_secs(3_600)).await?;
+        Ok(s.len() as i64)
+    })
+    .await?
+    .verify_replay(ID)
+    .await?;
+
+    assert_eq!(
+        report.matched, 1,
+        "the name matched before the value was decoded"
+    );
+    assert!(
+        matches!(report.divergence, Some(Divergence::Failed { .. })),
+        "a re-run that fails on a recorded value must not pass: {report:?}"
     );
     Ok(())
 }
@@ -416,16 +479,16 @@ async fn an_unknown_workflow_or_name_is_an_error() -> Result<()> {
     Ok(())
 }
 
-/// The recorded run's terminal status is reported as-is for a completed run.
+/// A run that ended on its own is reported as a complete history.
 #[tokio::test]
-async fn a_completed_history_is_terminal() -> Result<()> {
+async fn a_completed_history_is_complete() -> Result<()> {
     let provider = provider();
     record(&provider, steps(&["a"])).await?;
     let report = engine(&provider, steps(&["a"]))
         .await?
         .verify_replay(ID)
         .await?;
-    assert!(report.terminal);
+    assert!(report.complete);
     assert_eq!(report.workflow_id, ID);
     assert_eq!(report.workflow_name, NAME);
 
@@ -492,6 +555,195 @@ async fn an_added_transaction_is_refused_not_run() -> Result<()> {
     Ok(())
 }
 
+/// Every kind of durable call reaches the same gate, so an unrecorded one of any
+/// kind is refused rather than run. Each row records `["a"]` to completion, then
+/// verifies a body that replays `a` and issues the operation; the report must
+/// name that operation at position 1, the history must be untouched, and the
+/// side effects the in-memory provider can show must be absent. `transaction`
+/// and `transaction_on` need a SQL backend and are covered on SQLite above.
+#[tokio::test]
+async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
+    type Body = Box<
+        dyn Fn(DurableContext) -> futures_util::future::BoxFuture<'static, Result<i64>>
+            + Send
+            + Sync,
+    >;
+    // The operation name as `refuse_live_work` receives it, and a body that
+    // replays `a` and then issues the operation.
+    let rows: Vec<(&str, Body)> = vec![
+        (
+            "DBOS.sleep",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.sleep(Duration::from_millis(1)).await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.now",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.now().await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.uuid",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.uuid().await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.random",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.random().await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.send",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.send(ID, 1_i64, "topic").await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.updateWorkflowAttributes",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.set_workflow_attributes(ID, None).await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.recv",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.recv::<i64>("topic", Duration::from_millis(1)).await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.setEvent",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.set_event("key", 1_i64).await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.getEvent",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.get_event::<i64>(ID, "key", Duration::from_millis(1))
+                        .await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.writeStream",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.write_stream("stream", 1_i64).await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.closeStream",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.close_stream("stream").await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "child",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.start_workflow::<_, i64>("child", (), WorkflowOptions::default())
+                        .await?;
+                    Ok(0)
+                })
+            }),
+        ),
+        (
+            "DBOS.select",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.step("a", || async { Ok::<_, Error>(1_i64) }).await?;
+                    ctx.select(vec![Box::pin(async { 1_i64 })]).await?;
+                    Ok(0)
+                })
+            }),
+        ),
+    ];
+
+    for (operation, body) in rows {
+        let provider = provider();
+        record(&provider, steps(&["a"])).await?;
+        let verifier = engine(&provider, body).await?;
+
+        let report = verifier.verify_replay(ID).await?;
+
+        assert_eq!(
+            report.divergence,
+            Some(Divergence::Extra {
+                position: 1,
+                operation: operation.into(),
+            }),
+            "{operation}: {report:?}"
+        );
+        assert_eq!(
+            verifier.get_workflow_steps(ID).await?.len(),
+            1,
+            "{operation}: verification wrote a checkpoint"
+        );
+        assert!(
+            verifier.list_workflow_notifications(ID).await?.is_empty(),
+            "{operation}: a message was sent"
+        );
+        assert!(
+            verifier.list_workflow_events(ID).await?.is_empty(),
+            "{operation}: an event was set"
+        );
+        assert!(
+            provider
+                .get_workflow_status(&format!("{ID}-1"))
+                .await?
+                .is_none(),
+            "{operation}: a child workflow was started"
+        );
+    }
+    Ok(())
+}
+
 /// A call that is built and dropped claims a position without ever asking for
 /// the record at it. That must not count as having verified the history there:
 /// the recorded operation was never reached, whatever the position counter says.
@@ -501,7 +753,7 @@ async fn a_built_and_dropped_call_does_not_verify_the_history_under_it() -> Resu
     record(&provider, steps(&["a"])).await?;
 
     let report = engine(&provider, |ctx: DurableContext| async move {
-        // Claims position 0 and never polls it. Under a frontier-based check the
+        // Claims position 0 and never polls it. Under a counter-based check the
         // counter would read 1 and the history would look fully covered.
         drop(ctx.step("renamed", || async { Ok::<_, Error>(1_i64) }));
         Ok(0)
