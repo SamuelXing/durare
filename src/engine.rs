@@ -1529,6 +1529,7 @@ impl DurableEngine {
                 queue.clone(),
                 rt.clone(),
                 cancel.clone(),
+                self.max_recovery_attempts,
             )));
         }
         tasks.push(tokio::spawn(schedule_reconciler(
@@ -2748,6 +2749,47 @@ pub(crate) async fn dispatch_pending_workflows(
     Ok(recovered)
 }
 
+/// A stopped queued execution still consumes a global PENDING slot. Return it
+/// through the same ownership CAS used by explicit recovery, after backoff.
+/// Only this execution's generation is eligible; cancellation, another recovery
+/// or a terminal result wins. Storage outages retry the claim, not the body.
+async fn requeue_interrupted_run(
+    rt: &Runtime,
+    request: &RecoveryClaimRequest<'_>,
+    cancel: &CancellationToken,
+) {
+    let mut delay = Duration::from_millis(100)
+        .saturating_mul(1u32 << request.expected_attempts.clamp(0, 6))
+        .min(Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        let claim = rt.provider.claim_for_recovery(request).await;
+        match claim {
+            Ok(RecoveryClaim::Requeued) => {
+                rt.counters
+                    .workflows_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::info!(workflow_id = %request.workflow_id, "interrupted workflow returned to its queue");
+                return;
+            }
+            Ok(RecoveryClaim::Parked { attempts }) => {
+                rt.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(workflow_id = %request.workflow_id, attempts, "workflow parked: exceeded max recovery attempts");
+                return;
+            }
+            Ok(RecoveryClaim::Lost | RecoveryClaim::Claimed { .. }) => return,
+            Err(error) => {
+                tracing::warn!(workflow_id = %request.workflow_id, %error, "could not return interrupted workflow to queue; retrying recovery claim");
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
 /// The shared execution core: everything needed to create and run a workflow.
 ///
 /// Reachable both from [`DurableEngine`] methods and from inside a running
@@ -3051,6 +3093,7 @@ async fn queue_dispatch_loop(
     queue: Arc<WorkflowQueue>,
     rt: Arc<Runtime>,
     cancel: CancellationToken,
+    max_recovery_attempts: i32,
 ) {
     let provider = rt.provider.clone();
     let executor_id = rt.executor_id.clone();
@@ -3148,22 +3191,37 @@ async fn queue_dispatch_loop(
                         let auth = AuthContext::from_status(&wf);
                         let span =
                             rt.workflow_span(&wf.id, &wf.name, wf.queue_name.as_deref(), &auth);
-                        // Spawn through the tracker so `shutdown` drains this run.
+                        // Retain the claimed ownership generation for recovery:
+                        // another recovery/cancellation must make our CAS lose.
+                        let recovery_cancel = cancel.clone();
                         rt.tasks.spawn(async move {
-                            let _local = local_guard;
-                            // Terminal state is recorded by run_to_completion;
-                            // a handle observing this workflow polls it.
-                            let _ = run_to_completion(
-                                run_rt,
+                            let result = run_to_completion(
+                                run_rt.clone(),
                                 handler,
                                 wf.name,
-                                wf.id,
+                                wf.id.clone(),
                                 wf.input,
                                 wf.deadline_ms,
                                 auth,
                                 span,
                             )
                             .await;
+                            drop(local_guard);
+                            if matches!(result, Err(Error::RecoveryRequired(_))) {
+                                requeue_interrupted_run(
+                                    &run_rt,
+                                    &RecoveryClaimRequest {
+                                        workflow_id: &wf.id,
+                                        expected_executor: &wf.executor_id,
+                                        expected_attempts: wf.recovery_attempts,
+                                        new_executor: &run_rt.executor_id,
+                                        max_attempts: max_recovery_attempts,
+                                        requeue: true,
+                                    },
+                                    &recovery_cancel,
+                                )
+                                .await;
+                            }
                         });
                     }
                 }

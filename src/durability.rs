@@ -139,13 +139,23 @@
 //! terminal outcome wins, otherwise the caller receives `RecoveryRequired`.
 //! Concurrent cancellation/completion may already have changed the stored status.
 //!
-//! Recovery must be scheduled through the engine's existing recovery APIs; this
-//! error does not start an automatic retry loop. Every execution path emits an
-//! error event with `workflow_id`, `workflow`, `error`, and `recovery_required=true`,
-//! including queued, scheduled, child and recovered runs without an owning handle.
-//! Launch-time recovery does not automatically pick up new failures in a live
-//! process. Persistent decoding failures require a compatible reader or repaired
-//! data before recovery can succeed.
+//! A launched queue returns its stopped executions to the queue after backoff,
+//! using an atomic ownership check. Recovery obeys the configured recovery-attempt
+//! cap; exceeding it parks the workflow in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` and
+//! releases its queue slot. Recovery-claim storage failures retry with backoff
+//! against the same ownership generation. If a claim committed but its reply was
+//! lost, retrying cannot claim it again or spend another recovery attempt.
+//! Shutdown stops these attempts and leaves unfinished rows for later recovery.
+//!
+//! Non-queued executions still require the engine's explicit recovery APIs.
+//! Launch-time recovery does not pick up new failures in a live process. Every
+//! execution path emits an error event with `workflow_id`, `workflow`, `error`,
+//! and `recovery_required=true`. Persistent decoding failures require a compatible
+//! reader or repaired data before recovery can succeed.
+//!
+//! Stopping drops the workflow future: code after a caught storage failure,
+//! including asynchronous compensation, is not guaranteed to run. Keep necessary
+//! compensation durable and perform it from a separate, healthy execution.
 //!
 //! Errors returned by user step/transaction bodies remain business outcomes,
 //! including database errors. Failure to encode a body's return value is saved

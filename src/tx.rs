@@ -20,6 +20,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+/// A completed SQL attempt or a user-body failure. Infrastructure failures
+/// travel in the enclosing `Result`, never through the business retry policy.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) enum TransactionAttempt {
+    Committed(Value),
+    BodyFailed(Error),
+}
+
 /// A bound parameter for transactional-step SQL. Build these with
 /// [`params!`](crate::params) rather than by hand in the common case.
 #[derive(Clone, Debug, PartialEq)]
@@ -332,6 +340,10 @@ impl IsolationLevel {
 /// Re-raised [`Error::Recorded`](crate::Error::Recorded) diagnostics use this
 /// user budget too, even when their saved retry/conflict classifications are true.
 /// Only live driver failures enter the internal database retry loop.
+/// Non-transient failures of transaction machinery (`begin`, checkpoint encoding
+/// or insertion, `commit`, or rollback) bypass this business retry policy and
+/// require workflow recovery. They are never saved as the body's failure.
+/// This also applies to native data sources used by `transaction_on_with`.
 #[derive(Clone)]
 pub struct TransactionOptions {
     /// Checkpoint name recorded for this transactional step.

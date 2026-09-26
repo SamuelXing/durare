@@ -20,6 +20,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   serialized is recorded as a failed step, preventing recovery from rerunning
   its body just to encounter the same encoding failure. Recoverable failures
   emit a structured error event on every execution path, including detached runs.
+  SQL transaction machinery failures (including `begin`, checkpoint insertion
+  and `commit`) no longer enter `max_retries` / `retry_if` or become recorded
+  business failures; those options govern body errors. Existing live transient
+  database retries remain unchanged. Fix configuration faults before recovery.
+  Launched queues automatically requeue interrupted runs with backoff and an
+  ownership check, bounded by `max_recovery_attempts`; exhausted runs are parked
+  so they no longer consume queue concurrency. Non-queued runs still require
+  explicit recovery. Shutdown leaves unfinished recovery for a later executor.
+  The stopped workflow future is dropped; compensation after catching the fault
+  is not guaranteed to run.
 
 - **Breaking: recorded failures return the same error representation on the
   initial execution and replay.** Built-in variants retain their fields;

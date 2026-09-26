@@ -577,6 +577,18 @@ impl LogBuffer {
 
 #[tokio::test]
 async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()> {
+    // A global subscriber also observes spawned work on other runtime threads.
+    // This is the only subscriber installed by the library test binary.
+    let logs = LogBuffer::default();
+    let writer = logs.clone();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .unwrap();
     for mode in [
         "direct",
         "recovered",
@@ -586,14 +598,7 @@ async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()>
         "terminal",
         "panic",
     ] {
-        let logs = LogBuffer::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        logs.0.lock().unwrap().clear();
         let inner = Arc::new(InMemoryProvider::new());
         let fault = if mode == "terminal" {
             Fault::TerminalBefore
@@ -690,10 +695,11 @@ async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()>
         let observed = tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 let text = logs.text();
-                if text.contains("recovery_required=true")
-                    && text.contains(&expected_id)
-                    && text.contains("pool timed out")
-                {
+                if text.lines().any(|line| {
+                    line.contains("recovery_required=true")
+                        && line.contains(&format!("workflow_id={expected_id}"))
+                        && line.contains("pool timed out")
+                }) {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -865,6 +871,586 @@ async fn message_and_event_type_mismatches_remain_catchable() -> Result<()> {
                 .result()
                 .await?,
             ErrorCode::Serialization
+        );
+    }
+    Ok(())
+}
+
+/// Fail inside the SQL provider, after the user body returned successfully.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_transaction_machinery_faults_are_not_recorded() -> Result<()> {
+    for at_commit in [false, true] {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+        let provider = Arc::new(SqliteProvider::from_pool(pool.clone()));
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        sqlx::raw_sql("PRAGMA foreign_keys = ON; CREATE TABLE parent (id INTEGER PRIMARY KEY); CREATE TABLE effects (id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);")
+            .execute(&pool).await?;
+        if !at_commit {
+            sqlx::raw_sql("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON operation_outputs WHEN NEW.output IS NOT NULL BEGIN SELECT RAISE(ABORT, 'checkpoint insert unavailable'); END;")
+                .execute(&pool).await?;
+        }
+        let retries = Arc::new(AtomicUsize::new(0));
+        let counted = retries.clone();
+        engine.register("sql-fault", move |ctx: DurableContext, _: ()| {
+            let counted = counted.clone();
+            async move {
+                ctx.transaction_with(
+                    TransactionOptions::new("write")
+                        .retry_if(move |_| {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            true
+                        })
+                        .max_retries(1),
+                    move |tx| {
+                        Box::pin(async move {
+                            if at_commit {
+                                tx.execute("INSERT INTO effects VALUES (1)", &params![])
+                                    .await?;
+                            }
+                            Ok(42)
+                        })
+                    },
+                )
+                .await
+            }
+        });
+        let result = engine
+            .start::<_, i32>("sql-fault", (), WorkflowOptions::with_id("sql-fault"))
+            .await?
+            .result()
+            .await;
+        assert_eq!(result.unwrap_err().code(), ErrorCode::RecoveryRequired);
+        assert!(provider.get_step_result("sql-fault", 0).await?.is_none());
+        assert_eq!(
+            provider
+                .get_workflow_status("sql-fault")
+                .await?
+                .unwrap()
+                .status,
+            STATUS_PENDING
+        );
+        assert_eq!(
+            retries.load(Ordering::SeqCst),
+            0,
+            "machinery faults do not enter the business retry predicate"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM effects")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            count, 0,
+            "application writes roll back with the failed checkpoint"
+        );
+        if at_commit {
+            sqlx::query("INSERT INTO parent VALUES (1)")
+                .execute(&pool)
+                .await?;
+        } else {
+            sqlx::query("DROP TRIGGER fail_checkpoint")
+                .execute(&pool)
+                .await?;
+        }
+        let owner = provider
+            .get_workflow_status("sql-fault")
+            .await?
+            .unwrap()
+            .executor_id;
+        engine.recover_pending_for(&[owner]).await?;
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.retrieve_workflow::<i32>("sql-fault").await?.result()
+            )
+            .await
+            .unwrap()?,
+            42
+        );
+        engine.shutdown(Duration::from_secs(5)).await?;
+    }
+    Ok(())
+}
+
+async fn queue_recovers_capacity(inner: Arc<dyn StateProvider>) -> Result<()> {
+    // Both the checkpoint and the first recovery claim fail. The latter must
+    // retry without running the workflow until ownership has been acquired.
+    let provider = Arc::new(FaultProvider::new(
+        inner.clone(),
+        Fault::WriteThenClaimFailure,
+    ));
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("queued-recovery", |ctx: DurableContext, _: ()| async move {
+        ctx.step("work", || async { Ok(42) }).await
+    });
+    engine.register_queue(
+        WorkflowQueue::new("limited")
+            .global_concurrency(1)
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+    let first = engine
+        .start::<_, i32>(
+            "queued-recovery",
+            (),
+            WorkflowOptions::with_id("interrupted").queue("limited"),
+        )
+        .await?;
+    let second = engine
+        .start::<_, i32>(
+            "queued-recovery",
+            (),
+            WorkflowOptions::with_id("following").queue("limited"),
+        )
+        .await?;
+    let results = tokio::time::timeout(Duration::from_secs(5), async {
+        (first.result().await, second.result().await)
+    })
+    .await;
+    engine.shutdown(Duration::from_secs(2)).await?;
+    let (first, second) =
+        results.expect("a stopped run must not permanently consume the queue's global slot");
+    assert_eq!(first?, 42);
+    assert_eq!(second?, 42);
+    assert_eq!(
+        inner
+            .get_workflow_status("interrupted")
+            .await?
+            .unwrap()
+            .recovery_attempts
+            + inner
+                .get_workflow_status("following")
+                .await?
+                .unwrap()
+                .recovery_attempts,
+        1
+    );
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_transaction_machinery_faults_are_not_recorded() -> Result<()> {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let admin = sqlx::PgPool::connect(&url).await?;
+    for at_commit in [false, true] {
+        let schema = format!("checkpoint_fault_{}", uuid::Uuid::new_v4().simple());
+        let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        let timing = if at_commit {
+            "CONSTRAINT TRIGGER fail_checkpoint AFTER INSERT"
+        } else {
+            "TRIGGER fail_checkpoint BEFORE INSERT"
+        };
+        let deferred = if at_commit {
+            "DEFERRABLE INITIALLY DEFERRED"
+        } else {
+            ""
+        };
+        sqlx::raw_sql(&format!("CREATE TABLE {schema}.effects (id INTEGER); CREATE FUNCTION {schema}.reject_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'checkpoint unavailable' USING ERRCODE = '53100'; END $$; CREATE {timing} ON {schema}.operation_outputs {deferred} FOR EACH ROW WHEN (NEW.output IS NOT NULL) EXECUTE FUNCTION {schema}.reject_checkpoint();"))
+            .execute(&admin).await?;
+        let retries = Arc::new(AtomicUsize::new(0));
+        let counted = retries.clone();
+        engine.register("sql-fault", move |ctx: DurableContext, _: ()| {
+            let counted = counted.clone();
+            async move {
+                ctx.transaction_with(
+                    TransactionOptions::new("write")
+                        .max_retries(1)
+                        .retry_if(move |_| {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            true
+                        }),
+                    |tx| {
+                        Box::pin(async move {
+                            tx.execute("INSERT INTO effects VALUES (1)", &params![])
+                                .await?;
+                            Ok(42)
+                        })
+                    },
+                )
+                .await
+            }
+        });
+        let result = engine
+            .start::<_, i32>("sql-fault", (), WorkflowOptions::with_id("sql-fault"))
+            .await?
+            .result()
+            .await;
+        assert_eq!(result.unwrap_err().code(), ErrorCode::RecoveryRequired);
+        assert!(provider.get_step_result("sql-fault", 0).await?.is_none());
+        assert_eq!(
+            provider
+                .get_workflow_status("sql-fault")
+                .await?
+                .unwrap()
+                .status,
+            STATUS_PENDING
+        );
+        assert_eq!(retries.load(Ordering::SeqCst), 0);
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.effects"))
+            .fetch_one(&admin)
+            .await?;
+        assert_eq!(
+            count, 0,
+            "the failed checkpoint rolls back application writes"
+        );
+        sqlx::raw_sql(&format!(
+            "DROP TRIGGER fail_checkpoint ON {schema}.operation_outputs"
+        ))
+        .execute(&admin)
+        .await?;
+        let owner = provider
+            .get_workflow_status("sql-fault")
+            .await?
+            .unwrap()
+            .executor_id;
+        engine.recover_pending_for(&[owner]).await?;
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                engine.retrieve_workflow::<i32>("sql-fault").await?.result()
+            )
+            .await
+            .unwrap()?,
+            42
+        );
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.effects"))
+            .fetch_one(&admin)
+            .await?;
+        assert_eq!(count, 1);
+        engine.shutdown(Duration::from_secs(5)).await?;
+        sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&admin)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn native_transaction_is_refused_after_an_execution_fault() -> Result<()> {
+    let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+    let ds = inner.system_datasource();
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::Read));
+    let mut engine = DurableEngine::new(provider).await?;
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (seen, body_runs) = (observed.clone(), ran.clone());
+    engine.register("native-gate", move |ctx: DurableContext, _: ()| {
+        let (ds, seen, body_runs) = (ds.clone(), seen.clone(), body_runs.clone());
+        async move {
+            let _ = ctx.step("fault", || async { Ok(()) }).await;
+            let position = ctx.current_step_id();
+            let result = ctx
+                .transaction_on(
+                    &ds,
+                    "blocked",
+                    async move |_: &mut sqlx::SqliteConnection| {
+                        body_runs.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await;
+            *seen.lock().unwrap() =
+                Some((result.unwrap_err().code(), position, ctx.current_step_id()));
+            Ok(())
+        }
+    });
+    let result = engine
+        .start::<_, ()>("native-gate", (), WorkflowOptions::with_id("native-gate"))
+        .await?
+        .result()
+        .await;
+    assert_eq!(result.unwrap_err().code(), ErrorCode::RecoveryRequired);
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some((ErrorCode::RecoveryRequired, 1, 1))
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert!(inner.get_step_result("native-gate", 1).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn interrupted_queue_runs_release_global_capacity_after_recovery() -> Result<()> {
+    queue_recovers_capacity(Arc::new(InMemoryProvider::new())).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_interrupted_queue_recovers_capacity() -> Result<()> {
+    queue_recovers_capacity(Arc::new(SqliteProvider::connect("sqlite::memory:").await?)).await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_interrupted_queue_recovers_capacity() -> Result<()> {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let schema = format!("queue_fault_{}", uuid::Uuid::new_v4().simple());
+    let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+    let result = queue_recovers_capacity(provider).await;
+    let admin = sqlx::PgPool::connect(&url).await?;
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&admin)
+        .await?;
+    result
+}
+
+#[tokio::test]
+async fn persistent_queue_faults_park_at_the_recovery_cap() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteAlways));
+    let mut builder = DurableEngine::builder(provider);
+    builder.max_recovery_attempts(1);
+    let mut engine = builder.build().await?;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = runs.clone();
+    engine.register("fault", move |ctx: DurableContext, _: ()| {
+        let counted = counted.clone();
+        async move {
+            ctx.step("fault", || async {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        }
+    });
+    engine.register("healthy", |_: DurableContext, _: ()| async { Ok(42) });
+    engine.register_queue(
+        WorkflowQueue::new("limited")
+            .global_concurrency(1)
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+    let bad = engine
+        .start::<_, ()>(
+            "fault",
+            (),
+            WorkflowOptions::with_id("fault").queue("limited"),
+        )
+        .await?;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), bad.result()).await;
+    assert!(stopped
+        .expect("persistent fault must reach the cap")
+        .is_err());
+    assert_eq!(
+        inner.get_workflow_status("fault").await?.unwrap().status,
+        STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "initial run plus one recovery"
+    );
+    let healthy = engine
+        .start::<_, i32>(
+            "healthy",
+            (),
+            WorkflowOptions::with_id("healthy").queue("limited"),
+        )
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), healthy.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn queue_recovery_respects_cancellation_and_shutdown() -> Result<()> {
+    for cancel_workflow in [false, true] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteAlways));
+        let mut engine = DurableEngine::new(provider).await?;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counted = runs.clone();
+        engine.register("fault", move |ctx: DurableContext, _: ()| {
+            let counted = counted.clone();
+            async move {
+                ctx.step("fault", || async {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }
+        });
+        engine.register_queue(
+            WorkflowQueue::new("limited").base_polling_interval(Duration::from_millis(10)),
+        );
+        engine.launch().await?;
+        engine
+            .start::<_, ()>(
+                "fault",
+                (),
+                WorkflowOptions::with_id("fault").queue("limited"),
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while runs.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if cancel_workflow {
+            engine.cancel_workflow("fault").await?;
+            // Let the recovery CAS encounter the cancelled row.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        engine.shutdown(Duration::from_secs(2)).await?;
+        let status = inner.get_workflow_status("fault").await?.unwrap();
+        assert_eq!(
+            status.status,
+            if cancel_workflow {
+                STATUS_CANCELLED
+            } else {
+                STATUS_PENDING
+            }
+        );
+        assert_eq!(status.recovery_attempts, 0);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[derive(Clone)]
+struct BeginFaultDataSource {
+    inner: SqliteDataSource,
+    attempts: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "sqlite")]
+#[async_trait::async_trait]
+impl crate::datasource::sealed::Backend for BeginFaultDataSource {
+    type Conn = sqlx::SqliteConnection;
+    type NativeTx = sqlx::Transaction<'static, sqlx::Sqlite>;
+    async fn begin(&self, _: IsolationLevel, _: bool) -> Result<Self::NativeTx> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        Err(Error::Db(sqlx::Error::Protocol(
+            "transaction setup failed".into(),
+        )))
+    }
+    async fn commit(&self, tx: Self::NativeTx) -> Result<()> {
+        self.inner.commit(tx).await
+    }
+    async fn rollback(&self, tx: Self::NativeTx) -> Result<()> {
+        self.inner.rollback(tx).await
+    }
+    async fn tx_fingerprint(&self, conn: &mut Self::Conn) -> Result<Option<String>> {
+        self.inner.tx_fingerprint(conn).await
+    }
+    async fn fetch_completion(
+        &self,
+        id: &str,
+        seq: i32,
+    ) -> Result<Option<crate::datasource::CompletionRow>> {
+        self.inner.fetch_completion(id, seq).await
+    }
+    async fn insert_completion(
+        &self,
+        conn: &mut Self::Conn,
+        id: &str,
+        seq: i32,
+        output: Option<&str>,
+        error: Option<&str>,
+        serialization: &str,
+    ) -> Result<bool> {
+        self.inner
+            .insert_completion(conn, id, seq, output, error, serialization)
+            .await
+    }
+    async fn insert_failure(
+        &self,
+        id: &str,
+        seq: i32,
+        error: &str,
+        serialization: &str,
+    ) -> Result<()> {
+        self.inner
+            .insert_failure(id, seq, error, serialization)
+            .await
+    }
+    fn kind(&self) -> &crate::datasource::DataSourceKind {
+        self.inner.kind()
+    }
+    async fn insert_checkpoint(
+        &self,
+        conn: &mut Self::Conn,
+        id: &str,
+        seq: i32,
+        name: &str,
+        output: &str,
+        serialization: &str,
+        started: i64,
+    ) -> Result<bool> {
+        self.inner
+            .insert_checkpoint(conn, id, seq, name, output, serialization, started)
+            .await
+    }
+}
+#[cfg(feature = "sqlite")]
+impl crate::datasource::DataSource for BeginFaultDataSource {}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn datasource_setup_failures_bypass_the_business_retry_policy() -> Result<()> {
+    for system in [false, true] {
+        let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let retries = Arc::new(AtomicUsize::new(0));
+        let body_runs = Arc::new(AtomicUsize::new(0));
+        let ds = BeginFaultDataSource {
+            inner: if system {
+                inner.system_datasource()
+            } else {
+                SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+            },
+            attempts: attempts.clone(),
+        };
+        // Forward provider identity so the system data-source path is exercised.
+        let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::ChildBefore));
+        let mut engine = DurableEngine::new(provider).await?;
+        let (predicates, bodies) = (retries.clone(), body_runs.clone());
+        engine.register("setup", move |ctx: DurableContext, _: ()| {
+            let (ds, predicates, bodies) = (ds.clone(), predicates.clone(), bodies.clone());
+            async move {
+                ctx.transaction_on_with(
+                    &ds,
+                    TransactionOptions::new("setup")
+                        .max_retries(3)
+                        .retry_if(move |_| {
+                            predicates.fetch_add(1, Ordering::SeqCst);
+                            true
+                        }),
+                    async move |_: &mut sqlx::SqliteConnection| {
+                        bodies.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            }
+        });
+        let result = engine
+            .start::<_, ()>("setup", (), WorkflowOptions::with_id("setup"))
+            .await?
+            .result()
+            .await;
+        assert_eq!(result.unwrap_err().code(), ErrorCode::RecoveryRequired);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(retries.load(Ordering::SeqCst), 0);
+        assert_eq!(body_runs.load(Ordering::SeqCst), 0);
+        assert!(inner.get_step_result("setup", 0).await?.is_none());
+        assert_eq!(
+            inner.get_workflow_status("setup").await?.unwrap().status,
+            STATUS_PENDING
         );
     }
     Ok(())

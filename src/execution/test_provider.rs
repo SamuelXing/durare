@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 pub enum Fault {
     Read,
     WriteBefore,
+    WriteAlways,
+    WriteThenClaimFailure,
+    ClaimFailure,
     WriteAfter,
     TerminalBefore,
     TerminalAfter,
@@ -32,6 +35,13 @@ impl FaultProvider {
     }
     fn take(&self, fault: Fault) -> bool {
         let mut armed = self.fault.lock().unwrap();
+        if *armed == Some(Fault::WriteAlways) && fault == Fault::WriteBefore {
+            return true;
+        }
+        if *armed == Some(Fault::WriteThenClaimFailure) && fault == Fault::WriteBefore {
+            *armed = Some(Fault::ClaimFailure);
+            return true;
+        }
         if *armed == Some(fault) {
             *armed = None;
             true
@@ -48,6 +58,18 @@ impl FaultProvider {
 impl StateProvider for FaultProvider {
     fn serializer(&self) -> Serializer {
         self.inner.serializer()
+    }
+    fn provider_identity(&self) -> Option<&crate::provider::ProviderIdentity> {
+        self.inner.provider_identity()
+    }
+    fn supports_listen_notify(&self) -> bool {
+        self.inner.supports_listen_notify()
+    }
+    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
+        self.inner.await_change(wait, within).await
+    }
+    async fn ping(&self) -> Result<()> {
+        self.inner.ping().await
     }
     async fn init(&self) -> Result<()> {
         self.inner.init().await
@@ -249,6 +271,9 @@ impl StateProvider for FaultProvider {
         self.inner.fork_workflow(params).await
     }
     async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim> {
+        if self.take(Fault::ClaimFailure) {
+            return Self::failure();
+        }
         self.inner.claim_for_recovery(req).await
     }
     async fn record_child_workflow(

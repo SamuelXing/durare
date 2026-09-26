@@ -1510,6 +1510,12 @@ pub trait StateProvider: Send + Sync {
     /// (serialization failure / deadlock) is *not* recorded — it restarts the
     /// whole transaction on a fresh one, re-running `body`. SQL backends only; the
     /// in-memory provider returns an error.
+    ///
+    /// Only failures returned by `body` enter the application retry policy and
+    /// become recorded failures. Non-transient errors from transaction setup,
+    /// checkpoint encoding/insertion, commit or rollback must be returned as
+    /// storage errors without recording a step outcome. Preserve their source
+    /// even when both body and infrastructure use the same `Error` variant.
     async fn run_transaction_step(
         &self,
         workflow_id: &str,
