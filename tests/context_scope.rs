@@ -160,7 +160,7 @@ async fn body_boundary_errors_do_not_retry_the_enclosing_step() -> Result<()> {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn native_transactions_refuse_first_poll_before_effect_or_position() -> Result<()> {
+async fn native_transactions_refuse_spawned_calls_before_effect_or_position() -> Result<()> {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -173,29 +173,25 @@ async fn native_transactions_refuse_first_poll_before_effect_or_position() -> Re
         let ds = ds.clone();
         async move {
             tokio::spawn(async move {
-                refused(
-                    escaped
-                        .transaction_on(&ds, "escaped", async |_conn| {
-                            panic!("refused transaction body ran");
-                            #[allow(unreachable_code)]
-                            Ok(())
-                        })
-                        .await,
+                let escaped_call = escaped.transaction_on(&ds, "escaped", async |_conn| {
+                    panic!("refused transaction body ran");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                });
+                assert_eq!(escaped.current_step_id(), 0);
+                refused(escaped_call.await);
+                assert_eq!(escaped.current_step_id(), 0);
+                let escaped_with = escaped.transaction_on_with(
+                    &ds,
+                    TransactionOptions::new("escaped-with"),
+                    async |_conn| {
+                        panic!("refused transaction body ran");
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    },
                 );
                 assert_eq!(escaped.current_step_id(), 0);
-                refused(
-                    escaped
-                        .transaction_on_with(
-                            &ds,
-                            TransactionOptions::new("escaped-with"),
-                            async |_conn| {
-                                panic!("refused transaction body ran");
-                                #[allow(unreachable_code)]
-                                Ok(())
-                            },
-                        )
-                        .await,
-                );
+                refused(escaped_with.await);
                 assert_eq!(escaped.current_step_id(), 0);
             })
             .await

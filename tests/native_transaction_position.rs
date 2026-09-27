@@ -140,43 +140,53 @@ async fn native_transaction_values_survive_a_different_replay_poll_order() -> Re
 
 #[tokio::test]
 async fn dropped_native_transactions_spend_positions_without_running() -> Result<()> {
-    let (mut engine, ds, pool) = setup(true).await?;
-    engine.register("drop", move |ctx: DurableContext, _: ()| {
-        let ds = ds.clone();
-        async move {
-            let first = ctx.transaction_on(&ds, "dropped", async |_conn| {
-                panic!("a dropped native body ran");
-                #[allow(unreachable_code)]
-                Ok(())
-            });
-            let second = ctx.transaction_on_with(
-                &ds,
-                TransactionOptions::new("dropped-with"),
-                async |_conn| {
+    for external in [false, true] {
+        let (mut engine, ds, pool) = setup(external).await?;
+        engine.register("drop", move |ctx: DurableContext, _: ()| {
+            let ds = ds.clone();
+            async move {
+                let first = ctx.transaction_on(&ds, "dropped", async |_conn| {
                     panic!("a dropped native body ran");
                     #[allow(unreachable_code)]
                     Ok(())
-                },
-            );
-            drop((first, second));
-            ctx.step("after", || async { Ok(()) }).await
-        }
-    });
-    engine
-        .start::<_, ()>("drop", (), WorkflowOptions::with_id("drop"))
-        .await?
-        .result()
-        .await?;
-    assert_eq!(
-        common::recorded(&engine, "drop").await?,
-        [(2, "after".into())]
-    );
-    let witnesses: i64 = sqlx::query_scalar("SELECT count(*) FROM transaction_completion")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(witnesses, 0);
-    assert_eq!(engine.verify_replay("drop").await?.divergence, None);
-    pool.close().await;
+                });
+                let second = ctx.transaction_on_with(
+                    &ds,
+                    TransactionOptions::new("dropped-with"),
+                    async |_conn| {
+                        panic!("a dropped native body ran");
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    },
+                );
+                drop((first, second));
+                ctx.step("after", || async { Ok(()) }).await
+            }
+        });
+        engine
+            .start::<_, ()>("drop", (), WorkflowOptions::with_id("drop"))
+            .await?
+            .result()
+            .await?;
+        assert_eq!(
+            common::recorded(&engine, "drop").await?,
+            [(2, "after".into())]
+        );
+        let witnesses: i64 = if external {
+            sqlx::query_scalar("SELECT count(*) FROM transaction_completion")
+                .fetch_one(&pool)
+                .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'transaction_completion'",
+            )
+            .fetch_one(&pool)
+            .await?
+        };
+        assert_eq!(witnesses, 0);
+        assert_eq!(engine.verify_replay("drop").await?.divergence, None);
+        pool.close().await;
+    }
     Ok(())
 }
 
