@@ -116,14 +116,27 @@ mod position {
 
 use position::Position;
 
-/// The same check protects PendingStep and the async calls that do not yet
-/// return one. It runs before polling any of their user or provider work.
-fn check_call_poll(execution: &crate::execution::Execution, operation: &'static str) -> Result<()> {
+/// Construction and polling share error precedence. Once interrupted, an
+/// execution cannot turn its recovery signal into a recordable body refusal.
+fn check_call(
+    execution: &crate::execution::Execution,
+    operation: &'static str,
+    body_error: impl FnOnce() -> Error,
+) -> Result<()> {
     execution.check_placement(operation)?;
+    execution.check()?;
     if in_a_body() {
-        return Err(Error::DurableCallCrossedBody(operation.to_owned()));
+        return Err(body_error());
     }
-    execution.check()
+    Ok(())
+}
+
+/// Protect PendingStep and the async calls that do not yet return one before
+/// polling any of their user or provider work.
+fn check_call_poll(execution: &crate::execution::Execution, operation: &'static str) -> Result<()> {
+    check_call(execution, operation, || {
+        Error::DurableCallCrossedBody(operation.to_owned())
+    })
 }
 
 async fn poll_in_execution<T>(
@@ -175,7 +188,9 @@ pub struct StepOptions {
     /// Optional predicate deciding whether a given step error is retryable. When
     /// it returns `false` the step is *not* retried — the error propagates
     /// immediately even if `max_retries` attempts remain, so a permanent failure
-    /// fails fast. `None` (the default) retries every error up to `max_retries`.
+    /// fails fast. `None` (the default) retries body errors up to `max_retries`.
+    /// Durable-scope violations and execution/observation interruptions bypass
+    /// this policy, including the predicate.
     pub retry_if: Option<RetryPredicate>,
 }
 
@@ -217,7 +232,8 @@ impl StepOptions {
     }
 
     /// Set a predicate that decides whether a step error is retryable. It is
-    /// consulted on every failure before backoff; returning `false` stops retries
+    /// consulted on body failures before backoff, except durable-scope violations
+    /// and execution/observation interruptions. Returning `false` stops retries
     /// at once (the error propagates), so permanent errors don't burn attempts:
     ///
     /// ```
@@ -404,15 +420,10 @@ impl DurableContext {
     /// [`deprecate_patch`](Self::deprecate_patch)) and so cannot go through
     /// [`claim_position`](Self::claim_position).
     pub(super) fn refuse_inside_body(&self, operation: &'static str) -> Result<()> {
-        self.execution.check_placement(operation)?;
-        self.execution.check()?;
-        if in_a_body() {
-            return Err(Error::NestedDurableCall {
-                workflow_id: self.workflow_id.clone(),
-                operation: operation.to_owned(),
-            });
-        }
-        Ok(())
+        check_call(&self.execution, operation, || Error::NestedDurableCall {
+            workflow_id: self.workflow_id.clone(),
+            operation: operation.to_owned(),
+        })
     }
 
     /// Check the operation now executing at `seq` against the name recorded
@@ -1936,6 +1947,7 @@ impl DurableContext {
                 Err(error @ (Error::RecoveryRequired(_) | Error::ObservationFailed(_))) => {
                     return Err(self.execution.body_error(error));
                 }
+                Err(error) if error.is_scope_violation() => return Err(error),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,
                     // regardless of remaining attempts (fail fast on permanent errors).
@@ -2842,5 +2854,26 @@ impl<T> Future for PendingStep<'_, T> {
 impl<T> std::fmt::Debug for PendingStep<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingStep").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_latched_failure_precedes_a_poll_body_refusal() {
+        let execution = crate::execution::Execution::new("faulted");
+        execution.record(Error::Db(sqlx::Error::PoolTimedOut));
+        execution
+            .scope(|| {
+                in_body(|| async {
+                    assert!(matches!(
+                        check_call_poll(&execution, "step"),
+                        Err(Error::RecoveryRequired(_))
+                    ));
+                })
+            })
+            .await;
     }
 }

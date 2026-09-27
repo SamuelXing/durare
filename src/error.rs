@@ -299,6 +299,15 @@ pub enum Error {
 }
 
 impl Error {
+    /// Retrying a body cannot repair an invalid durable-call scope. Use the
+    /// stable code so a re-raised recorded diagnostic follows the same policy.
+    pub(crate) fn is_scope_violation(&self) -> bool {
+        matches!(
+            self.code(),
+            ErrorCode::NestedDurableCall | ErrorCode::DurableCallOutsideExecution
+        )
+    }
+
     /// Construct an application-level error from anything string-like.
     pub fn app(msg: impl Into<String>) -> Self {
         Error::App {

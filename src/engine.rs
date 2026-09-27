@@ -2226,7 +2226,7 @@ impl DurableEngine {
     /// # What it does not catch
     ///
     /// It re-runs the function, so what it sees is the sequence of durable
-    /// operations. That bounds it in three ways:
+    /// operations. That bounds it in two ways:
     ///
     /// - Non-determinism that does not change the sequence is invisible. A body
     ///   that reads the clock, iterates a `HashMap`, or branches on an
@@ -2234,13 +2234,13 @@ impl DurableEngine {
     ///   this time — and a coin-flip that happens to land the recorded way
     ///   passes too. The [determinism guide](crate::determinism) is still the
     ///   rulebook; this is a check, not a proof.
-    /// - A durable call made from a `tokio::spawn`ed task is not attributed to
-    ///   the body that spawned it. The nesting guard's task-local does not reach
-    ///   a spawned task either, and for the same reason: the position it claims
-    ///   belongs to whichever task got there first.
     /// - It judges one recorded history. Another workflow of the same name, down
     ///   a different branch, can still diverge — verify the runs you are about
     ///   to carry across the deploy, not one of them.
+    ///
+    /// Durable calls from spawned tasks are refused with
+    /// [`Error::DurableCallOutsideExecution`], just as in ordinary execution.
+    /// The guard runs even when the call would otherwise replay a checkpoint.
     ///
     /// # Errors
     ///

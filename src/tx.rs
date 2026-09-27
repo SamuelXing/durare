@@ -344,6 +344,7 @@ impl IsolationLevel {
 /// or insertion, `commit`, or rollback) bypass this business retry policy and
 /// require workflow recovery. They are never saved as the body's failure.
 /// This also applies to native data sources used by `transaction_on_with`.
+/// Durable-scope violations fail immediately without invoking `retry_if`.
 #[derive(Clone)]
 pub struct TransactionOptions {
     /// Checkpoint name recorded for this transactional step.
@@ -362,8 +363,9 @@ pub struct TransactionOptions {
     pub max_interval: Duration,
     /// Optional predicate deciding whether a body error is retryable. Returning
     /// `false` stops retries immediately even with attempts remaining, so a
-    /// permanent error fails fast. `None` (the default) retries every error up to
-    /// `max_retries`. A transaction conflict is retried regardless of this.
+    /// permanent error fails fast. `None` (the default) retries body errors up to
+    /// `max_retries`. Durable-scope violations bypass this policy and predicate.
+    /// A live transaction conflict is retried regardless of this.
     pub retry_if: Option<RetryPredicate>,
 }
 
@@ -421,7 +423,8 @@ impl TransactionOptions {
 
     /// Set a predicate deciding whether a body error is retryable. It is
     /// consulted on body failures before backoff; output-encoding failures and
-    /// execution/observation interruptions bypass it. Returning `false` stops retries
+    /// execution/observation interruptions and durable-scope violations bypass it.
+    /// Returning `false` stops retries
     /// at once (the error propagates), so a permanent failure doesn't burn
     /// attempts:
     ///
@@ -460,6 +463,7 @@ impl TransactionOptions {
                 | Error::ObservationFailed(_)
                 | Error::OutputSerialization(_)
         ) && !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
+            && !err.is_scope_violation()
             && attempt < self.max_retries
             && self.retry_if.as_ref().is_none_or(|p| p(err))
     }
@@ -528,6 +532,26 @@ fn bind_sqlite<'q>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_violations_bypass_transaction_retry_predicates() {
+        let opts = TransactionOptions::new("outer")
+            .max_retries(3)
+            .retry_if(|_| panic!("scope violations must bypass user retries"));
+        for error in [
+            Error::NestedDurableCall {
+                workflow_id: "wf".into(),
+                operation: "step".into(),
+            },
+            Error::DurableCallCrossedBody("step".into()),
+            Error::DurableCallOutsideExecution {
+                workflow_id: "wf".into(),
+                operation: "step".into(),
+            },
+        ] {
+            assert!(!opts.should_user_retry(&error, 0));
+        }
+    }
 
     #[cfg(feature = "postgres")]
     #[test]

@@ -1,6 +1,220 @@
 use durare::{
-    DurableContext, DurableEngine, InMemoryProvider, Result, StateProvider, WorkflowOptions,
+    DurableContext, DurableEngine, ErrorCode, InMemoryProvider, Result, StateProvider, StepOptions,
+    TransactionOptions, WorkflowOptions,
 };
+use std::time::Duration;
+
+/// A retry predicate cannot authorize repeating a durable-scope violation.
+#[tokio::test]
+async fn a_spawned_call_does_not_retry_its_enclosing_step() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let predicates = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let checks = predicates.clone();
+    engine.register("retry", move |ctx: DurableContext, _: ()| {
+        let calls = calls.clone();
+        let checks = checks.clone();
+        async move {
+            ctx.step_with(
+                StepOptions::new("outer")
+                    .max_retries(3)
+                    .base_interval(Duration::ZERO)
+                    .retry_if(move |_| {
+                        checks.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let escaped = ctx.clone();
+                    async move {
+                        tokio::spawn(
+                            async move { escaped.step("escaped", || async { Ok(()) }).await },
+                        )
+                        .await
+                        .unwrap()
+                    }
+                },
+            )
+            .await
+        }
+    });
+    refused(
+        engine
+            .start::<_, ()>("retry", (), WorkflowOptions::with_id("retry"))
+            .await?
+            .result()
+            .await,
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(predicates.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.get_workflow_steps("retry").await?.len(), 1);
+    let replay = engine.verify_replay("retry").await?;
+    assert_eq!((replay.recorded, replay.matched), (1, 1));
+    assert_eq!(replay.divergence, None);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_spawned_call_does_not_retry_its_enclosing_transactions() -> Result<()> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    let provider = Arc::new(durare::SqliteProvider::from_pool(pool.clone()));
+    let ds = provider.system_datasource();
+    let mut engine = DurableEngine::new(provider).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let predicates = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    let checks = predicates.clone();
+    engine.register("retry", move |ctx: DurableContext, native: bool| {
+        let calls = calls.clone();
+        let checks = checks.clone();
+        let ds = ds.clone();
+        async move {
+            let opts = TransactionOptions::new("outer")
+                .max_retries(3)
+                .base_interval(Duration::ZERO)
+                .retry_if(move |_| {
+                    checks.fetch_add(1, Ordering::SeqCst);
+                    true
+                });
+            let body_ctx = ctx.clone();
+            let escape = move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let escaped = body_ctx.clone();
+                async move {
+                    tokio::spawn(async move { escaped.step("escaped", || async { Ok(()) }).await })
+                        .await
+                        .unwrap()
+                }
+            };
+            if native {
+                ctx.transaction_on_with(&ds, opts, async move |_conn| escape().await)
+                    .await
+            } else {
+                ctx.transaction_with(opts, move |_tx| Box::pin(escape()))
+                    .await
+            }
+        }
+    });
+    for (i, native) in [false, true].into_iter().enumerate() {
+        let id = format!("retry-{i}");
+        refused(
+            engine
+                .start::<_, ()>("retry", native, WorkflowOptions::with_id(&id))
+                .await?
+                .result()
+                .await,
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), i + 1);
+        assert_eq!(predicates.load(Ordering::SeqCst), 0);
+        assert_eq!(engine.get_workflow_steps(&id).await?.len(), 1);
+        let replay = engine.verify_replay(&id).await?;
+        assert_eq!((replay.recorded, replay.matched), (1, 1));
+        assert_eq!(replay.divergence, None);
+        assert_eq!(attempts.load(Ordering::SeqCst), i + 1);
+    }
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn body_boundary_errors_do_not_retry_the_enclosing_step() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let calls = attempts.clone();
+    engine.register("boundary", move |ctx: DurableContext, crossed: bool| {
+        let calls = calls.clone();
+        async move {
+            let mut pending = crossed.then(|| ctx.step("inner", || async { Ok(()) }));
+            ctx.step_with(
+                StepOptions::new("outer")
+                    .max_retries(3)
+                    .base_interval(Duration::ZERO),
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    pending
+                        .take()
+                        .unwrap_or_else(|| ctx.step("inner", || async { Ok(()) }))
+                },
+            )
+            .await
+        }
+    });
+    for (i, crossed) in [false, true].into_iter().enumerate() {
+        let error = engine
+            .start::<_, ()>("boundary", crossed, WorkflowOptions::default())
+            .await?
+            .result()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NestedDurableCall);
+        assert_eq!(attempts.load(Ordering::SeqCst), i + 1);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn native_transactions_refuse_first_poll_before_effect_or_position() -> Result<()> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    let provider = Arc::new(durare::SqliteProvider::from_pool(pool.clone()));
+    let ds = provider.system_datasource();
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("native", move |ctx: DurableContext, _: ()| {
+        let escaped = ctx.clone();
+        let ds = ds.clone();
+        async move {
+            tokio::spawn(async move {
+                refused(
+                    escaped
+                        .transaction_on(&ds, "escaped", async |_conn| {
+                            panic!("refused transaction body ran");
+                            #[allow(unreachable_code)]
+                            Ok(())
+                        })
+                        .await,
+                );
+                assert_eq!(escaped.current_step_id(), 0);
+                refused(
+                    escaped
+                        .transaction_on_with(
+                            &ds,
+                            TransactionOptions::new("escaped-with"),
+                            async |_conn| {
+                                panic!("refused transaction body ran");
+                                #[allow(unreachable_code)]
+                                Ok(())
+                            },
+                        )
+                        .await,
+                );
+                assert_eq!(escaped.current_step_id(), 0);
+            })
+            .await
+            .unwrap();
+            assert_eq!(ctx.current_step_id(), 0);
+            ctx.step("valid", || async { Ok(()) }).await
+        }
+    });
+    engine
+        .start::<_, ()>("native", (), WorkflowOptions::with_id("native"))
+        .await?
+        .result()
+        .await?;
+    let steps = engine.get_workflow_steps("native").await?;
+    assert_eq!(steps.len(), 1);
+    assert_eq!((steps[0].step_id, steps[0].name.as_str()), (0, "valid"));
+    pool.close().await;
+    Ok(())
+}
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
