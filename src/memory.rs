@@ -837,7 +837,7 @@ impl StateProvider for InMemoryProvider {
         let Some(row) = g.workflows.get_mut(id) else {
             return Ok(false);
         };
-        if is_terminal(&row.status) && row.status != STATUS_CANCELLED {
+        if matches!(row.status.as_str(), STATUS_SUCCESS | STATUS_ERROR) {
             return Ok(false);
         }
         row.status = STATUS_PENDING.to_string();
@@ -889,7 +889,7 @@ impl StateProvider for InMemoryProvider {
                 continue;
             };
             // Same gate as resume_workflow: skip only SUCCESS/ERROR.
-            if is_terminal(&row.status) && row.status != STATUS_CANCELLED {
+            if matches!(row.status.as_str(), STATUS_SUCCESS | STATUS_ERROR) {
                 continue;
             }
             row.status = STATUS_PENDING.to_string();

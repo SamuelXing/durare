@@ -1,12 +1,31 @@
 //! Backend-free tests using the in-memory provider.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
-    WorkflowOptions, STATUS_PENDING, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, StateProvider,
+    StepOptions, WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+async fn seed_stopped_workflow(
+    provider: &Arc<InMemoryProvider>,
+    name: &str,
+    id: &str,
+) -> Result<()> {
+    let owner = DurableEngine::new(provider.clone()).await?;
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            id,
+            name,
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            owner.executor_id(),
+            owner.app_version(),
+        ))
+        .await?;
+    Ok(())
+}
 
 /// A step's side effect must run exactly once even if the workflow is executed
 /// again under the same id (the core durable-execution guarantee).
@@ -265,11 +284,8 @@ async fn durable_uuid_calls_in_one_workflow_are_distinct() -> Result<()> {
     Ok(())
 }
 
-/// F1 — a panic in a workflow body is caught and treated as a *recoverable*
-/// failure (like a crash), not a terminal error: the row is left non-terminal so
-/// a later `recover()` re-runs it from its checkpoints. A workflow that panics
-/// once is recovered to completion. (The default hook prints the panic to stderr;
-/// the owning caller observes it as an error.)
+/// A workflow panic parks without automatic retries. Explicit resume after
+/// repair replays its checkpoints; the panic is not recorded as a business error.
 #[tokio::test]
 async fn workflow_body_panic_is_recoverable() -> Result<()> {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
@@ -283,8 +299,8 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    // First execution panics: the owning caller sees an error, but the row is
-    // left recoverable (PENDING), not terminally failed.
+    engine.launch().await?;
+    // The owning caller sees the interruption; settlement parks the row.
     let res = engine
         .start::<(), ()>("panicky", (), WorkflowOptions::with_id("wf-panic"))
         .await?
@@ -294,22 +310,18 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         res.is_err(),
         "the owning caller observes the panic as an error"
     );
+    let parked = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.retrieve_workflow::<()>("wf-panic").await?.result(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        provider
-            .get_workflow_status("wf-panic")
-            .await?
-            .unwrap()
-            .status,
-        STATUS_PENDING,
-        "a panicked workflow is left recoverable, not terminally failed"
+        parked.unwrap_err().code(),
+        ErrorCode::MaxRecoveryAttemptsExceeded
     );
-
-    // recover() re-dispatches it in the background; the second attempt does
-    // not panic and completes. Poll for the terminal status.
-    assert!(
-        engine.recover().await? >= 1,
-        "recovery picks up the panicked run"
-    );
+    assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+    engine.resume_workflow::<()>("wf-panic").await?;
     let mut status = String::new();
     for _ in 0..100 {
         status = provider
@@ -328,6 +340,7 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         2,
         "panicked once, then recovered"
     );
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 
@@ -340,30 +353,7 @@ async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
     let provider = Arc::new(InMemoryProvider::new());
-    let register = |engine: &mut DurableEngine| {
-        engine.register("crash-once", |_ctx: DurableContext, _: ()| async move {
-            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("boom on the first attempt");
-            }
-            Ok::<_, Error>(())
-        });
-    };
-
-    // First "process": start a workflow that panics on its first attempt, so the
-    // row is left recoverable (PENDING). It never launches or recovers.
-    {
-        let mut engine = DurableEngine::new(provider.clone()).await?;
-        register(&mut engine);
-        let _ = engine
-            .start::<(), ()>(
-                "crash-once",
-                (),
-                WorkflowOptions::with_id("wf-launch-recover"),
-            )
-            .await?
-            .result()
-            .await; // observes the panic as an error; the row stays PENDING
-    }
+    seed_stopped_workflow(&provider, "crash-once", "wf-launch-recover").await?;
     assert_eq!(
         provider
             .get_workflow_status("wf-launch-recover")
@@ -371,7 +361,7 @@ async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
             .unwrap()
             .status,
         STATUS_PENDING,
-        "the panicked workflow is left recoverable"
+        "the stopped owner's workflow is recoverable"
     );
 
     // Second "process": a fresh engine over the same database. `launch()` alone —
@@ -380,9 +370,7 @@ async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
     let mut builder = DurableEngine::builder(provider.clone());
     builder.recover_on_launch(true);
     builder.register("crash-once", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
+        ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         Ok::<_, Error>(())
     });
     let engine = builder.build().await?;
@@ -407,8 +395,8 @@ async fn launch_recovers_pending_workflows_when_opted_in() -> Result<()> {
     );
     assert_eq!(
         ATTEMPTS.load(Ordering::SeqCst),
-        2,
-        "crashed once, then recovered on launch"
+        1,
+        "the stopped workflow is recovered once on launch"
     );
 
     engine.shutdown(Duration::from_secs(1)).await?;
@@ -422,27 +410,12 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
     let provider = Arc::new(InMemoryProvider::new());
-    {
-        let mut engine = DurableEngine::new(provider.clone()).await?;
-        engine.register("crash-once-opt", |_ctx: DurableContext, _: ()| async move {
-            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("boom on the first attempt");
-            }
-            Ok::<_, Error>(())
-        });
-        let _ = engine
-            .start::<(), ()>("crash-once-opt", (), WorkflowOptions::with_id("wf-opt-out"))
-            .await?
-            .result()
-            .await;
-    }
+    seed_stopped_workflow(&provider, "crash-once-opt", "wf-opt-out").await?;
 
     // launch() with the default (recovery off) leaves the pending row untouched.
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("crash-once-opt", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
+        ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         Ok::<_, Error>(())
     });
     engine.launch().await?;
@@ -457,6 +430,7 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
         STATUS_PENDING,
         "recovery is off, so the workflow stays pending"
     );
+    assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 0);
 
     // An explicit recover() still works; it dispatches in the background, so
     // poll for the terminal status.
@@ -477,6 +451,7 @@ async fn launch_does_not_recover_by_default() -> Result<()> {
         status, STATUS_SUCCESS,
         "the manually recovered run completes"
     );
+    assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -488,34 +463,14 @@ async fn shutdown_drains_a_launch_recovered_run() -> Result<()> {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
     static RUNNING: AtomicBool = AtomicBool::new(false);
 
-    // First "process": leave a PENDING run behind.
     let provider = Arc::new(InMemoryProvider::new());
-    {
-        let mut engine = DurableEngine::new(provider.clone()).await?;
-        engine.register("drain-probe", |_ctx: DurableContext, _: ()| async move {
-            if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("boom on the first attempt");
-            }
-            RUNNING.store(true, Ordering::SeqCst);
-            // Long enough that a shutdown which doesn't drain would return
-            // while this run is still going.
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            Ok::<_, Error>(())
-        });
-        let _ = engine
-            .start::<(), ()>("drain-probe", (), WorkflowOptions::with_id("wf-drain"))
-            .await?
-            .result()
-            .await;
-    }
+    seed_stopped_workflow(&provider, "drain-probe", "wf-drain").await?;
 
     // Second "process" opts in; launch() re-dispatches the run in the background.
     let mut builder = DurableEngine::builder(provider.clone());
     builder.recover_on_launch(true);
     builder.register("drain-probe", |_ctx: DurableContext, _: ()| async move {
-        if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-            panic!("boom on the first attempt");
-        }
+        ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         RUNNING.store(true, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(400)).await;
         Ok::<_, Error>(())
@@ -547,8 +502,8 @@ async fn shutdown_drains_a_launch_recovered_run() -> Result<()> {
     );
     assert_eq!(
         ATTEMPTS.load(Ordering::SeqCst),
-        2,
-        "crashed once, then recovered on launch"
+        1,
+        "the stopped workflow is recovered once on launch"
     );
     Ok(())
 }

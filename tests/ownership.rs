@@ -1,18 +1,13 @@
-//! Ownership: one workflow id, at most one live execution, one recorded
-//! outcome — no matter how many processes race to start, recover, or
-//! complete it.
-//!
-//! Regressions for two holes the DBOS SDKs close with `owner_xid` fencing:
-//! recovery double-dispatch (two recoverers both re-running the same
-//! pending workflow) and terminal-state overwrites (a completion landing on
-//! a row that already reached a different terminal state).
+//! Recovery claimants arbitrate a stopped owner's unfinished workflow; late
+//! writes preserve committed outcomes. The claim CAS does not fence a still-live
+//! original execution. These tests establish the stopped-owner precondition
+//! separately instead of inferring process death from a shutdown timeout.
 
-use durare::{DurableContext, DurableEngine, SqliteProvider, StateProvider, WorkflowOptions};
+use durare::{DurableContext, DurableEngine, SqliteProvider, StateProvider};
+use futures_util::FutureExt;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
-static SLOW_STEP_RUNS: AtomicU32 = AtomicU32::new(0);
 
 fn unique_db(tag: &str) -> (std::path::PathBuf, String) {
     let db = std::env::temp_dir().join(format!(
@@ -26,20 +21,26 @@ fn unique_db(tag: &str) -> (std::path::PathBuf, String) {
     (db, url)
 }
 
-async fn engine_over(url: &str, executor: &str) -> DurableEngine {
+async fn engine_over(
+    url: &str,
+    executor: &str,
+    runs: Arc<AtomicU32>,
+    release: Arc<tokio::sync::Semaphore>,
+) -> DurableEngine {
     let provider = Arc::new(SqliteProvider::connect(url).await.expect("connect"));
     let mut b = DurableEngine::builder(provider);
     b.executor_id(executor);
-    b.register("tracked", |ctx: DurableContext, _input: i32| async move {
-        // Slow enough that two racing replays overlap inside the step —
-        // neither has checkpointed it when the other starts.
-        ctx.step("slow", || async {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            SLOW_STEP_RUNS.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, durare::Error>(1_i64)
-        })
-        .await?;
-        Ok::<_, durare::Error>("done".to_string())
+    b.register("tracked", move |ctx: DurableContext, _input: i32| {
+        let (runs, release) = (runs.clone(), release.clone());
+        async move {
+            ctx.step("held", || async {
+                runs.fetch_add(1, Ordering::SeqCst);
+                release.acquire().await.unwrap().forget();
+                Ok::<_, durare::Error>(1_i64)
+            })
+            .await?;
+            Ok::<_, durare::Error>("done".to_string())
+        }
     });
     b.build().await.expect("engine builds")
 }
@@ -52,59 +53,67 @@ async fn engine_over(url: &str, executor: &str) -> DurableEngine {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_recovery_dispatches_a_run_once() {
     let (db, url) = unique_db("concurrent-recovery");
-
-    // "Process 0" crashes mid-step: the row stays PENDING under executor
-    // "crashed" with nothing checkpointed.
-    let crashed = engine_over(&url, "crashed").await;
-    let _h: durare::WorkflowHandle<String> = crashed
-        .start("tracked", 7, WorkflowOptions::with_id("wf-once"))
-        .await
-        .expect("start");
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let _ = crashed.shutdown(Duration::from_millis(100)).await;
-    drop(crashed);
-    let after_crash = SLOW_STEP_RUNS.load(Ordering::SeqCst);
-
-    // Two live processes race to recover the dead one.
-    let e1 = engine_over(&url, "rec-1").await;
-    let e2 = engine_over(&url, "rec-2").await;
-    let dead = vec!["crashed".to_string()];
-    let (r1, r2) = tokio::join!(e1.recover_pending_for(&dead), e2.recover_pending_for(&dead));
-    let (r1, r2) = (r1.expect("recover 1"), r2.expect("recover 2"));
-    assert_eq!(
-        r1.len() + r2.len(),
-        1,
-        "exactly one recoverer claims the run (got {} + {})",
-        r1.len(),
-        r2.len()
-    );
-
-    // Let the claimed run finish, then check the step ran exactly once more.
-    let provider = Arc::new(SqliteProvider::connect(&url).await.expect("connect"));
-    let mut settled = false;
-    for _ in 0..250 {
-        if let Some(w) = provider
-            .get_workflow_status("wf-once")
+    let result = std::panic::AssertUnwindSafe(async {
+        let runs = Arc::new(AtomicU32::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let e1 = engine_over(&url, "rec-1", runs.clone(), release.clone()).await;
+        let e2 = engine_over(&url, "rec-2", runs.clone(), release.clone()).await;
+        let provider = Arc::new(SqliteProvider::connect(&url).await.expect("connect"));
+        // Seed the history of a stopped owner. There is no original task that
+        // could still be executing; shutdown(timeout) would not prove that.
+        provider
+            .insert_workflow_status(durare::WorkflowStatus::new(
+                "wf-once",
+                "tracked",
+                serde_json::json!(7),
+                "PENDING",
+                "crashed",
+                e1.app_version(),
+            ))
             .await
-            .expect("status")
-        {
-            if w.status == "SUCCESS" {
-                settled = true;
-                break;
+            .expect("seed stopped history");
+        let dead = vec!["crashed".to_string()];
+        let (r1, r2) = tokio::join!(e1.recover_pending_for(&dead), e2.recover_pending_for(&dead));
+        let (r1, r2) = (r1.expect("recover 1"), r2.expect("recover 2"));
+        // Both sweeps have finished claiming before either body can commit.
+        release.add_permits(2);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while e1.metrics().await.unwrap().workflows_in_flight != 0
+                || e2.metrics().await.unwrap().workflows_in_flight != 0
+            {
+                tokio::task::yield_now().await;
             }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        })
+        .await
+        .expect("all dispatched executions must finish before counting effects");
+        assert_eq!(
+            r1.len() + r2.len(),
+            1,
+            "exactly one recoverer claims the run"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the uncheckpointed step executes once"
+        );
+        assert_eq!(
+            provider
+                .get_workflow_status("wf-once")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "SUCCESS"
+        );
+        e1.shutdown(Duration::from_secs(1)).await.unwrap();
+        e2.shutdown(Duration::from_secs(1)).await.unwrap();
+    })
+    .catch_unwind()
+    .await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
     }
-    assert!(settled, "the recovered run completes");
-    assert_eq!(
-        SLOW_STEP_RUNS.load(Ordering::SeqCst) - after_crash,
-        1,
-        "the un-checkpointed step re-executes exactly once"
-    );
-
-    let _ = e1.shutdown(Duration::from_secs(2)).await;
-    let _ = e2.shutdown(Duration::from_secs(2)).await;
-    let _ = std::fs::remove_file(&db);
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
 /// A SUCCESS/ERROR completion may only land on a PENDING row. A row that

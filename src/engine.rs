@@ -197,7 +197,10 @@ pub struct EngineConfig {
     /// pending work assumes the previous owner is gone, not running concurrently).
     /// Enable it for a single-process app, or when you set a distinct
     /// `DBOS__VMID` per process; otherwise drive recovery yourself with
-    /// [`recover`](DurableEngine::recover).
+    /// [`recover_pending_for`](DurableEngine::recover_pending_for) after confirming
+    /// the selected owners have stopped. Before launch, all executions in this
+    /// executor's recovery snapshot must have stopped too; a unique executor id
+    /// alone does not make it safe to recover work started before launch.
     pub recover_on_launch: Option<bool>,
     /// Automatic history retention. When set, [`launch`](DurableEngine::launch)
     /// starts a background sweeper that periodically enforces the policy via
@@ -693,11 +696,12 @@ pub struct DurableEngine {
     /// Cancelled by [`shutdown`](Self::shutdown) to stop the background loops.
     /// [`launch`](Self::launch) installs a fresh token after a shutdown, since a
     /// cancelled token can't be reset.
-    shutdown_token: std::sync::Mutex<CancellationToken>,
+    shutdown_token: Arc<std::sync::Mutex<CancellationToken>>,
     /// Set by [`deactivate`](Self::deactivate): this process stops claiming new
     /// work (dispatchers/scheduler aborted) but keeps serving in-flight runs and
     /// the admin server. Idempotent.
     deactivated: Arc<AtomicBool>,
+    automatic_recovery_stop: CancellationToken,
     /// Tracks every in-flight workflow-run task so [`shutdown`](Self::shutdown)
     /// can drain them before returning. A run is spawned *through* the tracker,
     /// so it is counted from the instant it is created — no separate guard to
@@ -814,7 +818,12 @@ impl DurableEngineBuilder {
     }
 
     /// Set the recovery-attempt cap before a workflow is parked in
-    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (default 100).
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` (default 100). Counts successful recovery
+    /// claims after process loss or infrastructure interruption;
+    /// it is not a process-crash counter. Repeated storage outages can exhaust
+    /// this budget even when the workflow code is healthy. Checkpoint progress
+    /// does not reset it; explicit resume resets the count. Workflow-body panics
+    /// park immediately with zero automatic body retries, independently of this cap.
     pub fn max_recovery_attempts(&mut self, max: i32) -> &mut Self {
         self.max_recovery_attempts = max;
         self
@@ -892,8 +901,9 @@ impl DurableEngineBuilder {
             recover_on_launch: self.config.resolve_recover_on_launch(),
             retention: self.config.retention,
             required_roles: self.required_roles,
-            shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             deactivated: Arc::new(AtomicBool::new(false)),
+            automatic_recovery_stop: CancellationToken::new(),
             tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
@@ -968,8 +978,9 @@ impl DurableEngine {
             recover_on_launch: config.resolve_recover_on_launch(),
             retention: config.retention,
             required_roles: HashMap::new(),
-            shutdown_token: std::sync::Mutex::new(CancellationToken::new()),
+            shutdown_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             deactivated: Arc::new(AtomicBool::new(false)),
+            automatic_recovery_stop: CancellationToken::new(),
             tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
             runtime: std::sync::OnceLock::new(),
@@ -1071,6 +1082,9 @@ impl DurableEngine {
                     app_version: self.app_version.clone(),
                     tasks: self.tasks.clone(),
                     counters: EngineCounters::default(),
+                    shutdown_token: self.shutdown_token.clone(),
+                    max_recovery_attempts: self.max_recovery_attempts,
+                    automatic_recovery_stop: self.automatic_recovery_stop.clone(),
                 })
             })
             .clone()
@@ -1418,9 +1432,10 @@ impl DurableEngine {
     /// (off by default), this also recovers this executor's workflows left
     /// pending by a previous run, re-dispatching them on a background task — so a
     /// crash and restart resumes unfinished work without a separate call. It is
-    /// opt-in because it is only sound when each live process has a *unique*
-    /// executor id; otherwise drive recovery yourself with
-    /// [`recover`](Self::recover).
+    /// opt-in because the selected executions must have stopped and each live
+    /// process needs a unique executor id. Do not include live work started before
+    /// launch in that snapshot. For other stopped owners, use
+    /// [`recover_pending_for`](Self::recover_pending_for).
     pub async fn launch(&self) -> Result<()> {
         // A deactivated process must not start claiming work again.
         if self.is_deactivated() {
@@ -1602,12 +1617,16 @@ impl DurableEngine {
 
     /// Stop claiming new work without shutting the process down: abort the queue
     /// dispatchers and the schedule reconciler, but leave in-flight workflow
-    /// tasks running and keep any admin server serving. Idempotent — a second
-    /// call is a no-op. Used by the admin server's `GET /deactivate`.
+    /// tasks running and keep any admin server serving. Stopped executions can
+    /// still requeue or park through their ownership CAS; direct recovery
+    /// dispatch is stopped. [`shutdown`](Self::shutdown) stops that settlement
+    /// too. Idempotent — a second call is a no-op. Used by the admin server's
+    /// `GET /deactivate`.
     pub fn deactivate(&self) {
         if self.deactivated.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.automatic_recovery_stop.cancel();
         tracing::info!(executor = %self.executor_id, "deactivating executor: stopping dispatch");
         for d in self
             .dispatchers
@@ -1806,6 +1825,12 @@ impl DurableEngine {
     /// recovery still working through its snapshot finishes the run it is on,
     /// starts no more, and leaves the untouched remainder `PENDING` for a later
     /// recovery.
+    ///
+    /// If the timeout expires, this still returns `Ok(())`. Running workflow
+    /// tasks are not aborted and may continue to commit results. Neither this
+    /// return value nor subsequently dropping the engine proves that its old
+    /// executions stopped. Confirm they have stopped before another executor
+    /// takes them over; see [`recover_pending_for`](Self::recover_pending_for).
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
         self.shutdown_token
             .lock()
@@ -1824,7 +1849,7 @@ impl DurableEngine {
         }
         // Drain in-flight runs, bounded by `timeout`: `close` lets `wait` return
         // once the tracked set empties. A run still going when the deadline passes
-        // is left mid-flight — durable, so a later recovery resumes it.
+        // keeps running. A takeover must wait for the old execution to stop.
         self.tasks.close();
         let _ = tokio::time::timeout(timeout, self.tasks.wait()).await;
         Ok(())
@@ -1919,8 +1944,11 @@ impl DurableEngine {
                         && e.code() == ErrorCode::QueueDeduplicated =>
                 {
                     if let (Some(q), Some(d)) = (opts.queue.as_deref(), opts.dedup_id.as_deref()) {
-                        if let Some(existing) =
-                            self.provider.get_deduplicated_workflow(q, d).await?
+                        if let Some(existing) = self
+                            .provider
+                            .get_deduplicated_workflow(q, d)
+                            .await
+                            .map_err(crate::execution::observation_error)?
                         {
                             return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
                         }
@@ -1943,14 +1971,7 @@ impl DurableEngine {
             return Ok(WorkflowHandle::polling(id, self.provider.clone()));
         }
 
-        let join = rt.spawn_owned(
-            id.clone(),
-            name,
-            handler,
-            canonical.input,
-            canonical.deadline_ms,
-            auth,
-        );
+        let join = rt.spawn_owned(canonical, handler);
         Ok(WorkflowHandle::local(id, self.provider.clone(), join))
     }
 
@@ -2088,7 +2109,8 @@ impl DurableEngine {
     pub async fn retrieve_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         self.provider
             .get_workflow_status(id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
         Ok(WorkflowHandle::polling(
             id.to_string(),
@@ -2227,12 +2249,17 @@ impl DurableEngine {
     /// body is caught and goes into the report: as
     /// [`Failed`](crate::Divergence::Failed) when nothing else diverged, and
     /// otherwise not at all, since a divergence is the better explanation for a
-    /// body that panicked on an operation it did not get.
+    /// body that panicked on an operation it did not get. A storage interruption
+    /// during replay returns [`Error::RecoveryRequired`], not a divergence report,
+    /// even if the body catches the fault and waits forever. Failures reading
+    /// the history before the body starts return [`Error::ObservationFailed`];
+    /// neither result is permission to recover the source workflow.
     pub async fn verify_replay(&self, workflow_id: &str) -> Result<ReplayReport> {
         let status = self
             .provider
             .get_workflow_status(workflow_id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .ok_or_else(|| Error::UnknownWorkflow(workflow_id.to_string()))?;
         let rt = self.runtime();
         let handler = rt
@@ -2240,7 +2267,10 @@ impl DurableEngine {
             .get(&registry_key(&status.name, status.config_name.as_deref()))
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(status.name.clone()))?;
-        let recorded = self.get_workflow_steps(workflow_id).await?;
+        let recorded = self
+            .get_workflow_steps(workflow_id)
+            .await
+            .map_err(crate::execution::observation_error)?;
 
         // A history is complete only if the run reached its own end. `CANCELLED`
         // and `MAX_RECOVERY_ATTEMPTS_EXCEEDED` are terminal for the row but not
@@ -2259,10 +2289,24 @@ impl DurableEngine {
         // Panics are caught the way a real execution catches them, so a body
         // that panics on an operation it was refused is reported rather than
         // taken out on the caller.
-        let outcome = AssertUnwindSafe(handler(ctx, status.input))
-            .catch_unwind()
-            .await;
+        let execution = ctx.execution();
+        let outcome = tokio::select! {
+            result = AssertUnwindSafe(handler(ctx, status.input)).catch_unwind() => result,
+            error = execution.failed() => return Err(error),
+        };
 
+        execution.check()?;
+        if let Ok(Err(error)) = &outcome {
+            match error {
+                Error::RecoveryRequired(cause) => {
+                    return Err(Error::RecoveryRequired(cause.clone()))
+                }
+                Error::ObservationFailed(cause) => {
+                    return Err(Error::ObservationFailed(cause.clone()))
+                }
+                _ => {}
+            }
+        }
         Ok(verification.report(
             History {
                 id: workflow_id,
@@ -2370,13 +2414,17 @@ impl DurableEngine {
         self.provider.cancel_workflow(id).await
     }
 
-    /// Resume a cancelled (or otherwise non-terminal) workflow. It is re-queued
-    /// onto the internal queue — which every engine dispatches, so it always
-    /// makes progress — and re-run from its checkpoints; the returned handle
-    /// tracks it by polling. Resuming an already-completed workflow is a no-op:
-    /// the handle simply reads its recorded outcome. A missing id is a typed
-    /// [`Error::NonExistentWorkflow`]. Requires a launched engine to make
-    /// progress.
+    /// Resume a cancelled, parked or unfinished workflow whose previous execution
+    /// has stopped. It is re-queued onto the internal queue and re-run from its
+    /// checkpoints; the returned handle tracks it by polling. Requires a launched
+    /// dispatcher and working storage to make progress. Resuming a `SUCCESS` or
+    /// `ERROR` workflow is a no-op: the handle reads its recorded outcome. A missing
+    /// id is a typed [`Error::NonExistentWorkflow`].
+    ///
+    /// This resumes only the named workflow. If a parent returned its child's
+    /// parked error and became `ERROR`, resuming the child does not reopen the
+    /// parent. Resume resets the recovery counter; stop any in-flight recovery
+    /// claims before doing so. See the [durability guide](crate::durability).
     pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         self.resume_workflow_on(id, INTERNAL_QUEUE).await
     }
@@ -2409,6 +2457,8 @@ impl DurableEngine {
     /// to re-run. A polling handle is returned for **every id that exists**, in
     /// input order — an already-terminal workflow is a no-op whose handle reads
     /// its recorded outcome; missing ids yield no handle (and no error).
+    /// As with [`resume_workflow`](Self::resume_workflow), previous executions
+    /// must have stopped. Only the named workflows are resumed, not their parents.
     pub async fn resume_workflows<O>(&self, ids: &[String]) -> Result<Vec<WorkflowHandle<O>>> {
         self.resume_workflows_on(ids, INTERNAL_QUEUE).await
     }
@@ -2547,6 +2597,16 @@ impl DurableEngine {
     /// for you when you enable
     /// [`recover_on_launch`](EngineConfig::recover_on_launch).
     ///
+    /// # Recovery precondition
+    ///
+    /// Every selected workflow's previous execution must have stopped. This call
+    /// scans all owners of the matching application version; do not use it as an
+    /// unfiltered sweep of a live fleet. Prefer
+    /// [`recover_pending_for`](Self::recover_pending_for) with confirmed-stopped
+    /// executor ids. The ownership CAS arbitrates recovery claimants; it does not
+    /// stop or fence a live original body. `PENDING`, deactivation and a successful
+    /// return from [`shutdown`](Self::shutdown) do not establish this precondition.
+    ///
     /// Returns the number of workflows re-dispatched; their in-flight runs
     /// drain on [`shutdown`](Self::shutdown) like any other run.
     pub async fn recover(&self) -> Result<usize> {
@@ -2557,6 +2617,9 @@ impl DurableEngine {
     /// given executor ids (empty = any executor), returning the id of every
     /// workflow that was recovered. Backs the admin server's
     /// `POST /dbos-workflow-recovery`, which recovers a named set of executors.
+    /// The caller must confirm those executions have stopped; the API does not
+    /// detect a dead owner. An empty list has the same live-fleet restriction as
+    /// [`recover`](Self::recover). A timed-out shutdown is not a safe handoff.
     pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
         let cancel = self
             .shutdown_token
@@ -2681,7 +2744,8 @@ pub(crate) async fn dispatch_pending_workflows(
         // it: concurrent sweeps recovering the same executor each observe the
         // same (executor, attempts) pair, exactly one lands the increment, and
         // the rest lose — at most one process dispatches each pending
-        // workflow. Losing is normal, not an error: someone else owns the run.
+        // workflow, assuming its old execution stopped. Losing does not prove
+        // there is a runner: an earlier claim reply may have been lost.
         let claim = rt
             .provider
             .claim_for_recovery(&RecoveryClaimRequest {
@@ -2697,7 +2761,7 @@ pub(crate) async fn dispatch_pending_workflows(
             RecoveryClaim::Lost => {
                 tracing::debug!(
                     id = %record.id,
-                    "recovery claim lost: another process moved this workflow first"
+                    "recovery claim lost: expected state changed; no dispatch"
                 );
             }
             RecoveryClaim::Parked { attempts } => {
@@ -2717,27 +2781,13 @@ pub(crate) async fn dispatch_pending_workflows(
                     .fetch_add(1, Ordering::Relaxed);
                 recovered.push(record.id);
             }
-            RecoveryClaim::Claimed { .. } => {
+            RecoveryClaim::Claimed { attempts } => {
                 let handler =
                     handler.expect("only non-queued rows are claimed for direct dispatch");
-                // Each recovered run gets its own tracked task, exactly like a
-                // freshly started one. Running them inline here had two failure
-                // modes the DBOS SDKs don't share: a run parked on `recv` or a
-                // timer stalled every pending workflow behind it in this loop —
-                // and stalled the caller of `recover` for its whole wait — and
-                // shutdown could never drain a recovery that contained one.
-                // Best-effort as before: a workflow that fails again is marked
-                // ERROR by `run_to_completion`.
-                let auth = AuthContext::from_status(&record);
-                let span = rt.workflow_span(&record.id, &record.name, None, &auth);
-                let task_rt = rt.clone();
-                let (name, id) = (record.name.clone(), record.id.clone());
-                let (input, deadline) = (record.input.clone(), record.deadline_ms);
-                rt.tasks.spawn(async move {
-                    let _ =
-                        run_to_completion(task_rt, handler, name, id, input, deadline, auth, span)
-                            .await;
-                });
+                let mut claimed = record.clone();
+                claimed.executor_id = rt.executor_id.clone();
+                claimed.recovery_attempts = attempts;
+                rt.spawn_detached(claimed, handler);
                 rt.counters
                     .workflows_recovered
                     .fetch_add(1, Ordering::Relaxed);
@@ -2746,6 +2796,102 @@ pub(crate) async fn dispatch_pending_workflows(
         }
     }
     Ok(recovered)
+}
+
+/// Recover one stopped execution using the ownership generation that ran it.
+/// A failed claim retries only the claim, never the body. Bound those retries
+/// separately: an unavailable database cannot persist a parking transition.
+#[derive(Clone, Copy, Debug)]
+enum RecoveryDisposition {
+    Retry,
+    ParkAfterPanic,
+}
+
+async fn recover_interrupted_run(
+    rt: Arc<Runtime>,
+    mut record: WorkflowStatus,
+    handler: WorkflowFn,
+    cancel: CancellationToken,
+    disposition: RecoveryDisposition,
+) {
+    const MAX_CLAIM_FAILURES: usize = 8;
+    // A workflow panic has no automatic body retry budget. Reuse the atomic
+    // parking transition without inventing a business failure.
+    let max_attempts = match disposition {
+        RecoveryDisposition::Retry => rt.max_recovery_attempts,
+        RecoveryDisposition::ParkAfterPanic => record.recovery_attempts,
+    };
+    // Deactivation stops taking work, not settling an execution that stopped.
+    // Queue handoff and parking cannot dispatch a body here. A direct claim
+    // below its cap would require dispatch, so stop it even before the CAS.
+    let requires_dispatch = record.queue_name.is_none() && record.recovery_attempts < max_attempts;
+    let mut delay = Duration::from_millis(100)
+        .saturating_mul(1u32 << record.recovery_attempts.clamp(0, 6))
+        .min(Duration::from_secs(5));
+    for failure in 0..MAX_CLAIM_FAILURES {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = rt.automatic_recovery_stop.cancelled(), if requires_dispatch => return,
+            _ = tokio::time::sleep(delay) => {}
+        }
+        let request = RecoveryClaimRequest {
+            workflow_id: &record.id,
+            expected_executor: &record.executor_id,
+            expected_attempts: record.recovery_attempts,
+            new_executor: &rt.executor_id,
+            max_attempts,
+            requeue: record.queue_name.is_some(),
+        };
+        let claim = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = rt.automatic_recovery_stop.cancelled(), if requires_dispatch => return,
+            result = rt.provider.claim_for_recovery(&request) => result,
+        };
+        match claim {
+            Ok(RecoveryClaim::Requeued) => {
+                rt.counters
+                    .workflows_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::info!(workflow_id = %record.id, "interrupted workflow returned to its queue");
+                return;
+            }
+            Ok(RecoveryClaim::Claimed { attempts }) => {
+                if cancel.is_cancelled() || rt.automatic_recovery_stop.is_cancelled() {
+                    tracing::info!(workflow_id = %record.id, "recovery claimed while executor stopped; left for explicit recovery");
+                    return;
+                }
+                rt.counters
+                    .workflows_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+                record.executor_id = rt.executor_id.clone();
+                record.recovery_attempts = attempts;
+                rt.spawn_detached(record, handler);
+                return;
+            }
+            Ok(RecoveryClaim::Parked { attempts }) => {
+                rt.counters.dead_lettered.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(workflow_id = %record.id, attempts, ?disposition, "workflow parked; explicit resume required");
+                return;
+            }
+            Ok(RecoveryClaim::Lost) => {
+                // Includes a claim that committed but whose response was lost.
+                // Dispatch without proof of ownership would duplicate execution.
+                tracing::warn!(workflow_id = %record.id,
+                    "recovery generation changed; no dispatch; an unfinished unowned row requires explicit recovery");
+                return;
+            }
+            Err(error) if failure + 1 == MAX_CLAIM_FAILURES => {
+                tracing::error!(workflow_id = %record.id, %error,
+                    "recovery claim retries exhausted; unfinished row requires explicit recovery after storage repair");
+            }
+            Err(error) => {
+                tracing::warn!(workflow_id = %record.id, %error, "recovery claim failed; retrying the same ownership generation");
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 /// The shared execution core: everything needed to create and run a workflow.
@@ -2765,6 +2911,9 @@ pub(crate) struct Runtime {
     app_version: String,
     tasks: TaskTracker,
     pub(crate) counters: EngineCounters,
+    shutdown_token: Arc<std::sync::Mutex<CancellationToken>>,
+    max_recovery_attempts: i32,
+    automatic_recovery_stop: CancellationToken,
 }
 
 /// Process-lifetime event counters behind [`DurableEngine::metrics`].
@@ -2894,7 +3043,11 @@ impl Runtime {
             row.deadline_ms = row.timeout_ms.map(|t| created_ms + t);
         }
 
-        let (canonical, created) = self.provider.insert_workflow_status(row).await?;
+        let (canonical, created) = self
+            .provider
+            .insert_workflow_status(row)
+            .await
+            .map_err(crate::execution::observation_error)?;
         Ok((canonical, queued, created))
     }
 
@@ -2903,39 +3056,24 @@ impl Runtime {
     /// out — the task is counted from the moment it is created.
     fn spawn_owned(
         self: &Arc<Self>,
-        id: String,
-        name: &str,
+        record: WorkflowStatus,
         handler: WorkflowFn,
-        input: Value,
-        deadline_ms: Option<i64>,
-        auth: AuthContext,
     ) -> JoinHandle<Result<Value>> {
-        // Built here, in the caller's context, so a child workflow's span
-        // parents under the workflow (or handler) span that started it.
-        let span = self.workflow_span(&id, name, None, &auth);
-        let rt = self.clone();
-        let name = name.to_string();
-        self.tasks.spawn(async move {
-            run_to_completion(rt, handler, name, id, input, deadline_ms, auth, span).await
-        })
+        let auth = AuthContext::from_status(&record);
+        let span = self.workflow_span(
+            &record.id,
+            &record.name,
+            record.queue_name.as_deref(),
+            &auth,
+        );
+        self.tasks
+            .spawn(run_to_completion(self.clone(), handler, record, span))
     }
 
-    /// Spawn a run on a self-owned, detached task; the result is observed by
-    /// polling the status row. Used for queue claims, recovery, schedules, and
-    /// child workflows.
-    fn spawn_detached(
-        self: &Arc<Self>,
-        id: String,
-        name: &str,
-        handler: WorkflowFn,
-        input: Value,
-        deadline_ms: Option<i64>,
-        auth: AuthContext,
-    ) {
-        let join = self.spawn_owned(id, name, handler, input, deadline_ms, auth);
-        // Detach: the run is tracked by the `TaskTracker`, so shutdown still
-        // drains it.
-        drop(join);
+    /// Detached runs use exactly the same execution and recovery owner as local
+    /// handles. Dropping the handle does not remove them from the task tracker.
+    fn spawn_detached(self: &Arc<Self>, record: WorkflowStatus, handler: WorkflowFn) {
+        drop(self.spawn_owned(record, handler));
     }
 
     /// Persist one scheduled tick at `instant` under the deterministic
@@ -2974,26 +3112,19 @@ impl Runtime {
         canonical: WorkflowStatus,
         queued: bool,
         created: bool,
-        id: &str,
     ) {
         if queued || !created || is_terminal(&canonical.status) {
             return;
         }
         if let Some(handler) = self.workflows.get(&schedule.workflow_name).cloned() {
-            self.spawn_detached(
-                id.to_string(),
-                &schedule.workflow_name,
-                handler,
-                canonical.input,
-                canonical.deadline_ms,
-                AuthContext::default(),
-            );
+            self.spawn_detached(canonical, handler);
         }
     }
 
     /// Start a child workflow under the deterministic `child_id`, stamping the
-    /// parent link and the inherited identity. A queued or already-terminal
-    /// child is left for polling; otherwise it runs now on a detached task.
+    /// parent link and the inherited identity. Only the insert winner may
+    /// dispatch a direct child. Existing children are observed, including PENDING
+    /// ones: a missing parent relationship record is not proof the child stopped.
     pub(crate) async fn spawn_child(
         self: &Arc<Self>,
         child_id: &str,
@@ -3008,18 +3139,11 @@ impl Runtime {
             .get(&registry_key(name, opts.config_name.as_deref()))
             .cloned()
             .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
-        let (canonical, queued, _created) = self
+        let (canonical, queued, created) = self
             .insert_run(child_id, name, input_json, &opts, Some(parent_id), &auth)
             .await?;
-        if !queued && !is_terminal(&canonical.status) {
-            self.spawn_detached(
-                child_id.to_string(),
-                name,
-                handler,
-                canonical.input,
-                canonical.deadline_ms,
-                auth,
-            );
+        if created && !queued && !is_terminal(&canonical.status) {
+            self.spawn_detached(canonical, handler);
         }
         Ok(())
     }
@@ -3148,22 +3272,9 @@ async fn queue_dispatch_loop(
                         let auth = AuthContext::from_status(&wf);
                         let span =
                             rt.workflow_span(&wf.id, &wf.name, wf.queue_name.as_deref(), &auth);
-                        // Spawn through the tracker so `shutdown` drains this run.
                         rt.tasks.spawn(async move {
-                            let _local = local_guard;
-                            // Terminal state is recorded by run_to_completion;
-                            // a handle observing this workflow polls it.
-                            let _ = run_to_completion(
-                                run_rt,
-                                handler,
-                                wf.name,
-                                wf.id,
-                                wf.input,
-                                wf.deadline_ms,
-                                auth,
-                                span,
-                            )
-                            .await;
+                            let _ = run_to_completion(run_rt, handler, wf, span).await;
+                            drop(local_guard);
                         });
                     }
                 }
@@ -3220,21 +3331,33 @@ fn check_required_roles(name: &str, required: &[String], auth: &AuthContext) -> 
         })
 }
 
-#[allow(clippy::too_many_arguments)] // one arg per run coordinate; grouping would obscure
-async fn run_to_completion(
+fn run_to_completion(
     rt: Arc<Runtime>,
     handler: WorkflowFn,
-    name: String,
-    id: String,
-    input: Value,
-    deadline_ms: Option<i64>,
-    auth: AuthContext,
+    record: WorkflowStatus,
     span: tracing::Span,
-) -> Result<Value> {
-    // The span covers the whole execution, terminal status write included;
-    // `recorder` sets the outcome fields declared `Empty` at creation.
-    let recorder = span.clone();
-    async move {
+) -> Pin<Box<dyn Future<Output = Result<Value>> + Send>> {
+    // Boxing breaks the spawn/recovery future-type cycle. The stored record
+    // carries the original ownership generation through every execution entry.
+    Box::pin(async move {
+        let (name, id, input, deadline_ms) = (
+            record.name.clone(),
+            record.id.clone(),
+            record.input.clone(),
+            record.deadline_ms,
+        );
+        let auth = AuthContext::from_status(&record);
+        let cancel = rt
+            .shutdown_token
+            .lock()
+            .expect("shutdown token poisoned")
+            .clone();
+        // The span covers the whole execution, terminal status write included;
+        // `recorder` sets the outcome fields declared `Empty` at creation.
+        let recorder = span.clone();
+        let diagnostics = span.clone();
+        let mut disposition = RecoveryDisposition::Retry;
+        let result = async {
     let provider = rt.provider().clone();
     // Required-roles enforcement, before the body runs — the single gate every
     // execution path (direct, queued, scheduled, child, recovery) flows
@@ -3253,12 +3376,19 @@ async fn run_to_completion(
         },
         None => None,
     };
-    let ctx = DurableContext::new(id.clone(), rt, auth);
+    let ctx = DurableContext::new(id.clone(), rt.clone(), auth);
     // Catch a panic in the workflow body so it can't unwind past the status
     // write below — which would strand the row PENDING with observers waiting
     // forever (finding F1). Steps catch their own panics (subject to retry);
     // this handles a panic in the workflow body itself.
-    let run = AssertUnwindSafe(handler(ctx, input)).catch_unwind();
+    let execution = ctx.execution();
+    let run = AssertUnwindSafe(handler.clone()(ctx, input)).catch_unwind();
+    let run = async {
+        tokio::select! {
+            result = run => result,
+            error = execution.failed() => Ok(Err(error)),
+        }
+    };
 
     // Enforce a workflow deadline if one was set: when it elapses, the run
     // future is dropped (cancelled at its next await) and the workflow is
@@ -3274,9 +3404,8 @@ async fn run_to_completion(
             match tokio::time::timeout(Duration::from_millis(remaining), run).await {
                 Ok(caught) => caught,
                 Err(_elapsed) => {
-                    let landed = provider
-                        .set_workflow_status(&id, STATUS_CANCELLED, None, Some("deadline exceeded"))
-                        .await?;
+                    execution.check()?;
+                    let landed = write_terminal_status(&provider, &id, STATUS_CANCELLED, None, Some("deadline exceeded")).await?;
                     if !landed {
                         // The row completed (or was moved) before the deadline
                         // write landed; the recorded outcome wins.
@@ -3292,29 +3421,27 @@ async fn run_to_completion(
         }
     };
 
-    // A panic in the workflow body is treated as a *recoverable* failure, like a
-    // crash — not a terminal error (finding F1, option B; the durable-execution
-    // norm, where only a returned error terminates a workflow). Leave the row in
-    // its current non-terminal state so a later `recover()` re-runs it from its
-    // checkpoints, bounded by the recovery-attempt cap (a deterministic panic
-    // eventually dead-letters). Surface the panic to the owning caller, but write
-    // no terminal status.
+    // A workflow panic is parked for explicit resume. Repeatedly rerunning a
+    // deterministic panic could repeat effects that have no checkpoint.
+    // A handled error is still a failed execution: no terminal status may be
+    // invented after a checkpoint read/write or decoding failure.
     let result = match caught {
-        Ok(returned) => returned,
+        Ok(returned) => returned.map_err(|error| execution.body_error(error)),
         Err(payload) => {
             let msg = panic_message(&*payload);
-            tracing::error!(id = %id, panic = %msg, "workflow panicked; left recoverable for recovery to re-run");
+            disposition = RecoveryDisposition::ParkAfterPanic;
+            tracing::error!(id = %id, panic = %msg, "workflow panicked; parking without automatic body retries");
             // No `dbos.workflow.status`: the row keeps its non-terminal state.
             recorder.record("otel.status_code", "ERROR");
-            return Err(Error::app(format!("workflow panicked: {msg}")));
+            execution.check()?;
+            return Err(crate::execution::recovery_error(Error::app(format!("workflow panicked: {msg}"))));
         }
     };
 
+    execution.check()?;
     match result {
         Ok(output) => {
-            let landed = provider
-                .set_workflow_status(&id, STATUS_SUCCESS, Some(&output), None)
-                .await?;
+            let landed = write_terminal_status(&provider, &id, STATUS_SUCCESS, Some(&output), None).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
             }
@@ -3332,23 +3459,20 @@ async fn run_to_completion(
         Err(Error::Cancelled(_)) => {
             // The workflow stopped because it was cancelled; reflect that
             // terminal state rather than ERROR.
-            let landed = provider
-                .set_workflow_status(&id, STATUS_CANCELLED, None, Some("cancelled"))
-                .await?;
+            let landed = write_terminal_status(&provider, &id, STATUS_CANCELLED, None, Some("cancelled")).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
             }
             recorder.record("dbos.workflow.status", STATUS_CANCELLED);
             recorder.record("otel.status_code", "ERROR");
-            Err(Error::Cancelled(id))
+            Err(Error::Cancelled(id.clone()))
         }
         Err(e) => {
             // Encode once and return the same representation a polling handle
             // or recovered execution will read, rather than the live error.
-            let stored = crate::serialize::encode_error(&provider.serializer(), &e);
-            let landed = provider
-                .set_workflow_status(&id, STATUS_ERROR, None, Some(&stored))
-                .await?;
+            let stored = crate::serialize::encode_error(&provider.serializer(), &e)
+                .map_err(crate::execution::recovery_error)?;
+            let landed = write_terminal_status(&provider, &id, STATUS_ERROR, None, Some(&stored)).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;
             }
@@ -3362,7 +3486,61 @@ async fn run_to_completion(
     }
     }
     .instrument(span)
-    .await
+    .await;
+        // Every entry path uses this boundary, including detached queue, schedule,
+        // child and recovered runs whose Result has no owning caller.
+        if let Err(Error::RecoveryRequired(cause)) = &result {
+            diagnostics.record("otel.status_code", "ERROR");
+            tracing::error!(
+                parent: &diagnostics,
+                workflow_id = %id,
+                workflow = %name,
+                error = %cause,
+                recovery_required = true,
+                ?disposition,
+                "workflow execution stopped without finalizing; settlement scheduled"
+            );
+            // Every interrupted execution, queued or not, gets the same settlement.
+            // Ordinary recorded business failures never schedule a no-op claim.
+            rt.tasks.spawn(recover_interrupted_run(
+                rt.clone(),
+                record,
+                handler,
+                cancel,
+                disposition,
+            ));
+        } else if let Err(Error::ObservationFailed(cause)) = &result {
+            tracing::error!(parent: &diagnostics, workflow_id = %id, error = %cause,
+                observation_failed = true, "could not observe the authoritative outcome; no recovery scheduled");
+        }
+        result
+    })
+}
+
+async fn write_terminal_status(
+    provider: &Arc<dyn StateProvider>,
+    id: &str,
+    status: &str,
+    output: Option<&Value>,
+    error: Option<&str>,
+) -> Result<bool> {
+    match provider
+        .set_workflow_status(id, status, output, error)
+        .await
+    {
+        Ok(landed) => Ok(landed),
+        Err(error) if !crate::execution::is_storage_failure(&error) => Err(error),
+        Err(error) => {
+            // The commit may have succeeded. A terminal readback is evidence;
+            // an unavailable/nonterminal read is not permission to finalize.
+            if let Ok(Some(recorded)) = provider.get_workflow_status(id).await {
+                if is_terminal(&recorded.status) {
+                    return Ok(false); // the caller adopts the stored outcome
+                }
+            }
+            Err(crate::execution::recovery_error(error))
+        }
+    }
 }
 
 /// Park a losing execution on the recorded outcome: poll the status row until
@@ -3385,7 +3563,11 @@ async fn adopt_recorded_outcome(
         "workflow outcome was not recorded: this execution no longer owns the workflow; waiting for the recorded outcome"
     );
     loop {
-        let Some(status) = provider.get_workflow_status(id).await? else {
+        let Some(status) = provider
+            .get_workflow_status(id)
+            .await
+            .map_err(crate::execution::observation_error)?
+        else {
             return Err(Error::NonExistentWorkflow(id.to_string()));
         };
         if is_terminal(&status.status) {
@@ -3404,12 +3586,13 @@ async fn adopt_recorded_outcome(
                 STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED => {
                     Err(Error::MaxRecoveryAttemptsExceeded(id.to_string()))
                 }
-                _ => Err(crate::recorded_error::from_parts(
+                _ => Err(crate::recorded_error::try_from_parts(
                     status
                         .error
                         .unwrap_or_else(|| "workflow failed".to_string()),
                     status.error_info,
-                )),
+                )
+                .map_err(crate::execution::observation_error)?),
             };
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -3489,7 +3672,7 @@ async fn backfill_ticks(
     let mut ids = Vec::new();
     for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
         let (canonical, queued, created, id) = rt.persist_scheduled_tick(schedule, instant).await?;
-        rt.launch_scheduled_tick(schedule, canonical, queued, created, &id);
+        rt.launch_scheduled_tick(schedule, canonical, queued, created);
         ids.push(id);
     }
     Ok(ids)
@@ -3673,7 +3856,7 @@ async fn schedule_fire_loop(
         }
 
         match rt.persist_scheduled_tick(&schedule, next).await {
-            Ok((canonical, queued, created, id)) => {
+            Ok((canonical, queued, created, _)) => {
                 // Test hook: simulate an abrupt failure of the scheduling
                 // process right after the tick is persisted but before it runs
                 // (and before `last_fired_at` is stamped). Recovery must then
@@ -3681,7 +3864,7 @@ async fn schedule_fire_loop(
                 // armed via the `fail` registry. See `tests/schedule_failpoint.rs`.
                 fail::fail_point!("schedule_tick_after_persist", |_| {});
 
-                rt.launch_scheduled_tick(&schedule, canonical, queued, created, &id);
+                rt.launch_scheduled_tick(&schedule, canonical, queued, created);
             }
             Err(e) => {
                 tracing::warn!(

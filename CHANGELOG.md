@@ -8,6 +8,65 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: checkpoint storage failures stop the execution with
+  `Error::RecoveryRequired` instead of finalizing a business failure.** Catching
+  the error does not permit further durable work or terminal writes. Committed
+  records replay; uncommitted plain steps can repeat. Lost terminal-write replies
+  are reconciled with stored status. User-body database errors and semantic
+  provider rejections remain business errors.
+  Direct, child, scheduled, recovered and queued runs now share automatic recovery
+  after backoff. An ownership CAS uses the original executor and recovery
+  generation; only its winner may restart a direct run or requeue a queued run.
+  Workflow-body panics have zero automatic body retries: the same ownership CAS
+  parks them in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` for explicit resume, releasing
+  queue capacity. Step-body panics retain their step retry policy.
+  Recorded business failures schedule no recovery claim.
+  `max_recovery_attempts` counts restart claims after
+  infrastructure interruptions as well as process loss; progress does not reset
+  it. Exhausted workflows park and release queue capacity. Repair and explicit
+  resume reset a parked workflow (including on the in-memory backend).
+  Deactivation stops automatic dispatch and direct recovery claims that would
+  restart a body, while stopped executions can still requeue or park. Another
+  active executor may pick up requeued work. Shutdown stops all automatic settlement.
+  A shutdown timeout still returns `Ok(())` and leaves running bodies alive;
+  explicit recovery/resume requires confirming that the previous executions
+  stopped. The recovery CAS does not fence a live old body.
+  Failed storage claims retry at most eight times, then emit an error and leave
+  the unfinished row for explicit recovery after repair. A lost/ambiguous direct
+  claim never authorizes duplicate dispatch; it may need explicit recovery once
+  the previous owner is known to have stopped.
+  `RecoveryRequired` cannot be persisted as a business failure, including when
+  propagated through a child handle. Failure to encode a terminal error enters
+  recovery settlement rather than leaving an untracked `PENDING` row.
+  Creation/retrieval/polling infrastructure faults return `Error::ObservationFailed`,
+  preserving the cause's error code without claiming the target stopped.
+  Stream reads and handle status reads use
+  the same observation channel. Retry reads or creation with the same id;
+  this reconciles existence but cannot prove that an existing direct run has an
+  owner. A lost creation reply can require explicit recovery after the original
+  owner stops. Do not recover a target based on an observation fault alone.
+  Existing children are observed, never redispatched merely because their
+  parent's relationship checkpoint is missing. A polling child handle reports
+  `MaxRecoveryAttemptsExceeded` when the child parks. A parent that returns that
+  error becomes `ERROR`; resuming the child does not reopen its parent, and
+  resume preserves `SUCCESS`/`ERROR` outcomes. Propagating either
+  signal through a durable body interrupts that execution and bypasses business
+  retries. Output-to-Rust-type mismatches remain catchable.
+  SQL transaction machinery errors do not become business failures or enter
+  `max_retries` / `retry_if`; existing live transient database retries remain.
+  Output conversion failures use `Error::OutputSerialization` and bypass body
+  retries, then record the existing Serialization diagnostic. Replay reuses that
+  failure once committed. After a duplicate checkpoint, a rollback error does
+  not override a readable, validated committed outcome; other rollback failures
+  retain their infrastructure classification.
+  Replay verification exits on a latched storage fault even if the body catches
+  it and parks; history-read faults are observation failures, not divergence.
+  Every interrupted execution emits a structured diagnostic. Stopping drops the
+  workflow future, including sibling calls with checkpoint writes in flight;
+  effects without committed checkpoints may repeat and post-fault compensation
+  is not guaranteed. There is no new schema or recorded-error format; exhaustive
+  matches must handle the new error variants.
+
 - **Breaking: recorded failures return the same error representation on the
   initial execution and replay.** Built-in variants retain their fields;
   live driver, migration, and JSON errors become `Error::Recorded`, preserving

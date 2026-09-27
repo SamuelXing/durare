@@ -185,12 +185,13 @@ impl Client {
                             queue_name,
                             opts.dedup_id.as_deref().unwrap_or(""),
                         )
-                        .await?
+                        .await
+                        .map_err(crate::execution::observation_error)?
                     {
                         return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(crate::execution::observation_error(e)),
             }
         }
     }
@@ -271,7 +272,8 @@ impl Client {
     pub async fn retrieve_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         self.provider
             .get_workflow_status(id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
         Ok(WorkflowHandle::polling(
             id.to_string(),

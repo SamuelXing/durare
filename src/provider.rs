@@ -274,13 +274,16 @@ impl<T: StateProvider + ?Sized> StreamBackend for T {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<Value>, bool)> {
-        self.read_stream(workflow_id, key, from_offset).await
+        self.read_stream(workflow_id, key, from_offset)
+            .await
+            .map_err(crate::execution::observation_error)
     }
 
     async fn producer_status(&self, workflow_id: &str) -> Result<Option<String>> {
         Ok(self
             .get_workflow_status(workflow_id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .map(|s| s.status))
     }
 }
@@ -340,7 +343,10 @@ pub(crate) async fn snapshot_stream<T: DeserializeOwned>(
     key: &str,
     from_offset: i32,
 ) -> Result<(Vec<T>, bool)> {
-    let (values, closed) = provider.read_stream(workflow_id, key, from_offset).await?;
+    let (values, closed) = provider
+        .read_stream(workflow_id, key, from_offset)
+        .await
+        .map_err(crate::execution::observation_error)?;
     let out = values
         .into_iter()
         .map(serde_json::from_value)
@@ -1308,9 +1314,11 @@ pub enum RecoveryClaim {
         /// `recovery_attempts` after the parking increment.
         attempts: i32,
     },
-    /// The row no longer matches what the sweep observed — a rival sweep
-    /// claimed it, or it completed, was cancelled, or was resumed. Another
-    /// process is responsible for it now; do nothing.
+    /// The row no longer matches the expected state. It may have completed,
+    /// been cancelled/resumed, or been claimed by a rival or by an earlier call
+    /// whose reply was lost. This is not permission to dispatch, and does not
+    /// prove that any process is running the workflow. An unfinished direct run
+    /// may require explicit recovery once its previous execution has stopped.
     Lost,
 }
 
@@ -1319,6 +1327,18 @@ pub enum RecoveryClaim {
 ///
 /// Every method must be **idempotent** with respect to its keys, because the
 /// engine may re-run a workflow after a crash and replay completed steps.
+///
+/// # Error contract
+///
+/// At this boundary, return [`Error::Db`], [`Error::Migrate`], [`Error::Serde`]
+/// or [`Error::Serialization`] for storage/record-encoding failures. A provider
+/// with another storage error type can wrap its cause in [`Error::RecoveryRequired`].
+/// The engine stops the affected execution without recording a business outcome.
+/// Return semantic rejections (such as [`Error::NonExistentWorkflow`] or
+/// [`Error::App`] for a closed stream) as ordinary errors; callers may handle them.
+/// Do not flatten storage failures to an application message. Recorded user
+/// failures are outcomes, not live storage errors; transaction callers reconcile
+/// ambiguous failures against the stored step before deciding how to proceed.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Create tables / indexes if they do not yet exist.
@@ -1498,6 +1518,12 @@ pub trait StateProvider: Send + Sync {
     /// (serialization failure / deadlock) is *not* recorded — it restarts the
     /// whole transaction on a fresh one, re-running `body`. SQL backends only; the
     /// in-memory provider returns an error.
+    ///
+    /// Only failures returned by `body` enter the application retry policy and
+    /// become recorded failures. Non-transient errors from transaction setup,
+    /// checkpoint encoding/insertion, commit or rollback must be returned as
+    /// storage errors without recording a step outcome. Preserve their source
+    /// even when both body and infrastructure use the same `Error` variant.
     async fn run_transaction_step(
         &self,
         workflow_id: &str,
@@ -1798,19 +1824,18 @@ pub trait StateProvider: Send + Sync {
     /// it*: it applies only while the row is still `PENDING`, still owned by
     /// [`expected_executor`](RecoveryClaimRequest::expected_executor), and still
     /// at [`expected_attempts`](RecoveryClaimRequest::expected_attempts). Any
-    /// interleaved transition — a rival sweep's claim (which bumps the attempt
-    /// count), a completion, a cancellation, a resume — makes the predicate
-    /// miss, and the caller gets [`RecoveryClaim::Lost`]: at most one process
-    /// dispatches each pending workflow, no matter how many recover the same
-    /// dead executor at once.
+    /// change to those fields makes the predicate miss, returning
+    /// [`RecoveryClaim::Lost`]. With a stopped old execution and no concurrent
+    /// counter reset, only one claimant can dispatch that generation. A lost
+    /// reply can leave a successful claim without a runner, so Lost does not
+    /// establish that another process is executing it.
     ///
     /// One caveat: a resume *resets* the attempt counter, so a cancel-then-
     /// resume can reconstruct the exact triple a sweep observed before either
     /// happened, and a claim that stayed in flight across both would land on
-    /// the resumed run. The window requires a sweep stalled across two operator
-    /// actions; the terminal-write guard and the step-checkpoint conflict in
-    /// [`record_step_result`](Self::record_step_result) contain the doubled
-    /// execution if it ever occurs.
+    /// the resumed run. Stop in-flight recovery claims before resetting the
+    /// counter. Terminal-write and checkpoint conflict checks preserve recorded
+    /// outcomes but cannot undo effects already performed by a duplicate body.
     ///
     /// A successful claim increments `recovery_attempts` and, depending on the
     /// request, either re-stamps `executor_id` with the claimant

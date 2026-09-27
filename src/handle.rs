@@ -46,10 +46,11 @@ use tokio::task::JoinHandle;
 /// resolves first consumes it and the rest fall back to polling the persisted
 /// status. Every normal outcome — success, error, cancellation, timeout — is
 /// written to that status before the task returns, so all clones observe the
-/// same result. A *panicking* workflow is the exception: the clone that owns
-/// the task surfaces the panic as an error, while the others poll a status the
-/// panic never wrote and keep waiting until the run is recovered. (Idiomatic
-/// failures return `Err`, which is terminal, so this affects only real panics.)
+/// same result. An interrupted execution (a workflow panic or infrastructure
+/// failure) is different: the owning clone returns `RecoveryRequired`, while
+/// polling clones wait for recovery to produce a terminal outcome. A polling
+/// read or stored-error decoding fault returns `ObservationFailed`; none of
+/// these observation failures can become another step's recorded business error.
 pub struct WorkflowHandle<O> {
     id: String,
     provider: Arc<dyn StateProvider>,
@@ -111,7 +112,8 @@ impl<O> WorkflowHandle<O> {
     pub async fn get_status(&self) -> Result<WorkflowStatus> {
         self.provider
             .get_workflow_status(&self.id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .ok_or_else(|| Error::UnknownWorkflow(self.id.clone()))
     }
 }
@@ -132,7 +134,10 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     /// The workflow's own error if it finished in `ERROR` (reconstructed from
     /// its checkpoint — a portable error keeps its structure);
     /// [`Error::Cancelled`] if it was cancelled; a decode error if the stored
-    /// output does not deserialize as `O`.
+    /// output does not deserialize as `O`. An interrupted task returns
+    /// [`Error::RecoveryRequired`]. A storage read or unreadable error envelope
+    /// returns [`Error::ObservationFailed`], which does not establish that the
+    /// target stopped; retry the observation instead of recovering the target.
     pub async fn result(&self) -> Result<O> {
         // Claim the in-process task exactly once. The guard is a temporary of
         // this statement, so it is dropped here — never held across the await.
@@ -148,7 +153,9 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                     let value = res?;
                     Ok(serde_json::from_value(value)?)
                 }
-                Err(e) => Err(Error::app(format!("workflow task failed: {e}"))),
+                Err(e) => Err(crate::execution::recovery_error(Error::app(format!(
+                    "workflow task failed: {e}"
+                )))),
             };
         }
 
@@ -178,12 +185,13 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                 Err(Error::MaxRecoveryAttemptsExceeded(self.id.clone()))
             }
             // Use the same decoder as initial completion and step replay.
-            STATUS_ERROR => Err(crate::recorded_error::from_parts(
+            STATUS_ERROR => Err(crate::recorded_error::try_from_parts(
                 status
                     .error
                     .unwrap_or_else(|| "workflow failed".to_string()),
                 status.error_info,
-            )),
+            )
+            .map_err(crate::execution::observation_error)?),
             _ => {
                 let output = status.output.unwrap_or(Value::Null);
                 Ok(serde_json::from_value(output)?)

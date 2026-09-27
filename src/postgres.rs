@@ -1163,6 +1163,7 @@ impl StateProvider for PostgresProvider {
         opts: &TransactionOptions,
         body: TxBody<'_>,
     ) -> Result<Value> {
+        use crate::tx::TransactionAttempt;
         let name = opts.name.as_str();
         // Replay: a previously recorded outcome — a committed success or a durable
         // failure written by an earlier exhausted run — is returned immediately,
@@ -1258,7 +1259,7 @@ impl StateProvider for PostgresProvider {
                                     None,
                                 )
                                 .await?;
-                            outcome.into_value_result()
+                            outcome.into_value_result().map(TransactionAttempt::Committed)
                         }
                         // Success: checkpoint the output in the same transaction, so
                         // the body's writes and the checkpoint commit atomically.
@@ -1288,7 +1289,9 @@ impl StateProvider for PostgresProvider {
                                 // back, then classify against the stored row —
                                 // an identical write converges, anything else
                                 // errors.
-                                tx.rollback().await?;
+                                if let Err(error) = tx.rollback().await {
+                                    tracing::warn!(%error, "rollback after duplicate checkpoint failed; reading the committed outcome");
+                                }
                                 self.classify_lost_txn_checkpoint(
                                     workflow_id,
                                     seq,
@@ -1298,10 +1301,10 @@ impl StateProvider for PostgresProvider {
                                     started_at_ms,
                                 )
                                 .await?;
-                                return Ok(value);
+                                return Ok(TransactionAttempt::Committed(value));
                             }
                             tx.commit().await?;
-                            Ok(value)
+                            Ok(TransactionAttempt::Committed(value))
                         }
                         // Any error rolls back the body's writes (dropping `tx` on a
                         // conflict/transient error, an explicit rollback otherwise) so
@@ -1312,14 +1315,15 @@ impl StateProvider for PostgresProvider {
                         Err(e) if e.should_retry_live_transaction() => Err(e),
                         Err(e) => {
                             tx.rollback().await?;
-                            Err(e)
+                            Ok(TransactionAttempt::BodyFailed(e))
                         }
                     }
                 }
                 .await;
 
                 match outcome {
-                    Ok(v) => return Ok(v),
+                    Ok(TransactionAttempt::Committed(v)) => return Ok(v),
+                    Ok(TransactionAttempt::BodyFailed(e)) => break 'conflict e,
                     // A transaction conflict or transient DB error: retry on a fresh
                     // transaction, unbounded, backing off and bailing if the workflow
                     // is cancelled. Matches Go/Python, which retry these until they
@@ -1329,7 +1333,9 @@ impl StateProvider for PostgresProvider {
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
-                    Err(e) => break 'conflict e,
+                    // A begin, encode, checkpoint or commit failure is not a
+                    // business outcome, even when it is not transient.
+                    Err(e) => return Err(e),
                 }
             };
 
@@ -1358,7 +1364,7 @@ impl StateProvider for PostgresProvider {
                 user_attempt += 1;
                 continue;
             }
-            let encoded_err = serialize::encode_error(&self.serializer, &body_err);
+            let encoded_err = serialize::encode_error(&self.serializer, &body_err)?;
             let won = sqlx::query(&format!(
                 "INSERT INTO {operation_outputs}
                      (workflow_uuid, function_id, function_name, error, serialization,
