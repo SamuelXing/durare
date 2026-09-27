@@ -330,7 +330,7 @@ async fn stream_type_mismatches_remain_catchable_and_observation_causes_stay_fla
             .await?,
         42
     );
-    let execution = super::Execution::default();
+    let execution = super::Execution::new("producer");
     let cause = Arc::new(Error::Db(sqlx::Error::PoolTimedOut));
     let error = execution.body_error(Error::ObservationFailed(cause.clone()));
     let Error::RecoveryRequired(actual) = error else {

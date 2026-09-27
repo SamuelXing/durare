@@ -59,6 +59,10 @@ enum ErrorWire {
         operation: String,
     },
     DurableCallCrossedBody(String),
+    DurableCallOutsideExecution {
+        workflow_id: String,
+        operation: String,
+    },
     WorkflowConflict(String),
     ReplayDiverged {
         workflow_id: String,
@@ -263,6 +267,10 @@ mod tests {
                 operation: "step".into(),
             },
             Error::DurableCallCrossedBody("step".into()),
+            Error::DurableCallOutsideExecution {
+                workflow_id: "wf".into(),
+                operation: "step".into(),
+            },
             Error::WorkflowConflict("wf".into()),
             Error::ReplayDiverged {
                 workflow_id: "wf".into(),

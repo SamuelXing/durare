@@ -49,6 +49,8 @@ pub enum ErrorCode {
     /// A durable operation was created or polled inside another durable
     /// operation's body, where it cannot hold its position across a replay.
     NestedDurableCall,
+    /// A durable operation used a context outside its originating execution.
+    DurableCallOutsideExecution,
     /// Another live execution of the same workflow id checkpointed this step
     /// first; this execution no longer owns the workflow.
     WorkflowConflict,
@@ -225,6 +227,25 @@ pub enum Error {
     )]
     DurableCallCrossedBody(String),
 
+    /// A durable call was created or polled outside the workflow execution that
+    /// supplied its context. This includes spawned tasks and contexts retained
+    /// from another run, even when both runs have the same workflow id.
+    ///
+    /// This is a catchable programming error, not a request for infrastructure
+    /// recovery. Keep durable calls in the workflow body (for example using
+    /// `tokio::join!`), or start a child workflow. Plain tasks inside a step and
+    /// reading context metadata remain allowed.
+    #[error(
+        "workflow `{workflow_id}`: `{operation}` was used outside its original workflow execution; \
+         keep durable calls in the workflow body or start a child workflow"
+    )]
+    DurableCallOutsideExecution {
+        /// The workflow whose context or pending call was used.
+        workflow_id: String,
+        /// The refused durable operation.
+        operation: String,
+    },
+
     /// Another live execution of workflow `{0}` checkpointed the step this
     /// execution was about to record: two executions of the same workflow id
     /// were running at once (e.g. overlapping recovery sweeps), and this one
@@ -278,6 +299,15 @@ pub enum Error {
 }
 
 impl Error {
+    /// Retrying a body cannot repair an invalid durable-call scope. Use the
+    /// stable code so a re-raised recorded diagnostic follows the same policy.
+    pub(crate) fn is_scope_violation(&self) -> bool {
+        matches!(
+            self.code(),
+            ErrorCode::NestedDurableCall | ErrorCode::DurableCallOutsideExecution
+        )
+    }
+
     /// Construct an application-level error from anything string-like.
     pub fn app(msg: impl Into<String>) -> Self {
         Error::App {
@@ -379,6 +409,7 @@ impl Error {
             Error::NestedDurableCall { .. } | Error::DurableCallCrossedBody { .. } => {
                 ErrorCode::NestedDurableCall
             }
+            Error::DurableCallOutsideExecution { .. } => ErrorCode::DurableCallOutsideExecution,
             Error::WorkflowConflict(_) => ErrorCode::WorkflowConflict,
             Error::ReplayDiverged { .. } => ErrorCode::ReplayDiverged,
             Error::App { .. } | Error::Portable(_) => ErrorCode::Application,

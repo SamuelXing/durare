@@ -2226,7 +2226,7 @@ impl DurableEngine {
     /// # What it does not catch
     ///
     /// It re-runs the function, so what it sees is the sequence of durable
-    /// operations. That bounds it in three ways:
+    /// operations. That bounds it in two ways:
     ///
     /// - Non-determinism that does not change the sequence is invisible. A body
     ///   that reads the clock, iterates a `HashMap`, or branches on an
@@ -2234,13 +2234,13 @@ impl DurableEngine {
     ///   this time — and a coin-flip that happens to land the recorded way
     ///   passes too. The [determinism guide](crate::determinism) is still the
     ///   rulebook; this is a check, not a proof.
-    /// - A durable call made from a `tokio::spawn`ed task is not attributed to
-    ///   the body that spawned it. The nesting guard's task-local does not reach
-    ///   a spawned task either, and for the same reason: the position it claims
-    ///   belongs to whichever task got there first.
     /// - It judges one recorded history. Another workflow of the same name, down
     ///   a different branch, can still diverge — verify the runs you are about
     ///   to carry across the deploy, not one of them.
+    ///
+    /// Durable calls from spawned tasks are refused with
+    /// [`Error::DurableCallOutsideExecution`], just as in ordinary execution.
+    /// The guard runs even when the call would otherwise replay a checkpoint.
     ///
     /// # Errors
     ///
@@ -2291,7 +2291,7 @@ impl DurableEngine {
         // taken out on the caller.
         let execution = ctx.execution();
         let outcome = tokio::select! {
-            result = AssertUnwindSafe(handler(ctx, status.input)).catch_unwind() => result,
+            result = AssertUnwindSafe(execution.scope(|| handler(ctx, status.input))).catch_unwind() => result,
             error = execution.failed() => return Err(error),
         };
 
@@ -3382,7 +3382,7 @@ fn run_to_completion(
     // forever (finding F1). Steps catch their own panics (subject to retry);
     // this handles a panic in the workflow body itself.
     let execution = ctx.execution();
-    let run = AssertUnwindSafe(handler.clone()(ctx, input)).catch_unwind();
+    let run = AssertUnwindSafe(execution.scope(|| handler.clone()(ctx, input))).catch_unwind();
     let run = async {
         tokio::select! {
             result = run => result,

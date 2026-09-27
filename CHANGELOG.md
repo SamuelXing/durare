@@ -8,6 +8,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: durable calls require their original workflow execution.** Moving
+  an owned or cloned `DurableContext` into `tokio::spawn`, or using it from
+  another execution, now returns `Error::DurableCallOutsideExecution` before
+  claiming a position. Already-built calls check on every poll; refusing one
+  does not reclaim its position. Native transactions and patches also check
+  every poll, without changing their existing position allocation or callback
+  signatures. Use `join!` in the workflow, child workflows for independent
+  durable work, or plain tasks inside a checkpointed step. Context metadata
+  remains accessible outside the execution. This is a recordable programming
+  error, not an infrastructure recovery signal. This error and the existing
+  nested/crossed-body errors bypass step and transaction retries, including
+  `retry_if`; retrying cannot repair an invalid call scope. Its new persisted
+  error kind requires readers-before-writers rollout: upgrade readers before
+  allowing executions that can record it; older readers cannot decode this new kind.
+
 - **Breaking: checkpoint storage failures stop the execution with
   `Error::RecoveryRequired` instead of finalizing a business failure.** Catching
   the error does not permit further durable work or terminal writes. Committed
