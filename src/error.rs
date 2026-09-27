@@ -79,7 +79,10 @@ pub enum Error {
     /// An infrastructure failure while creating, locating or observing a
     /// workflow. It says nothing about whether the target execution stopped.
     /// Retry the observation (or creation with the same id), not recovery of
-    /// the target. A durable body that propagates this signal interrupts its
+    /// the target based on this signal alone. A creation retry establishes
+    /// existence, not that a task owns an existing direct run; see the durability
+    /// guide for ambiguous creation and explicit recovery.
+    /// A durable body that propagates this signal interrupts its
     /// own execution; the observation failure cannot be recorded as an outcome.
     /// [`code`](Self::code) and the diagnostic predicates describe the cause.
     #[error("workflow operation could not be observed: {0}")]

@@ -139,7 +139,7 @@
 //! terminal outcome wins, otherwise the caller receives `RecoveryRequired`.
 //! Concurrent cancellation/completion may already have changed the stored status.
 //!
-//! All execution entries share automatic recovery after backoff: direct starts,
+//! Storage interruptions at all execution entries share recovery after backoff: direct starts,
 //! children, schedules, recovery dispatch and queues. An atomic ownership check
 //! uses the executor and recovery generation captured when that run started.
 //! Queued runs return to their queue; direct runs are dispatched after a won
@@ -153,10 +153,13 @@
 //! the stale generation cannot be claimed twice. A lost claim is never permission
 //! to dispatch: another executor may already be running it. An ambiguous direct
 //! claim may therefore need explicit recovery after the previous owner is known
-//! to have stopped. Shutdown stops automatic recovery and leaves unfinished rows.
+//! to have stopped. Shutdown and deactivation stop automatic recovery and leave
+//! unfinished rows. Deactivation also cancels in-flight automatic claims; a
+//! claim already committed at cancellation may need explicit recovery. Explicit
+//! operator recovery remains available on a deactivated engine.
 //!
 //! The cap counts successful recovery claims, including restarts after storage
-//! interruptions and panics, not only process crashes. Progress does not reset
+//! interruptions, not only process crashes. Progress does not reset
 //! the count: flapping storage can exhaust a healthy workflow's budget. Persistent
 //! decoding/configuration problems use this same bounded policy, because their
 //! error category cannot establish when an operator or deployment will repair
@@ -177,16 +180,30 @@
 //! if that write did not commit, the sibling's effect may repeat. Cancellation
 //! does not strengthen the plain-step at-least-once guarantee.
 //!
-//! Workflow-body panics and failed local tasks return `RecoveryRequired`; they
-//! did not establish a business outcome. A local handle reports the interruption
-//! even when automatic recovery is already scheduled; a polling handle can wait
-//! for the recovered outcome. Externally aborting the entire owning task bypasses
-//! its completion path and can still require explicit recovery.
+//! Workflow-body panics have zero automatic body retries. Their ownership CAS
+//! parks the row in `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, releasing queue capacity;
+//! it increments the ownership generation but does not exhaust the configured
+//! storage-recovery budget by rerunning the body. Repair the code and explicitly
+//! resume the parked workflow. Step-body panics retain the step retry policy.
+//! A local handle reports `RecoveryRequired` for an interrupted execution; a
+//! polling handle observes either its recovered outcome or its parked status.
+//! Externally aborting the entire owning task bypasses this settlement path and
+//! can still require explicit recovery. Parking requires writable storage; failed
+//! parking claims follow the same bounded claim retries described above.
 //!
 //! Creation, retrieval and polling infrastructure failures instead return
 //! [`Error::ObservationFailed`]. This says the operation could not be observed,
 //! not that its target stopped. Retry a read; retry ambiguous creation with the
-//! same workflow id. Do not recover the target based on this error alone.
+//! same workflow id. A retry reconciles existence, not execution ownership. If
+//! creation committed but its reply was lost, an existing direct run (including
+//! a child or scheduled tick) may have no task. It needs explicit recovery after
+//! the previous creator is known to have stopped. An existing child is never
+//! redispatched just because its parent's relationship checkpoint is absent:
+//! that child could still be running. Queued creation is claimed by a dispatcher.
+//! Do not recover the target based on an observation error alone. A failed
+//! terminal readback after another execution committed is an observation failure,
+//! not permission to recover that execution. Stream reads and handle status reads
+//! follow the same rule; conversion to the requested Rust type stays catchable.
 //! Its `code()` and diagnostic predicates describe the underlying cause.
 //! Neither signal can be checkpointed as a business outcome or sent through
 //! business retry policy. When propagated through a parent durable body, it

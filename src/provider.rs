@@ -274,13 +274,16 @@ impl<T: StateProvider + ?Sized> StreamBackend for T {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<Value>, bool)> {
-        self.read_stream(workflow_id, key, from_offset).await
+        self.read_stream(workflow_id, key, from_offset)
+            .await
+            .map_err(crate::execution::observation_error)
     }
 
     async fn producer_status(&self, workflow_id: &str) -> Result<Option<String>> {
         Ok(self
             .get_workflow_status(workflow_id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .map(|s| s.status))
     }
 }
@@ -340,7 +343,10 @@ pub(crate) async fn snapshot_stream<T: DeserializeOwned>(
     key: &str,
     from_offset: i32,
 ) -> Result<(Vec<T>, bool)> {
-    let (values, closed) = provider.read_stream(workflow_id, key, from_offset).await?;
+    let (values, closed) = provider
+        .read_stream(workflow_id, key, from_offset)
+        .await
+        .map_err(crate::execution::observation_error)?;
     let out = values
         .into_iter()
         .map(serde_json::from_value)

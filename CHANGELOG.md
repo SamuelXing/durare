@@ -17,11 +17,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Direct, child, scheduled, recovered and queued runs now share automatic recovery
   after backoff. An ownership CAS uses the original executor and recovery
   generation; only its winner may restart a direct run or requeue a queued run.
-  Workflow-body panics use the same path. Recorded business failures schedule no
-  recovery claim. `max_recovery_attempts` counts restart claims after panics and
+  Workflow-body panics have zero automatic body retries: the same ownership CAS
+  parks them in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` for explicit resume, releasing
+  queue capacity. Step-body panics retain their step retry policy.
+  Recorded business failures schedule no recovery claim.
+  `max_recovery_attempts` counts restart claims after
   infrastructure interruptions as well as process loss; progress does not reset
   it. Exhausted workflows park and release queue capacity. Repair and explicit
-  resume reset a parked workflow. Shutdown stops automatic recovery.
+  resume reset a parked workflow (including on the in-memory backend).
+  Shutdown and deactivation stop automatic recovery.
   Failed storage claims retry at most eight times, then emit an error and leave
   the unfinished row for explicit recovery after repair. A lost/ambiguous direct
   claim never authorizes duplicate dispatch; it may need explicit recovery once
@@ -29,8 +33,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `RecoveryRequired` cannot be persisted as a business failure, including when
   propagated through a child handle. Creation/retrieval/polling infrastructure
   faults return `Error::ObservationFailed`, preserving the cause's error code
-  without claiming the target stopped. Retry reads or creation with the same id;
-  do not recover the target based on an observation fault. Propagating either
+  without claiming the target stopped. Stream reads and handle status reads use
+  the same observation channel. Retry reads or creation with the same id;
+  this reconciles existence but cannot prove that an existing direct run has an
+  owner. A lost creation reply can require explicit recovery after the original
+  owner stops. Do not recover a target based on an observation fault alone.
+  Existing children are observed, never redispatched merely because their
+  parent's relationship checkpoint is missing. Propagating either
   signal through a durable body interrupts that execution and bypasses business
   retries. Output-to-Rust-type mismatches remain catchable.
   SQL transaction machinery errors do not become business failures or enter

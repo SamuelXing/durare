@@ -31,6 +31,8 @@ pub enum Fault {
     Corrupt,
     ChildBefore,
     ChildAfter,
+    ChildRecordBefore,
+    StreamRead,
     InsertBefore,
     InsertAfter,
 }
@@ -346,6 +348,9 @@ impl StateProvider for FaultProvider {
         name: &str,
         child_id: &str,
     ) -> Result<()> {
+        if self.take(Fault::ChildRecordBefore) {
+            return Self::failure();
+        }
         self.inner
             .record_child_workflow(parent_id, seq, name, child_id)
             .await
@@ -386,6 +391,9 @@ impl StateProvider for FaultProvider {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<Value>, bool)> {
+        if self.take(Fault::StreamRead) {
+            return Self::failure();
+        }
         self.inner.read_stream(workflow_id, key, from_offset).await
     }
     async fn list_workflow_events(&self, workflow_id: &str) -> Result<Vec<(String, Value)>> {

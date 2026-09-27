@@ -23,7 +23,12 @@ async fn sweep(inner: Arc<dyn StateProvider>) -> Result<()> {
             let id = uuid::Uuid::new_v4().to_string();
             let effects = Arc::new(AtomicUsize::new(0));
             let wrapped = Arc::new(FaultProvider::new(inner.clone(), fault));
-            let mut engine = DurableEngine::new(wrapped).await?;
+            wrapped.block_claim.store(true, Ordering::SeqCst);
+            let mut engine = DurableEngine::with_config(
+                wrapped,
+                EngineConfig::default().executor_id(format!("faulting-{id}")),
+            )
+            .await?;
             let register = |engine: &mut DurableEngine| {
                 let effects = effects.clone();
                 engine.register("checkpoint", move |ctx: DurableContext, _: ()| {
@@ -50,6 +55,7 @@ async fn sweep(inner: Arc<dyn StateProvider>) -> Result<()> {
                 .await?
                 .result()
                 .await;
+            engine.shutdown(Duration::from_secs(2)).await?;
             let status = inner.get_workflow_status(&id).await?.unwrap();
             if fault == Fault::TerminalAfter {
                 assert_eq!(
@@ -73,7 +79,11 @@ async fn sweep(inner: Arc<dyn StateProvider>) -> Result<()> {
                         "no later checkpoint after a fault"
                     );
                 }
-                let mut recovery = DurableEngine::new(inner.clone()).await?;
+                let mut recovery = DurableEngine::with_config(
+                    inner.clone(),
+                    EngineConfig::default().executor_id(format!("recovering-{id}")),
+                )
+                .await?;
                 register(&mut recovery);
                 let recovered = recovery.recover_pending_for(&[status.executor_id]).await?;
                 assert!(recovered.contains(&id));
@@ -84,6 +94,7 @@ async fn sweep(inner: Arc<dyn StateProvider>) -> Result<()> {
                 .await
                 .expect("recovery must complete")?;
                 assert_eq!(value, 42);
+                recovery.shutdown(Duration::from_secs(2)).await?;
             }
             assert_eq!(
                 effects.load(Ordering::SeqCst),
@@ -421,6 +432,8 @@ async fn encoding_a_step_result_must_not_repeat_its_effect_on_recovery() -> Resu
     };
     let mut engine = DurableEngine::new(inner.clone()).await?;
     register(&mut engine);
+    // This test exercises explicit recovery after a stopped executor.
+    engine.deactivate();
     let _ = engine
         .start::<_, ()>("encoding", (), WorkflowOptions::with_id("encoding"))
         .await?
@@ -722,8 +735,11 @@ async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()>
             loop {
                 let text = logs.text();
                 if text.lines().any(|line| {
-                    line.contains("recovery_required=true")
-                        && line.contains(&format!("workflow_id={expected_id}"))
+                    line.contains(if mode == "adopt" {
+                        "observation_failed=true"
+                    } else {
+                        "recovery_required=true"
+                    }) && line.contains(&format!("workflow_id={expected_id}"))
                         && line.contains("pool timed out")
                 }) {
                     break;
@@ -859,6 +875,7 @@ async fn transaction_result_encoding_failures_are_recorded_as_business_failures(
         };
         let mut engine = DurableEngine::new(inner.clone()).await?;
         register(&mut engine);
+        engine.deactivate();
         let _ = engine
             .start::<_, ()>("encoding-tx", (), WorkflowOptions::with_id("encoding-tx"))
             .await?
@@ -1578,7 +1595,7 @@ async fn datasource_setup_failures_bypass_the_business_retry_policy() -> Result<
 }
 
 #[tokio::test]
-async fn queued_panics_recover_or_park_without_leaking_capacity() -> Result<()> {
+async fn queued_panics_park_without_leaking_capacity_and_can_be_resumed() -> Result<()> {
     for permanent in [false, true] {
         let inner = Arc::new(InMemoryProvider::new());
         let mut builder = DurableEngine::builder(inner.clone());
@@ -1614,14 +1631,10 @@ async fn queued_panics_recover_or_park_without_leaking_capacity() -> Result<()> 
             engine.shutdown(Duration::from_secs(1)).await?;
         }
         let result = result.expect("an interrupted queued run must recover or park");
-        if permanent {
-            assert_eq!(
-                result.unwrap_err().code(),
-                ErrorCode::MaxRecoveryAttemptsExceeded
-            );
-        } else {
-            assert_eq!(result?, 42);
-        }
+        assert_eq!(
+            result.unwrap_err().code(),
+            ErrorCode::MaxRecoveryAttemptsExceeded
+        );
         let next = engine
             .start::<_, i32>(
                 "healthy",
@@ -1635,7 +1648,17 @@ async fn queued_panics_recover_or_park_without_leaking_capacity() -> Result<()> 
                 .unwrap()?,
             42
         );
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        if !permanent {
+            let resumed = engine.resume_workflow::<i32>("panics").await?;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(3), resumed.result())
+                    .await
+                    .unwrap()?,
+                42
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        }
         engine.shutdown(Duration::from_secs(1)).await?;
     }
     Ok(())
@@ -1664,9 +1687,11 @@ async fn a_child_recovery_error_cannot_be_checkpointed_by_its_parent() -> Result
                 ctx.step("work", || async { Ok(42) }).await
             }
         });
+        child.deactivate();
         let child = Arc::new(child);
         let parent_store = Arc::new(InMemoryProvider::new());
         let mut parent = DurableEngine::new(parent_store.clone()).await?;
+        parent.deactivate();
         let child_engine = child.clone();
         parent.register("parent", move |ctx: DurableContext, _: ()| {
             let child = child_engine.clone();
@@ -1750,8 +1775,10 @@ async fn terminal_reconciliation_preserves_the_recovery_channel() -> Result<()> 
             .result()
             .await
             .unwrap_err();
-        let Error::RecoveryRequired(cause) = error else {
-            panic!("expected recovery channel, got {error:?}");
+        let cause = match (fault, error) {
+            (Fault::TerminalWrapped, Error::RecoveryRequired(cause)) => cause,
+            (Fault::TerminalAfterThenAdoptRead, Error::ObservationFailed(cause)) => cause,
+            (_, error) => panic!("wrong execution/observation channel: {error:?}"),
         };
         assert!(
             matches!(&*cause, Error::Db(sqlx::Error::PoolTimedOut)),

@@ -9,7 +9,8 @@
 
 use durare::{
     DurableContext, DurableEngine, Error, ListFilter, Result, ScheduleOptions, ScheduledInput,
-    SqliteProvider, StateProvider, STATUS_PENDING, STATUS_SUCCESS,
+    SqliteProvider, StateProvider, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -112,11 +113,10 @@ async fn tick_survives_crash_before_run() -> Result<()> {
     Ok(())
 }
 
-/// A crash *during* a scheduled run replays from checkpoints: a step that already
-/// committed before the crash is not re-run, and the rest completes — exactly
-/// once per tick, however many ticks fired.
+/// A panic during a scheduled run parks it. Explicit resume after repair reuses
+/// committed checkpoints and completes the remaining work once per tick.
 #[tokio::test]
-async fn tick_replays_after_crash_during_run() -> Result<()> {
+async fn panicked_tick_parks_and_replays_after_explicit_resume() -> Result<()> {
     let _serial = SERIAL.lock().await;
     static S1: AtomicUsize = AtomicUsize::new(0);
     static S2: AtomicUsize = AtomicUsize::new(0);
@@ -131,7 +131,7 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
                     Ok::<_, Error>(())
                 })
                 .await?;
-                // Crash between the two steps once s1 is checkpointed.
+                // Panic between the two steps once s1 is checkpointed.
                 fail::fail_point!("scheduled_job_mid_run");
                 ctx.step("s2", || async {
                     S2.fetch_add(1, Ordering::SeqCst);
@@ -143,8 +143,7 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
         );
     };
 
-    // Each fired tick runs s1, then panics (leaving the row PENDING with s1
-    // checkpointed) before s2.
+    // Each fired tick runs s1, then panics and parks before s2.
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
@@ -154,6 +153,23 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
         fail::cfg("scheduled_job_mid_run", "panic").expect("arm");
         engine.launch().await?;
         tokio::time::sleep(Duration::from_millis(2500)).await;
+        engine.pause_schedule("tick").await?;
+        let observer = SqliteProvider::connect(&url).await?;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = sched_rows(&observer).await?;
+                if !rows.is_empty()
+                    && rows
+                        .iter()
+                        .all(|row| row.status == STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED)
+                {
+                    return Ok::<_, Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all panicked ticks must park")?;
         engine.shutdown(Duration::from_secs(1)).await?;
         fail::remove("scheduled_job_mid_run");
     }
@@ -163,8 +179,9 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
     let n = rows.len();
     assert!(n >= 1, "at least one tick fired");
     assert!(
-        rows.iter().all(|r| r.status == STATUS_PENDING),
-        "all crashed mid-run"
+        rows.iter()
+            .all(|r| r.status == STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED),
+        "all panicked ticks parked without automatic body retries"
     );
     assert_eq!(S1.load(Ordering::SeqCst), n, "s1 ran once per fired tick");
     assert_eq!(
@@ -173,12 +190,14 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
         "s2 never reached before the crash"
     );
 
-    // Recovery replays each tick: s1 from its checkpoint (not re-run), s2 to
+    // Explicit resume replays each tick: s1 from its checkpoint (not re-run), s2 to
     // completion.
     {
         let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
         register(&mut engine);
-        assert!(engine.recover().await? >= 1, "recovery picked up the ticks");
+        engine.launch().await?;
+        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        assert_eq!(engine.resume_workflows::<()>(&ids).await?.len(), n);
         // Every re-dispatched tick completes in the background; wait them out.
         for _ in 0..250 {
             let rows = sched_rows(&provider).await?;
@@ -187,6 +206,7 @@ async fn tick_replays_after_crash_during_run() -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        engine.shutdown(Duration::from_secs(2)).await?;
     }
     assert_eq!(S1.load(Ordering::SeqCst), n, "s1 not re-run on replay");
     assert_eq!(S2.load(Ordering::SeqCst), n, "s2 ran exactly once per tick");

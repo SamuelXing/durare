@@ -112,7 +112,8 @@ impl<O> WorkflowHandle<O> {
     pub async fn get_status(&self) -> Result<WorkflowStatus> {
         self.provider
             .get_workflow_status(&self.id)
-            .await?
+            .await
+            .map_err(crate::execution::observation_error)?
             .ok_or_else(|| Error::UnknownWorkflow(self.id.clone()))
     }
 }
@@ -167,7 +168,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                     return self.terminal_to_result(status);
                 }
                 Ok(_) | Err(Error::UnknownWorkflow(_)) => {}
-                Err(e) => return Err(crate::execution::observation_error(e)),
+                Err(e) => return Err(e),
             }
             tokio::time::sleep(self.poll_interval).await;
         }

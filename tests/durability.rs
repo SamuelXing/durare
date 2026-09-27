@@ -1,8 +1,8 @@
 //! Backend-free tests using the in-memory provider.
 
 use durare::{
-    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepOptions,
-    WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
+    DurableContext, DurableEngine, Error, ErrorCode, InMemoryProvider, Result, StateProvider,
+    StepOptions, WorkflowOptions, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -284,11 +284,8 @@ async fn durable_uuid_calls_in_one_workflow_are_distinct() -> Result<()> {
     Ok(())
 }
 
-/// F1 — a panic in a workflow body is caught and treated as a *recoverable*
-/// failure (like a crash), not a terminal error: the row is left non-terminal so
-/// a later `recover()` re-runs it from its checkpoints. A workflow that panics
-/// once is recovered to completion. (The default hook prints the panic to stderr;
-/// the owning caller observes it as an error.)
+/// A workflow panic parks without automatic retries. Explicit resume after
+/// repair replays its checkpoints; the panic is not recorded as a business error.
 #[tokio::test]
 async fn workflow_body_panic_is_recoverable() -> Result<()> {
     static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
@@ -302,8 +299,8 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         Ok::<_, Error>(())
     });
 
-    // First execution panics: the owning caller sees an error, but the row is
-    // left recoverable (PENDING), not terminally failed.
+    engine.launch().await?;
+    // The owning caller sees the interruption; settlement parks the row.
     let res = engine
         .start::<(), ()>("panicky", (), WorkflowOptions::with_id("wf-panic"))
         .await?
@@ -313,22 +310,18 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         res.is_err(),
         "the owning caller observes the panic as an error"
     );
+    let parked = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.retrieve_workflow::<()>("wf-panic").await?.result(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        provider
-            .get_workflow_status("wf-panic")
-            .await?
-            .unwrap()
-            .status,
-        STATUS_PENDING,
-        "a panicked workflow is left recoverable, not terminally failed"
+        parked.unwrap_err().code(),
+        ErrorCode::MaxRecoveryAttemptsExceeded
     );
-
-    // recover() re-dispatches it in the background; the second attempt does
-    // not panic and completes. Poll for the terminal status.
-    assert!(
-        engine.recover().await? >= 1,
-        "recovery picks up the panicked run"
-    );
+    assert_eq!(ATTEMPTS.load(Ordering::SeqCst), 1);
+    engine.resume_workflow::<()>("wf-panic").await?;
     let mut status = String::new();
     for _ in 0..100 {
         status = provider
@@ -347,6 +340,7 @@ async fn workflow_body_panic_is_recoverable() -> Result<()> {
         2,
         "panicked once, then recovered"
     );
+    engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
 

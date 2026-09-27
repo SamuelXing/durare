@@ -52,7 +52,7 @@ impl Execution {
             .0
             .failure
             .get_or_init(|| match error {
-                Error::RecoveryRequired(cause) => cause,
+                Error::RecoveryRequired(cause) | Error::ObservationFailed(cause) => cause,
                 error => Arc::new(error),
             })
             .clone();
@@ -80,6 +80,7 @@ impl Execution {
 pub(crate) fn recovery_error(error: Error) -> Error {
     match error {
         Error::RecoveryRequired(_) => error,
+        Error::ObservationFailed(cause) => Error::RecoveryRequired(cause),
         other => Error::RecoveryRequired(Arc::new(other)),
     }
 }
@@ -122,3 +123,6 @@ pub(crate) fn is_storage_failure(error: &Error) -> bool {
 
 #[cfg(test)]
 pub(crate) mod test_provider;
+
+#[cfg(test)]
+mod boundary_tests;
