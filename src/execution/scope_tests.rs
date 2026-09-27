@@ -23,7 +23,7 @@ async fn scope_identity_and_restoration_survive_pending_and_panics() {
                 })
                 .await;
             assert!(owner.check_placement("step").is_ok());
-            let mut suspended = Box::pin(other.scope(|| std::future::pending::<()>()));
+            let mut suspended = Box::pin(other.scope(std::future::pending::<()>));
             poll_fn(|cx| {
                 assert!(suspended.as_mut().poll(cx).is_pending());
                 assert!(owner.check_placement("step").is_ok());
