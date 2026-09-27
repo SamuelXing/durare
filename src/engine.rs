@@ -2291,7 +2291,7 @@ impl DurableEngine {
         // taken out on the caller.
         let execution = ctx.execution();
         let outcome = tokio::select! {
-            result = AssertUnwindSafe(handler(ctx, status.input)).catch_unwind() => result,
+            result = AssertUnwindSafe(execution.scope(|| handler(ctx, status.input))).catch_unwind() => result,
             error = execution.failed() => return Err(error),
         };
 
@@ -3382,7 +3382,7 @@ fn run_to_completion(
     // forever (finding F1). Steps catch their own panics (subject to retry);
     // this handles a panic in the workflow body itself.
     let execution = ctx.execution();
-    let run = AssertUnwindSafe(handler.clone()(ctx, input)).catch_unwind();
+    let run = AssertUnwindSafe(execution.scope(|| handler.clone()(ctx, input))).catch_unwind();
     let run = async {
         tokio::select! {
             result = run => result,

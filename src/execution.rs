@@ -1,19 +1,62 @@
-//! Per-execution storage-failure channel. It is deliberately separate from the
-//! workflow's Result: catching an error must not authorize a terminal write.
+//! Per-execution identity and storage-failure channel. Placement checks prevent
+//! using a context outside its handler; the failure latch separately prevents
+//! catching a storage error from authorizing more work or a terminal write.
 use crate::{Error, Result};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Notify;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Execution(Arc<Inner>);
 
 #[derive(Default)]
 struct Inner {
+    workflow_id: String,
     failure: OnceLock<Arc<Error>>,
     changed: Notify,
 }
 
+tokio::task_local! {
+    static CURRENT_EXECUTION: Execution;
+}
+
 impl Execution {
+    pub(crate) fn new(workflow_id: &str) -> Self {
+        Self(Arc::new(Inner {
+            workflow_id: workflow_id.to_owned(),
+            ..Inner::default()
+        }))
+    }
+
+    /// Scope invocation and every poll, restoring the previous execution on
+    /// return or unwind. A spawned task does not inherit this capability.
+    pub(crate) fn scope<F, Fut>(
+        &self,
+        body: F,
+    ) -> impl std::future::Future<Output = Fut::Output> + use<F, Fut>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future,
+    {
+        let running = CURRENT_EXECUTION.sync_scope(self.clone(), body);
+        CURRENT_EXECUTION.scope(self.clone(), running)
+    }
+
+    pub(crate) fn check_placement(&self, operation: &'static str) -> Result<()> {
+        // A workflow id can name multiple recovery/verification executions.
+        // Only this allocation owns this context's counter and pending calls.
+        if CURRENT_EXECUTION
+            .try_with(|current| Arc::ptr_eq(&current.0, &self.0))
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(Error::DurableCallOutsideExecution {
+                workflow_id: self.0.workflow_id.clone(),
+                operation: operation.to_owned(),
+            })
+        }
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         match self.0.failure.get() {
             Some(error) => Err(Error::RecoveryRequired(error.clone())),
@@ -126,3 +169,6 @@ pub(crate) mod test_provider;
 
 #[cfg(test)]
 mod boundary_tests;
+
+#[cfg(test)]
+mod scope_tests;

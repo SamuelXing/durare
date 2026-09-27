@@ -22,9 +22,8 @@ tokio::task_local! {
     ///
     /// Set by [`in_body`] around a step closure, a transaction body and the
     /// polling of `select`'s branches — and around nothing else. It does not
-    /// reach a task spawned from inside a body: a task-local belongs to the
-    /// task, so durable calls made from `tokio::spawn` are outside every scope
-    /// and are not refused. It is a *scope*, so it is set when a body's poll
+    /// reach a spawned task; the execution placement check separately refuses
+    /// durable calls there. It is a *scope*, so it is set when a body's poll
     /// begins and
     /// restored when the poll returns, however it returns: ready, pending, an
     /// early `?`, a drop mid-poll, or a panic unwinding through it. Nothing has
@@ -116,6 +115,29 @@ mod position {
 }
 
 use position::Position;
+
+/// The same check protects PendingStep and the async calls that do not yet
+/// return one. It runs before polling any of their user or provider work.
+fn check_call_poll(execution: &crate::execution::Execution, operation: &'static str) -> Result<()> {
+    execution.check_placement(operation)?;
+    if in_a_body() {
+        return Err(Error::DurableCallCrossedBody(operation.to_owned()));
+    }
+    execution.check()
+}
+
+async fn poll_in_execution<T>(
+    execution: &crate::execution::Execution,
+    operation: &'static str,
+    running: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let mut running = std::pin::pin!(running);
+    poll_fn(|cx| match check_call_poll(execution, operation) {
+        Ok(()) => running.as_mut().poll(cx),
+        Err(error) => Poll::Ready(Err(error)),
+    })
+    .await
+}
 
 /// Claim the position for a durable operation, or hand the refusal straight
 /// back to the caller as an already-failed call.
@@ -257,6 +279,14 @@ impl AuthContext {
 /// All durable operations a workflow performs go through this context:
 /// [`DurableContext::step`] / [`DurableContext::step_with`] for checkpointed work
 /// and [`DurableContext::sleep`] for durable timers.
+///
+/// Clones share the original execution's authority and step counter. Durable
+/// calls must claim their positions and be polled within that execution,
+/// including after a future returns `Pending`. A spawned task or another execution cannot use
+/// them and receives [`Error::DurableCallOutsideExecution`]. Metadata access
+/// does not require this scope. Use `join!` for concurrent durable calls, child
+/// workflows for independent durable work, and ordinary tasks inside a step
+/// for work covered by that step's checkpoint.
 #[derive(Clone)]
 pub struct DurableContext {
     workflow_id: String,
@@ -289,6 +319,7 @@ pub struct DurableContext {
 impl DurableContext {
     pub(crate) fn new(workflow_id: String, runtime: Arc<Runtime>, auth: AuthContext) -> Self {
         Self {
+            execution: crate::execution::Execution::new(&workflow_id),
             workflow_id,
             provider: runtime.provider().clone(),
             runtime,
@@ -296,7 +327,6 @@ impl DurableContext {
             seq: Arc::new(AtomicI32::new(0)),
             in_transaction: Arc::new(AtomicBool::new(false)),
             verify: None,
-            execution: Default::default(),
         }
     }
 
@@ -374,6 +404,7 @@ impl DurableContext {
     /// [`deprecate_patch`](Self::deprecate_patch)) and so cannot go through
     /// [`claim_position`](Self::claim_position).
     pub(super) fn refuse_inside_body(&self, operation: &'static str) -> Result<()> {
+        self.execution.check_placement(operation)?;
         self.execution.check()?;
         if in_a_body() {
             return Err(Error::NestedDurableCall {
@@ -482,8 +513,8 @@ impl DurableContext {
     /// This is a *concurrency* guard, not a nesting one. Nesting is refused by
     /// [`claim_position`](Self::claim_position) before the counter moves, with
     /// [`Error::NestedDurableCall`]. What is left for the flag is two
-    /// transactions running at once on one workflow — through `join!` or a
-    /// spawned task — which the task-local scope cannot observe, since it is
+    /// transactions running at once on one workflow through `join!`, which
+    /// the body scope cannot observe, since it is
     /// unset whenever a body is between polls. The guard clears it on drop.
     fn begin_transaction(&self) -> Result<TxFlagGuard<'_>> {
         if self.in_transaction.swap(true, Ordering::SeqCst) {
@@ -550,38 +581,41 @@ impl DurableContext {
     /// marker only consumes a step slot on the new path.
     pub async fn patch(&self, name: &str) -> Result<bool> {
         self.refuse_inside_body("patch")?;
-        let seq = self.current_step_id();
-        let marker = format!("{PATCH_PREFIX}{name}");
-        let patched = match self
-            .provider
-            .get_step_name(&self.workflow_id, seq)
-            .await
-            .map_err(|error| self.execution.record(error))?
-        {
-            // Not seen before: record the marker and take the new path. The
-            // marker is a write, so a verification run stops here instead.
-            None => {
-                self.refuse_live_work(seq, &marker)?;
-                self.provider
-                    .record_patch(&self.workflow_id, seq, &marker)
-                    .await
-                    .map_err(|error| self.execution.record(error))?;
-                true
+        poll_in_execution(&self.execution, "patch", async {
+            let seq = self.current_step_id();
+            let marker = format!("{PATCH_PREFIX}{name}");
+            let patched = match self
+                .provider
+                .get_step_name(&self.workflow_id, seq)
+                .await
+                .map_err(|error| self.execution.record(error))?
+            {
+                // Not seen before: record the marker and take the new path. The
+                // marker is a write, so a verification run stops here instead.
+                None => {
+                    self.refuse_live_work(seq, &marker)?;
+                    self.provider
+                        .record_patch(&self.workflow_id, seq, &marker)
+                        .await
+                        .map_err(|error| self.execution.record(error))?;
+                    true
+                }
+                // Our own marker (a replay/recovery of a patched run): new path.
+                Some(recorded) if recorded == marker => {
+                    self.served_record(seq);
+                    true
+                }
+                // A different step already occupies this slot (a pre-patch run): old path.
+                Some(_) => false,
+            };
+            if patched {
+                // The marker takes its own step slot, so new-path steps that follow
+                // are numbered after it. Old-path runs don't consume it.
+                self.next_seq();
             }
-            // Our own marker (a replay/recovery of a patched run): new path.
-            Some(recorded) if recorded == marker => {
-                self.served_record(seq);
-                true
-            }
-            // A different step already occupies this slot (a pre-patch run): old path.
-            Some(_) => false,
-        };
-        if patched {
-            // The marker takes its own step slot, so new-path steps that follow
-            // are numbered after it. Old-path runs don't consume it.
-            self.next_seq();
-        }
-        Ok(patched)
+            Ok(patched)
+        })
+        .await
     }
 
     /// Remove a patch once every workflow that recorded it has finished migrating
@@ -594,22 +628,25 @@ impl DurableContext {
     /// deleted entirely.
     pub async fn deprecate_patch(&self, name: &str) -> Result<()> {
         self.refuse_inside_body("deprecate_patch")?;
-        let seq = self.current_step_id();
-        let marker = format!("{PATCH_PREFIX}{name}");
-        if self
-            .provider
-            .get_step_name(&self.workflow_id, seq)
-            .await
-            .map_err(|error| self.execution.record(error))?
-            .as_deref()
-            == Some(marker.as_str())
-        {
-            // The marker's slot is consumed, not re-recorded: read-only on every
-            // run, verification included.
-            self.served_record(seq);
-            self.next_seq();
-        }
-        Ok(())
+        poll_in_execution(&self.execution, "deprecate_patch", async {
+            let seq = self.current_step_id();
+            let marker = format!("{PATCH_PREFIX}{name}");
+            if self
+                .provider
+                .get_step_name(&self.workflow_id, seq)
+                .await
+                .map_err(|error| self.execution.record(error))?
+                .as_deref()
+                == Some(marker.as_str())
+            {
+                // The marker's slot is consumed, not re-recorded: read-only on every
+                // run, verification included.
+                self.served_record(seq);
+                self.next_seq();
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Start a **child workflow** from within this workflow and return a handle
@@ -1122,15 +1159,18 @@ impl DurableContext {
         F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         let seq = self.claim_position("transaction")?.seq();
-        let _guard = self.begin_transaction()?;
+        poll_in_execution(&self.execution, "transaction", async {
+            let _guard = self.begin_transaction()?;
 
-        let span = self.op_span("transaction", &opts.name, seq);
-        let out = self
-            .run_datasource_transaction(ds, &opts, &f, seq)
-            .instrument(span.clone())
-            .await;
-        span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
-        out
+            let span = self.op_span("transaction", &opts.name, seq);
+            let out = self
+                .run_datasource_transaction(ds, &opts, &f, seq)
+                .instrument(span.clone())
+                .await;
+            span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+            out
+        })
+        .await
     }
 
     /// The two-commit protocol behind [`transaction_on`](Self::transaction_on):
@@ -2717,8 +2757,9 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
 /// A durable operation that has claimed its position in the workflow but has
 /// not run yet.
 ///
-/// Every durable call on a [`DurableContext`] hands one of these back instead of
-/// being an `async fn`, and the difference is where the call's **position** is
+/// Most durable calls on a [`DurableContext`] return this type. Native
+/// transactions and patches remain async exceptions. The difference from an
+/// `async fn` is where the call's **position** is
 /// decided. A position is the `(workflow_id, seq)` key its checkpoint is written
 /// under, and a replay finds the recorded result only by asking for the same
 /// position the first run asked for.
@@ -2737,6 +2778,11 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
 /// only *running* something that already knows where it stands, and
 /// `tokio::join!` over several is ordinary code.
 ///
+/// A call can only run in its originating workflow execution and outside any
+/// step, transaction, or select body. This is checked on every poll, including
+/// when a suspended call is moved. See [`Error::DurableCallOutsideExecution`]
+/// and [`Error::DurableCallCrossedBody`].
+///
 /// # A built call has spent its position
 ///
 /// The position is claimed at the call, so building one and dropping it without
@@ -2746,11 +2792,10 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
 #[must_use = "this durable call has already claimed its position; awaiting it is what runs it"]
 pub struct PendingStep<'a, T> {
     running: Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
-    /// The operation whose position this holds, or `None` for a call refused
+    /// The claimed position and its execution, or `None` for a call refused
     /// before it claimed one. A refusal must report why it was refused wherever
     /// it is awaited, rather than being refused a second time for being there.
-    claimed: Option<&'static str>,
-    execution: Option<crate::execution::Execution>,
+    position: Option<Position>,
 }
 
 impl<'a, T> PendingStep<'a, T> {
@@ -2758,8 +2803,7 @@ impl<'a, T> PendingStep<'a, T> {
     fn new(position: Position, running: impl Future<Output = Result<T>> + Send + 'a) -> Self {
         Self {
             running: Box::pin(running),
-            claimed: Some(position.operation()),
-            execution: Some(position.execution),
+            position: Some(position),
         }
     }
 
@@ -2768,8 +2812,7 @@ impl<'a, T> PendingStep<'a, T> {
     fn failed(e: Error) -> Self {
         Self {
             running: Box::pin(async move { Err(e) }),
-            claimed: None,
-            execution: None,
+            position: None,
         }
     }
 }
@@ -2787,13 +2830,8 @@ impl<T> Future for PendingStep<'_, T> {
         // whether this call holds a position, rather than remembering which body
         // it was built in, is also what makes this a backstop: a durable
         // operation that skipped the check at construction is still refused.
-        if let Some(operation) = self.claimed {
-            if in_a_body() {
-                return Poll::Ready(Err(Error::DurableCallCrossedBody(operation.to_owned())));
-            }
-        }
-        if let Some(execution) = &self.execution {
-            if let Err(error) = execution.check() {
+        if let Some(position) = &self.position {
+            if let Err(error) = check_call_poll(&position.execution, position.operation()) {
                 return Poll::Ready(Err(error));
             }
         }
