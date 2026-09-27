@@ -1617,8 +1617,11 @@ impl DurableEngine {
 
     /// Stop claiming new work without shutting the process down: abort the queue
     /// dispatchers and the schedule reconciler, but leave in-flight workflow
-    /// tasks running and keep any admin server serving. Idempotent — a second
-    /// call is a no-op. Used by the admin server's `GET /deactivate`.
+    /// tasks running and keep any admin server serving. Stopped executions can
+    /// still requeue or park through their ownership CAS; direct recovery
+    /// dispatch is stopped. [`shutdown`](Self::shutdown) stops that settlement
+    /// too. Idempotent — a second call is a no-op. Used by the admin server's
+    /// `GET /deactivate`.
     pub fn deactivate(&self) {
         if self.deactivated.swap(true, Ordering::SeqCst) {
             return;
@@ -2812,6 +2815,16 @@ async fn recover_interrupted_run(
     disposition: RecoveryDisposition,
 ) {
     const MAX_CLAIM_FAILURES: usize = 8;
+    // A workflow panic has no automatic body retry budget. Reuse the atomic
+    // parking transition without inventing a business failure.
+    let max_attempts = match disposition {
+        RecoveryDisposition::Retry => rt.max_recovery_attempts,
+        RecoveryDisposition::ParkAfterPanic => record.recovery_attempts,
+    };
+    // Deactivation stops taking work, not settling an execution that stopped.
+    // Queue handoff and parking cannot dispatch a body here. A direct claim
+    // below its cap would require dispatch, so stop it even before the CAS.
+    let requires_dispatch = record.queue_name.is_none() && record.recovery_attempts < max_attempts;
     let mut delay = Duration::from_millis(100)
         .saturating_mul(1u32 << record.recovery_attempts.clamp(0, 6))
         .min(Duration::from_secs(5));
@@ -2819,7 +2832,7 @@ async fn recover_interrupted_run(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            _ = rt.automatic_recovery_stop.cancelled() => return,
+            _ = rt.automatic_recovery_stop.cancelled(), if requires_dispatch => return,
             _ = tokio::time::sleep(delay) => {}
         }
         let request = RecoveryClaimRequest {
@@ -2827,18 +2840,13 @@ async fn recover_interrupted_run(
             expected_executor: &record.executor_id,
             expected_attempts: record.recovery_attempts,
             new_executor: &rt.executor_id,
-            // A workflow panic has no automatic body retry budget. Reuse the
-            // atomic parking transition without inventing a business failure.
-            max_attempts: match disposition {
-                RecoveryDisposition::Retry => rt.max_recovery_attempts,
-                RecoveryDisposition::ParkAfterPanic => record.recovery_attempts,
-            },
+            max_attempts,
             requeue: record.queue_name.is_some(),
         };
         let claim = tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            _ = rt.automatic_recovery_stop.cancelled() => return,
+            _ = rt.automatic_recovery_stop.cancelled(), if requires_dispatch => return,
             result = rt.provider.claim_for_recovery(&request) => result,
         };
         match claim {
@@ -3462,7 +3470,8 @@ fn run_to_completion(
         Err(e) => {
             // Encode once and return the same representation a polling handle
             // or recovered execution will read, rather than the live error.
-            let stored = crate::serialize::encode_error(&provider.serializer(), &e)?;
+            let stored = crate::serialize::encode_error(&provider.serializer(), &e)
+                .map_err(crate::execution::recovery_error)?;
             let landed = write_terminal_status(&provider, &id, STATUS_ERROR, None, Some(&stored)).await?;
             if !landed {
                 return adopt_recorded_outcome(&provider, &id, &recorder).await;

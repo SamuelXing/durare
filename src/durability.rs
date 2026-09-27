@@ -153,10 +153,13 @@
 //! the stale generation cannot be claimed twice. A lost claim is never permission
 //! to dispatch: another executor may already be running it. An ambiguous direct
 //! claim may therefore need explicit recovery after the previous owner is known
-//! to have stopped. Shutdown and deactivation stop automatic recovery and leave
-//! unfinished rows. Deactivation also cancels in-flight automatic claims; a
-//! claim already committed at cancellation may need explicit recovery. Explicit
-//! operator recovery remains available on a deactivated engine.
+//! to have stopped. Deactivation stops automatic dispatch and direct recovery
+//! claims that would restart a body. Once an execution has stopped, its bounded
+//! settlement can still return a queued run to its queue or park a panicked or
+//! exhausted run. Requeued work may run on another active executor. Shutdown
+//! stops all automatic settlement, including these database-only transitions.
+//! A direct claim already committed when dispatch stops may need explicit
+//! recovery. Explicit operator recovery remains available on a deactivated engine.
 //!
 //! The cap counts successful recovery claims, including restarts after storage
 //! interruptions, not only process crashes. Progress does not reset

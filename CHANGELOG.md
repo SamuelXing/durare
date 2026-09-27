@@ -25,7 +25,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   infrastructure interruptions as well as process loss; progress does not reset
   it. Exhausted workflows park and release queue capacity. Repair and explicit
   resume reset a parked workflow (including on the in-memory backend).
-  Shutdown and deactivation stop automatic recovery.
+  Deactivation stops automatic dispatch and direct recovery claims that would
+  restart a body, while stopped executions can still requeue or park. Another
+  active executor may pick up requeued work. Shutdown stops all automatic settlement.
   A shutdown timeout still returns `Ok(())` and leaves running bodies alive;
   explicit recovery/resume requires confirming that the previous executions
   stopped. The recovery CAS does not fence a live old body.
@@ -34,9 +36,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claim never authorizes duplicate dispatch; it may need explicit recovery once
   the previous owner is known to have stopped.
   `RecoveryRequired` cannot be persisted as a business failure, including when
-  propagated through a child handle. Creation/retrieval/polling infrastructure
-  faults return `Error::ObservationFailed`, preserving the cause's error code
-  without claiming the target stopped. Stream reads and handle status reads use
+  propagated through a child handle. Failure to encode a terminal error enters
+  recovery settlement rather than leaving an untracked `PENDING` row.
+  Creation/retrieval/polling infrastructure faults return `Error::ObservationFailed`,
+  preserving the cause's error code without claiming the target stopped.
+  Stream reads and handle status reads use
   the same observation channel. Retry reads or creation with the same id;
   this reconciles existence but cannot prove that an existing direct run has an
   owner. A lost creation reply can require explicit recovery after the original

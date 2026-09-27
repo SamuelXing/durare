@@ -245,10 +245,13 @@ async fn deactivate_stops_an_in_flight_automatic_recovery_claim() -> Result<()> 
     .expect("the stopped recovery task must drain without shutdown");
     engine.shutdown(Duration::from_secs(2)).await?;
     assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let row = inner.get_workflow_status("effect").await?.unwrap();
+    assert_eq!(row.status, STATUS_PENDING);
     assert_eq!(
-        inner.get_workflow_status("effect").await?.unwrap().status,
-        STATUS_PENDING
+        row.recovery_attempts, 0,
+        "deactivation must stop a direct restart claim"
     );
+    assert!(provider.claim_outcomes.lock().unwrap().is_empty());
     Ok(())
 }
 
@@ -480,6 +483,187 @@ async fn wait_for_attempts_to_stop(engine: &DurableEngine) -> Result<()> {
     })
     .await
     .expect("workflow and recovery tasks must finish")
+}
+
+#[tokio::test]
+async fn workflow_error_encoding_failure_uses_recovery_settlement() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let mut builder = DurableEngine::builder(inner.clone());
+    builder.max_recovery_attempts(0);
+    let mut engine = builder.build().await?;
+    engine.register("unrecordable", |_: DurableContext, _: ()| async {
+        let signal = Error::RecoveryRequired(Arc::new(Error::app("interrupted")));
+        Err::<(), _>(Error::Recorded(Box::new(RecordedError::capture(&signal))))
+    });
+    let error = engine
+        .start::<_, ()>("unrecordable", (), WorkflowOptions::with_id("unrecordable"))
+        .await?
+        .result()
+        .await
+        .unwrap_err();
+    wait_for_attempts_to_stop(&engine).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    assert!(
+        matches!(error, Error::RecoveryRequired(ref cause) if matches!(**cause, Error::Serialization(_))),
+        "an error that cannot be recorded must enter settlement: {error:?}"
+    );
+    let row = inner.get_workflow_status("unrecordable").await?.unwrap();
+    assert_eq!(row.status, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED);
+    assert_eq!(row.recovery_attempts, 1);
+    assert!(
+        row.error.is_none(),
+        "an interruption is not a business failure"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DeactivateAt {
+    Body,
+    Claim,
+}
+
+async fn settle_while_deactivated(at: DeactivateAt, stop: Option<&str>) -> Result<()> {
+    // Requeue, queued panic, direct panic, and a direct run at its retry cap.
+    for (queued, panics, cap) in [
+        (true, false, 100),
+        (true, true, 100),
+        (false, true, 100),
+        (false, false, 0),
+    ] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteBefore));
+        provider
+            .block_claim
+            .store(matches!(at, DeactivateAt::Claim), Ordering::SeqCst);
+        let mut builder = DurableEngine::builder(provider.clone());
+        builder.max_recovery_attempts(cap);
+        let mut engine = builder.build().await?;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (started, gate, counted) = (entered.clone(), release.clone(), runs.clone());
+        engine.register("fault", move |ctx: DurableContext, _: ()| {
+            let (started, gate, counted) = (started.clone(), gate.clone(), counted.clone());
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                gate.acquire().await.unwrap().forget();
+                assert!(!panics, "workflow panic after an external effect");
+                ctx.step("effect", || async { Ok(()) }).await
+            }
+        });
+        engine.register("healthy", |_: DurableContext, _: ()| async { Ok(42) });
+        engine.register_queue(
+            WorkflowQueue::new("one")
+                .global_concurrency(1)
+                .base_polling_interval(Duration::from_millis(10)),
+        );
+        engine.launch().await?;
+        let options = WorkflowOptions::with_id("fault");
+        let options = if queued {
+            options.queue("one")
+        } else {
+            options
+        };
+        engine.start::<_, ()>("fault", (), options).await?;
+        tokio::time::timeout(Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        if queued {
+            engine
+                .start::<_, i32>("healthy", (), WorkflowOptions::with_id("next").queue("one"))
+                .await?;
+        }
+        if matches!(at, DeactivateAt::Body) {
+            engine.deactivate();
+            // Deactivation must not claim or park an execution still in its body.
+            assert_eq!(provider.claim_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                inner.get_workflow_status("fault").await?.unwrap().status,
+                STATUS_PENDING
+            );
+        }
+        release.add_permits(1);
+        if matches!(at, DeactivateAt::Claim) {
+            tokio::time::timeout(Duration::from_secs(3), provider.claim_started.notified())
+                .await
+                .unwrap();
+            engine.deactivate();
+        }
+        match stop {
+            Some("shutdown") => {
+                engine.shutdown(Duration::ZERO).await?;
+            }
+            Some("cancel") => {
+                engine.cancel_workflow("fault").await?;
+            }
+            _ => {}
+        }
+        // On shutdown, keep the provider gate held: the recovery task must stop
+        // without waiting for a reply. Otherwise let the CAS finish or lose.
+        if stop != Some("shutdown") {
+            provider.claim_permit.add_permits(1);
+        }
+        wait_for_attempts_to_stop(&engine).await?;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "no new body on the draining executor"
+        );
+        let row = inner.get_workflow_status("fault").await?.unwrap();
+        let expected = match stop {
+            Some("shutdown") => STATUS_PENDING,
+            Some("cancel") => STATUS_CANCELLED,
+            _ if queued && !panics => STATUS_ENQUEUED,
+            _ => STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+        };
+        assert_eq!(
+            row.status, expected,
+            "queued={queued}, panics={panics}, cap={cap}, stop={stop:?}"
+        );
+        assert_eq!(row.recovery_attempts, if stop.is_some() { 0 } else { 1 });
+        assert!(row.error.is_none());
+        if queued && stop.is_none() {
+            let rows = inner
+                .dequeue_workflows(&DequeueRequest {
+                    queue_name: "one".into(),
+                    executor_id: "other".into(),
+                    app_version: engine.app_version().into(),
+                    partition_key: None,
+                    max_tasks: 1,
+                    global_concurrency: Some(1),
+                    rate_limit_max: None,
+                    rate_limit_period_ms: None,
+                })
+                .await?;
+            assert_eq!(
+                rows.len(),
+                1,
+                "the stopped run must release global capacity"
+            );
+        }
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn deactivation_allows_stopped_bodies_to_requeue_or_park() -> Result<()> {
+    settle_while_deactivated(DeactivateAt::Body, None).await
+}
+
+#[tokio::test]
+async fn deactivation_allows_in_flight_requeue_and_parking_claims() -> Result<()> {
+    settle_while_deactivated(DeactivateAt::Claim, None).await
+}
+
+#[tokio::test]
+async fn deactivated_settlement_still_respects_shutdown_and_cancellation() -> Result<()> {
+    for action in ["shutdown", "cancel"] {
+        settle_while_deactivated(DeactivateAt::Claim, Some(action)).await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
