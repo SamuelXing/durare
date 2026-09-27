@@ -49,7 +49,7 @@ use tokio::task::JoinHandle;
 /// same result. An interrupted execution (a workflow panic or infrastructure
 /// failure) is different: the owning clone returns `RecoveryRequired`, while
 /// polling clones wait for recovery to produce a terminal outcome. A polling
-/// read or stored-error decoding fault also returns `RecoveryRequired`; none of
+/// read or stored-error decoding fault returns `ObservationFailed`; none of
 /// these observation failures can become another step's recorded business error.
 pub struct WorkflowHandle<O> {
     id: String,
@@ -133,8 +133,10 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     /// The workflow's own error if it finished in `ERROR` (reconstructed from
     /// its checkpoint — a portable error keeps its structure);
     /// [`Error::Cancelled`] if it was cancelled; a decode error if the stored
-    /// output does not deserialize as `O`. An interrupted task, storage read
-    /// failure or unreadable error envelope returns [`Error::RecoveryRequired`].
+    /// output does not deserialize as `O`. An interrupted task returns
+    /// [`Error::RecoveryRequired`]. A storage read or unreadable error envelope
+    /// returns [`Error::ObservationFailed`], which does not establish that the
+    /// target stopped; retry the observation instead of recovering the target.
     pub async fn result(&self) -> Result<O> {
         // Claim the in-process task exactly once. The guard is a temporary of
         // this statement, so it is dropped here — never held across the await.
@@ -165,7 +167,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                     return self.terminal_to_result(status);
                 }
                 Ok(_) | Err(Error::UnknownWorkflow(_)) => {}
-                Err(e) => return Err(crate::execution::provider_error(e)),
+                Err(e) => return Err(crate::execution::observation_error(e)),
             }
             tokio::time::sleep(self.poll_interval).await;
         }
@@ -188,7 +190,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                     .unwrap_or_else(|| "workflow failed".to_string()),
                 status.error_info,
             )
-            .map_err(crate::execution::recovery_error)?),
+            .map_err(crate::execution::observation_error)?),
             _ => {
                 let output = status.output.unwrap_or(Value::Null);
                 Ok(serde_json::from_value(output)?)

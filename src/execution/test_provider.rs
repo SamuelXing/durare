@@ -3,7 +3,12 @@ use crate::provider::{NotificationInfo, RecordedStep, StepOutcome};
 use crate::*;
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+use tokio::sync::{Notify, Semaphore};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Fault {
@@ -12,6 +17,7 @@ pub enum Fault {
     WriteAlways,
     WriteThenClaimFailure,
     ClaimFailure,
+    ClaimAlways,
     WriteAfter,
     TerminalBefore,
     TerminalAfter,
@@ -19,6 +25,7 @@ pub enum Fault {
     TerminalAfterThenAdoptRead,
     ReconcileRead,
     StatusRead,
+    HistoryRead,
     TransactionBefore,
     TransactionAfter,
     Corrupt,
@@ -30,29 +37,47 @@ pub enum Fault {
 
 pub struct FaultProvider {
     pub inner: Arc<dyn StateProvider>,
-    pub fault: Mutex<Option<Fault>>,
+    faults: Mutex<VecDeque<Fault>>,
+    pub block_claim: AtomicBool,
+    pub claim_started: Notify,
+    pub claim_finished: Notify,
+    pub claim_permit: Semaphore,
+    pub claim_calls: AtomicUsize,
 }
 impl FaultProvider {
     pub fn new(inner: Arc<dyn StateProvider>, fault: Fault) -> Self {
+        let plan = match fault {
+            Fault::WriteThenClaimFailure => vec![Fault::WriteBefore, Fault::ClaimFailure],
+            Fault::TerminalAfterThenAdoptRead => vec![
+                Fault::TerminalAfter,
+                Fault::ReconcileRead,
+                Fault::StatusRead,
+            ],
+            other => vec![other],
+        };
         Self {
             inner,
-            fault: Mutex::new(Some(fault)),
+            faults: Mutex::new(plan.into()),
+            block_claim: AtomicBool::new(false),
+            claim_started: Notify::new(),
+            claim_finished: Notify::new(),
+            claim_permit: Semaphore::new(0),
+            claim_calls: AtomicUsize::new(0),
         }
     }
+    pub fn arm(&self, faults: impl IntoIterator<Item = Fault>) {
+        *self.faults.lock().unwrap() = faults.into_iter().collect();
+    }
     fn take(&self, fault: Fault) -> bool {
-        let mut armed = self.fault.lock().unwrap();
-        if *armed == Some(Fault::WriteAlways) && fault == Fault::WriteBefore {
-            return true;
-        }
-        if *armed == Some(Fault::WriteThenClaimFailure) && fault == Fault::WriteBefore {
-            *armed = Some(Fault::ClaimFailure);
-            return true;
-        }
-        if *armed == Some(fault) {
-            *armed = None;
-            true
-        } else {
-            false
+        let mut plan = self.faults.lock().unwrap();
+        match (plan.front(), fault) {
+            (Some(Fault::WriteAlways), Fault::WriteBefore)
+            | (Some(Fault::ClaimAlways), Fault::ClaimFailure) => true,
+            (Some(next), _) if *next == fault => {
+                plan.pop_front();
+                true
+            }
+            _ => false,
         }
     }
     fn failure<T>() -> Result<T> {
@@ -107,9 +132,7 @@ impl StateProvider for FaultProvider {
         if self.take(Fault::StatusRead) {
             return Self::failure();
         }
-        if self.take(Fault::ReconcileRead) {
-            *self.fault.lock().unwrap() = Some(Fault::StatusRead);
-        }
+        self.take(Fault::ReconcileRead);
         self.inner.get_workflow_status(id).await
     }
     async fn set_workflow_status(
@@ -131,10 +154,6 @@ impl StateProvider for FaultProvider {
             .inner
             .set_workflow_status(id, status, output, error)
             .await?;
-        if self.take(Fault::TerminalAfterThenAdoptRead) {
-            *self.fault.lock().unwrap() = Some(Fault::ReconcileRead);
-            return Self::failure();
-        }
         if self.take(Fault::TerminalAfter) {
             return Self::failure();
         }
@@ -307,10 +326,18 @@ impl StateProvider for FaultProvider {
         self.inner.fork_workflow(params).await
     }
     async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim> {
-        if self.take(Fault::ClaimFailure) {
-            return Self::failure();
+        self.claim_calls.fetch_add(1, Ordering::SeqCst);
+        self.claim_started.notify_one();
+        if self.block_claim.load(Ordering::SeqCst) {
+            self.claim_permit.acquire().await.unwrap().forget();
         }
-        self.inner.claim_for_recovery(req).await
+        let result = if self.take(Fault::ClaimFailure) {
+            Self::failure()
+        } else {
+            self.inner.claim_for_recovery(req).await
+        };
+        self.claim_finished.notify_one();
+        result
     }
     async fn record_child_workflow(
         &self,
@@ -331,6 +358,9 @@ impl StateProvider for FaultProvider {
         self.inner.check_child_workflow(parent_id, seq).await
     }
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
+        if self.take(Fault::HistoryRead) {
+            return Self::failure();
+        }
         self.inner.get_workflow_steps(workflow_id).await
     }
     async fn get_step_name(&self, workflow_id: &str, seq: i32) -> Result<Option<String>> {

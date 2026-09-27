@@ -25,11 +25,15 @@ enum ErrorWire {
     #[serde(skip)]
     RecoveryRequired(std::sync::Arc<Error>),
     #[serde(skip)]
+    ObservationFailed(std::sync::Arc<Error>),
+    #[serde(skip)]
     Db(sqlx::Error),
     #[serde(skip)]
     Migrate(sqlx::migrate::MigrateError),
     #[serde(skip)]
     Serde(serde_json::Error),
+    #[serde(skip)]
+    OutputSerialization(serde_json::Error),
     Recorded(Box<RecordedError>),
     Serialization(String),
     UnknownWorkflow(String),
@@ -110,6 +114,9 @@ pub(crate) fn encode(serializer: &Serializer, error: &Error) -> crate::Result<Op
     if let Error::RecoveryRequired(cause) = error {
         return Err(Error::RecoveryRequired(cause.clone()));
     }
+    if let Error::ObservationFailed(cause) = error {
+        return Err(Error::ObservationFailed(cause.clone()));
+    }
     if error.code() == crate::ErrorCode::RecoveryRequired {
         return Err(Error::Serialization(
             "an execution interruption is not a recordable outcome".into(),
@@ -134,7 +141,7 @@ pub(crate) fn encode(serializer: &Serializer, error: &Error) -> crate::Result<Op
     }
     let captured;
     let recordable = match error {
-        Error::Db(_) | Error::Migrate(_) | Error::Serde(_) => {
+        Error::Db(_) | Error::Migrate(_) | Error::Serde(_) | Error::OutputSerialization(_) => {
             captured = Error::Recorded(Box::new(RecordedError::capture(error)));
             &captured
         }

@@ -1,8 +1,7 @@
 //! Storage failures must not become terminal business outcomes.
 #[path = "../tests/common/mod.rs"]
 mod common;
-#[path = "execution/test_provider.rs"]
-mod fault_provider;
+use crate::execution::test_provider as fault_provider;
 
 use crate::*;
 use fault_provider::{Fault, FaultProvider};
@@ -113,9 +112,14 @@ async fn postgres_checkpoint_faults_remain_recoverable() -> Result<()> {
         return Ok(());
     };
     let (admin, url, db) = common::hermetic_pg_db(&base, "checkpoint_fault").await;
-    let result = sweep(Arc::new(PostgresProvider::connect(&url).await?)).await;
+    use futures_util::FutureExt;
+    let result = std::panic::AssertUnwindSafe(async {
+        sweep(Arc::new(PostgresProvider::connect(&url).await?)).await
+    })
+    .catch_unwind()
+    .await;
     common::drop_hermetic_pg_db(&admin, &db).await;
-    result
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 #[tokio::test]
@@ -728,6 +732,22 @@ async fn recovery_required_is_reported_for_every_execution_entry() -> Result<()>
             }
         })
         .await;
+        if mode != "panic" {
+            tokio::time::timeout(Duration::from_secs(4), async {
+                loop {
+                    let rows = inner.list_workflows(&ListFilter::default()).await?;
+                    if rows
+                        .iter()
+                        .any(|row| row.id.starts_with(&expected_id) && row.status == STATUS_SUCCESS)
+                    {
+                        return Ok::<_, Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("every execution entry must recover automatically")?;
+        }
         engine.shutdown(Duration::from_secs(2)).await?;
         if mode == "panic" {
             assert!(logs.text().contains("workflow panicked"), "{}", logs.text());
@@ -748,10 +768,14 @@ async fn postgres_provider_business_errors_remain_catchable() -> Result<()> {
         return Ok(());
     };
     let (admin, url, db) = common::hermetic_pg_db(&base, "business_fault").await;
-    let result =
-        business_errors_remain_catchable(Arc::new(PostgresProvider::connect(&url).await?)).await;
+    use futures_util::FutureExt;
+    let result = std::panic::AssertUnwindSafe(async {
+        business_errors_remain_catchable(Arc::new(PostgresProvider::connect(&url).await?)).await
+    })
+    .catch_unwind()
+    .await;
     common::drop_hermetic_pg_db(&admin, &db).await;
-    result
+    result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 #[tokio::test]
@@ -1227,12 +1251,19 @@ async fn postgres_interrupted_queue_recovers_capacity() -> Result<()> {
         return Ok(());
     };
     let schema = format!("queue_fault_{}", uuid::Uuid::new_v4().simple());
-    let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
-    let result = queue_recovers_capacity(provider).await;
     let admin = sqlx::PgPool::connect(&url).await?;
-    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+    use futures_util::FutureExt;
+    let result = std::panic::AssertUnwindSafe(async {
+        let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+        queue_recovers_capacity(provider).await
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(&admin)
-        .await?;
+        .await;
+    let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    cleanup?;
     result
 }
 
@@ -1304,7 +1335,8 @@ async fn queue_recovery_respects_cancellation_and_shutdown() -> Result<()> {
     for cancel_workflow in [false, true] {
         let inner = Arc::new(InMemoryProvider::new());
         let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteAlways));
-        let mut engine = DurableEngine::new(provider).await?;
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        provider.block_claim.store(true, Ordering::SeqCst);
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = runs.clone();
         engine.register("fault", move |ctx: DurableContext, _: ()| {
@@ -1328,17 +1360,15 @@ async fn queue_recovery_respects_cancellation_and_shutdown() -> Result<()> {
                 WorkflowOptions::with_id("fault").queue("limited"),
             )
             .await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while runs.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), provider.claim_started.notified())
+            .await
+            .expect("recovery must reach the claim gate");
         if cancel_workflow {
             engine.cancel_workflow("fault").await?;
-            // Let the recovery CAS encounter the cancelled row.
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            provider.claim_permit.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), provider.claim_finished.notified())
+                .await
+                .expect("the claim must observe cancellation");
         }
         engine.shutdown(Duration::from_secs(2)).await?;
         let status = inner.get_workflow_status("fault").await?.unwrap();
@@ -1362,6 +1392,7 @@ struct FaultDataSource {
     inner: SqliteDataSource,
     attempts: Arc<AtomicUsize>,
     fail_begin: bool,
+    duplicate: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -1383,6 +1414,44 @@ impl crate::datasource::sealed::Backend for FaultDataSource {
     }
     async fn rollback(&self, tx: Self::NativeTx) -> Result<()> {
         self.inner.rollback(tx).await?;
+        if self.duplicate {
+            // Simulate the winner becoming observable as our losing attempt
+            // releases its connection. Commit a real authoritative row, then
+            // lose this attempt's rollback response.
+            let encoded = Serializer::Json.encode(&serde_json::json!(42))?;
+            let mut winner = self
+                .inner
+                .begin(IsolationLevel::ReadCommitted, false)
+                .await?;
+            if matches!(
+                self.inner.kind(),
+                crate::datasource::DataSourceKind::System(_)
+            ) {
+                self.inner
+                    .insert_checkpoint(
+                        &mut winner,
+                        "duplicate",
+                        0,
+                        "effect",
+                        &encoded,
+                        crate::serialize::DBOS_JSON,
+                        1,
+                    )
+                    .await?;
+            } else {
+                self.inner
+                    .insert_completion(
+                        &mut winner,
+                        "duplicate",
+                        0,
+                        Some(&encoded),
+                        None,
+                        crate::serialize::DBOS_JSON,
+                    )
+                    .await?;
+            }
+            self.inner.commit(winner).await?;
+        }
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(Error::Db(sqlx::Error::Protocol(
             "rollback response lost".into(),
@@ -1407,6 +1476,9 @@ impl crate::datasource::sealed::Backend for FaultDataSource {
         error: Option<&str>,
         serialization: &str,
     ) -> Result<bool> {
+        if self.duplicate {
+            return Ok(false);
+        }
         self.inner
             .insert_completion(conn, id, seq, output, error, serialization)
             .await
@@ -1435,6 +1507,9 @@ impl crate::datasource::sealed::Backend for FaultDataSource {
         serialization: &str,
         started: i64,
     ) -> Result<bool> {
+        if self.duplicate {
+            return Ok(false);
+        }
         self.inner
             .insert_checkpoint(conn, id, seq, name, output, serialization, started)
             .await
@@ -1459,6 +1534,7 @@ async fn datasource_setup_failures_bypass_the_business_retry_policy() -> Result<
             },
             attempts: attempts.clone(),
             fail_begin: true,
+            duplicate: false,
         };
         // Forward provider identity so the system data-source path is exercised.
         let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::ChildBefore));
@@ -1708,7 +1784,7 @@ async fn verification_storage_fault_is_not_reported_as_divergence() -> Result<()
         .await?
         .result()
         .await?;
-    *provider.fault.lock().unwrap() = Some(Fault::Read);
+    provider.arm([Fault::Read]);
     let result = engine.verify_replay("verify").await;
     assert!(
         matches!(result, Err(Error::RecoveryRequired(_))),
@@ -1735,6 +1811,7 @@ async fn native_rollback_failures_interrupt_instead_of_recording_body_errors() -
             },
             attempts: attempts.clone(),
             fail_begin: false,
+            duplicate: false,
         };
         let mut engine = DurableEngine::new(inner.clone()).await?;
         engine.register("rollback", move |ctx: DurableContext, _: ()| {
@@ -1768,93 +1845,104 @@ async fn native_rollback_failures_interrupt_instead_of_recording_body_errors() -
 #[tokio::test]
 async fn recovery_signal_crosses_every_error_recording_boundary_without_being_saved() -> Result<()>
 {
-    fn interruption() -> Error {
-        Error::RecoveryRequired(Arc::new(Error::Db(sqlx::Error::PoolTimedOut)))
-    }
-    for mode in [
-        "workflow",
-        "step-retry",
-        "transaction",
-        "external",
-        "system",
-    ] {
-        let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
-        let mut engine = DurableEngine::new(inner.clone()).await?;
-        let predicates = Arc::new(AtomicUsize::new(0));
-        let counted = predicates.clone();
-        let ds = if mode == "external" {
-            SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+    fn interruption(observation: bool) -> Error {
+        let cause = Arc::new(Error::Db(sqlx::Error::PoolTimedOut));
+        if observation {
+            Error::ObservationFailed(cause)
         } else {
-            inner.system_datasource()
-        };
-        let workflow_ds = ds.clone();
-        engine.register("boundary", move |ctx: DurableContext, _: ()| {
-            let (counted, ds) = (counted.clone(), workflow_ds.clone());
-            async move {
-                if mode == "workflow" {
-                    return Err::<(), _>(interruption());
+            Error::RecoveryRequired(cause)
+        }
+    }
+    for observation in [false, true] {
+        for mode in [
+            "workflow",
+            "step-retry",
+            "transaction",
+            "external",
+            "system",
+        ] {
+            let inner = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+            let mut engine = DurableEngine::new(inner.clone()).await?;
+            let predicates = Arc::new(AtomicUsize::new(0));
+            let counted = predicates.clone();
+            let ds = if mode == "external" {
+                SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+            } else {
+                inner.system_datasource()
+            };
+            let workflow_ds = ds.clone();
+            engine.register("boundary", move |ctx: DurableContext, _: ()| {
+                let (counted, ds) = (counted.clone(), workflow_ds.clone());
+                async move {
+                    if mode == "workflow" {
+                        return Err::<(), _>(interruption(observation));
+                    }
+                    let retry = move |_: &Error| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        true
+                    };
+                    let _ = match mode {
+                        "step-retry" => {
+                            ctx.step_with(
+                                StepOptions::new("boundary").max_retries(2).retry_if(retry),
+                                || async move { Err::<(), _>(interruption(observation)) },
+                            )
+                            .await
+                        }
+                        "transaction" => {
+                            ctx.transaction_with(
+                                TransactionOptions::new("boundary")
+                                    .max_retries(2)
+                                    .retry_if(retry),
+                                move |_| {
+                                    Box::pin(async move { Err::<(), _>(interruption(observation)) })
+                                },
+                            )
+                            .await
+                        }
+                        _ => {
+                            ctx.transaction_on_with(
+                                &ds,
+                                TransactionOptions::new("boundary")
+                                    .max_retries(2)
+                                    .retry_if(retry),
+                                async move |_: &mut sqlx::SqliteConnection| {
+                                    Err::<(), _>(interruption(observation))
+                                },
+                            )
+                            .await
+                        }
+                    };
+                    Ok(()) // catching a rejected record must not authorize SUCCESS
                 }
-                let retry = move |_: &Error| {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    true
-                };
-                let _ = match mode {
-                    "step-retry" => {
-                        ctx.step_with(
-                            StepOptions::new("boundary").max_retries(2).retry_if(retry),
-                            || async { Err::<(), _>(interruption()) },
-                        )
-                        .await
-                    }
-                    "transaction" => {
-                        ctx.transaction_with(
-                            TransactionOptions::new("boundary")
-                                .max_retries(2)
-                                .retry_if(retry),
-                            |_| Box::pin(async { Err::<(), _>(interruption()) }),
-                        )
-                        .await
-                    }
-                    _ => {
-                        ctx.transaction_on_with(
-                            &ds,
-                            TransactionOptions::new("boundary")
-                                .max_retries(2)
-                                .retry_if(retry),
-                            async |_: &mut sqlx::SqliteConnection| Err::<(), _>(interruption()),
-                        )
-                        .await
-                    }
-                };
-                Ok(()) // catching a rejected record must not authorize SUCCESS
+            });
+            let result = engine
+                .start::<_, ()>("boundary", (), WorkflowOptions::with_id("boundary"))
+                .await?
+                .result()
+                .await;
+            assert!(
+                matches!(result, Err(Error::RecoveryRequired(_))),
+                "{mode}: {result:?}"
+            );
+            assert_eq!(
+                predicates.load(Ordering::SeqCst),
+                0,
+                "{mode}: infrastructure signals skip business retry"
+            );
+            assert!(
+                inner.get_step_result("boundary", 0).await?.is_none(),
+                "{mode}"
+            );
+            assert_eq!(
+                inner.get_workflow_status("boundary").await?.unwrap().status,
+                STATUS_PENDING,
+                "{mode}"
+            );
+            if mode == "external" {
+                use crate::datasource::sealed::Backend;
+                assert!(ds.fetch_completion("boundary", 0).await?.is_none());
             }
-        });
-        let result = engine
-            .start::<_, ()>("boundary", (), WorkflowOptions::with_id("boundary"))
-            .await?
-            .result()
-            .await;
-        assert!(
-            matches!(result, Err(Error::RecoveryRequired(_))),
-            "{mode}: {result:?}"
-        );
-        assert_eq!(
-            predicates.load(Ordering::SeqCst),
-            0,
-            "{mode}: infrastructure signals skip business retry"
-        );
-        assert!(
-            inner.get_step_result("boundary", 0).await?.is_none(),
-            "{mode}"
-        );
-        assert_eq!(
-            inner.get_workflow_status("boundary").await?.unwrap().status,
-            STATUS_PENDING,
-            "{mode}"
-        );
-        if mode == "external" {
-            use crate::datasource::sealed::Backend;
-            assert!(ds.fetch_completion("boundary", 0).await?.is_none());
         }
     }
     Ok(())
@@ -1970,13 +2058,14 @@ async fn polling_handle_failures_preserve_infrastructure_origin() -> Result<()> 
         let error = handle.result().await.unwrap_err();
         assert_eq!(
             error.code(),
-            if mode == "type" {
-                ErrorCode::Serialization
+            if mode == "read" {
+                ErrorCode::Database
             } else {
-                ErrorCode::RecoveryRequired
+                ErrorCode::Serialization
             },
             "{mode}: {error:?}"
         );
+        assert_eq!(matches!(error, Error::ObservationFailed(_)), mode != "type");
     }
     Ok(())
 }
@@ -2032,7 +2121,7 @@ async fn creating_or_retrieving_a_workflow_preserves_storage_origin() -> Result<
             };
             let error = result.err().expect("injected failure must surface");
             assert!(
-                matches!(error, Error::RecoveryRequired(_)),
+                matches!(error, Error::ObservationFailed(_)),
                 "client={client_api}, {fault:?}: {error:?}"
             );
             assert_eq!(
@@ -2042,4 +2131,428 @@ async fn creating_or_retrieving_a_workflow_preserves_storage_origin() -> Result<
         }
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn queued_parent_does_not_strand_on_an_interrupted_unqueued_child() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteBefore));
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("child", |ctx: DurableContext, _: ()| async move {
+        ctx.step("child-effect", || async { Ok(42) }).await
+    });
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        ctx.start_workflow::<_, i32>("child", (), WorkflowOptions::default())
+            .await?
+            .result()
+            .await
+    });
+    engine.register_queue(
+        WorkflowQueue::new("parents")
+            .global_concurrency(1)
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+    let handle = engine
+        .start::<_, i32>(
+            "parent",
+            (),
+            WorkflowOptions::with_id("parent").queue("parents"),
+        )
+        .await?;
+    let result = tokio::time::timeout(Duration::from_secs(3), handle.result()).await;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    assert_eq!(
+        result.expect("child must recover without an external sweep")?,
+        42
+    );
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn transaction_output_encoding_never_enters_the_body_retry_policy() -> Result<()> {
+    for mode in ["legacy", "external", "system"] {
+        let provider = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+        let ds = if mode == "system" {
+            provider.system_datasource()
+        } else {
+            SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+        };
+        let effects = Arc::new(AtomicUsize::new(0));
+        let predicates = Arc::new(AtomicUsize::new(0));
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        let (count, decisions) = (effects.clone(), predicates.clone());
+        engine.register("encoding", move |ctx: DurableContext, _: ()| {
+            let (ds, count, decisions) = (ds.clone(), count.clone(), decisions.clone());
+            async move {
+                let opts = TransactionOptions::new("effect")
+                    .max_retries(3)
+                    .base_interval(Duration::ZERO)
+                    .retry_if(move |_| {
+                        decisions.fetch_add(1, Ordering::SeqCst);
+                        true
+                    });
+                let result = if mode == "legacy" {
+                    ctx.transaction_with(opts, move |_| {
+                        let count = count.clone();
+                        Box::pin(async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(Unserializable)
+                        })
+                    })
+                    .await
+                } else {
+                    ctx.transaction_on_with(
+                        &ds,
+                        opts,
+                        async move |_: &mut sqlx::SqliteConnection| {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(Unserializable)
+                        },
+                    )
+                    .await
+                };
+                result.map(|_| ())
+            }
+        });
+        let result = engine
+            .start::<_, ()>("encoding", (), WorkflowOptions::with_id("encoding"))
+            .await?
+            .result()
+            .await;
+        assert_eq!(
+            result.unwrap_err().code(),
+            ErrorCode::Serialization,
+            "{mode}"
+        );
+        assert_eq!(
+            effects.load(Ordering::SeqCst),
+            1,
+            "{mode}: output encoding must not repeat the body"
+        );
+        assert_eq!(
+            predicates.load(Ordering::SeqCst),
+            0,
+            "{mode}: not a body failure"
+        );
+        assert!(provider.get_step_result("encoding", 0).await?.is_some());
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn verification_interrupts_a_body_that_catches_a_fault_and_parks() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::Read));
+    inner
+        .insert_workflow_status(WorkflowStatus::new(
+            "verify-park",
+            "verify-park",
+            serde_json::Value::Null,
+            STATUS_SUCCESS,
+            "old",
+            "",
+        ))
+        .await?;
+    inner
+        .record_step_result(
+            "verify-park",
+            0,
+            "effect",
+            serde_json::json!(42),
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register("verify-park", |ctx: DurableContext, _: ()| async move {
+        let _ = ctx.step("effect", || async { Ok(42) }).await;
+        std::future::pending::<Result<()>>().await
+    });
+    let result = tokio::time::timeout(
+        Duration::from_millis(300),
+        engine.verify_replay("verify-park"),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(Error::RecoveryRequired(_)))),
+        "{result:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn duplicate_native_transaction_converges_despite_lost_rollback_response() -> Result<()> {
+    for system in [false, true] {
+        let provider = Arc::new(SqliteProvider::connect("sqlite::memory:").await?);
+        let ds = FaultDataSource {
+            inner: if system {
+                provider.system_datasource()
+            } else {
+                SqliteDataSource::new(sqlx::SqlitePool::connect("sqlite::memory:").await?).await?
+            },
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_begin: false,
+            duplicate: true,
+        };
+        let bodies = Arc::new(AtomicUsize::new(0));
+        let counted = bodies.clone();
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        engine.register("duplicate", move |ctx: DurableContext, _: ()| {
+            let (ds, counted) = (ds.clone(), counted.clone());
+            async move {
+                ctx.transaction_on(
+                    &ds,
+                    "effect",
+                    async move |_: &mut sqlx::SqliteConnection| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Ok(42)
+                    },
+                )
+                .await
+            }
+        });
+        let result = engine
+            .start::<_, i32>("duplicate", (), WorkflowOptions::with_id("duplicate"))
+            .await?
+            .result()
+            .await;
+        engine.shutdown(Duration::from_secs(1)).await?;
+        assert_eq!(result?, 42, "system={system}");
+        assert_eq!(bodies.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            provider
+                .get_workflow_status("duplicate")
+                .await?
+                .unwrap()
+                .status,
+            STATUS_SUCCESS
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn observation_failure_does_not_claim_the_target_execution_stopped() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    inner
+        .insert_workflow_status(WorkflowStatus::new(
+            "running",
+            "other",
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            "other-owner",
+            "version",
+        ))
+        .await?;
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::StatusRead));
+    let handle = WorkflowHandle::<()>::polling("running".into(), provider);
+    let error = handle.result().await.unwrap_err();
+    assert_eq!(
+        error.code(),
+        ErrorCode::Database,
+        "a read outage is not evidence that the target stopped"
+    );
+    assert!(
+        crate::serialize::encode_error(&Serializer::Json, &error).is_err(),
+        "observation failures still cannot become business outcomes"
+    );
+    let status = inner.get_workflow_status("running").await?.unwrap();
+    assert_eq!(status.status, STATUS_PENDING);
+    assert_eq!(status.recovery_attempts, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn permanent_recovery_claim_failure_stops_retrying_without_running_the_body() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteBefore));
+    provider.arm([Fault::WriteBefore, Fault::ClaimAlways]);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let count = runs.clone();
+    engine.register("claims", move |ctx: DurableContext, _: ()| {
+        let count = count.clone();
+        async move {
+            ctx.step("effect", || async {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        }
+    });
+    let _ = engine
+        .start::<_, ()>("claims", (), WorkflowOptions::with_id("claims"))
+        .await?
+        .result()
+        .await;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        while provider.claim_calls.load(Ordering::SeqCst) < 8 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("claim retry budget must be bounded");
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(provider.claim_calls.load(Ordering::SeqCst), 8);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    let status = inner.get_workflow_status("claims").await?.unwrap();
+    assert_eq!(
+        status.status, STATUS_PENDING,
+        "cannot manufacture a parked row while storage rejects writes"
+    );
+    assert_eq!(status.recovery_attempts, 0);
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unrecoverable_child_parks_and_releases_its_queued_parent() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteAlways));
+    let mut builder = DurableEngine::builder(provider);
+    builder.max_recovery_attempts(1);
+    let mut engine = builder.build().await?;
+    engine.register("child", |ctx: DurableContext, _: ()| async move {
+        ctx.step("effect", || async { Ok(42) }).await
+    });
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        ctx.start_workflow::<_, i32>("child", (), WorkflowOptions::default())
+            .await?
+            .result()
+            .await
+    });
+    engine.register("healthy", |_: DurableContext, _: ()| async { Ok(42) });
+    engine.register_queue(
+        WorkflowQueue::new("parents")
+            .global_concurrency(1)
+            .base_polling_interval(Duration::from_millis(10)),
+    );
+    engine.launch().await?;
+    let bad = engine
+        .start::<_, i32>(
+            "parent",
+            (),
+            WorkflowOptions::with_id("parent").queue("parents"),
+        )
+        .await?;
+    let failed = tokio::time::timeout(Duration::from_secs(4), bad.result())
+        .await
+        .expect("child recovery is bounded");
+    assert!(
+        matches!(failed, Err(Error::MaxRecoveryAttemptsExceeded(_))),
+        "{failed:?}"
+    );
+    let good = engine
+        .start::<_, i32>("healthy", (), WorkflowOptions::default().queue("parents"))
+        .await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), good.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    assert_eq!(
+        inner.get_workflow_status("parent-0").await?.unwrap().status,
+        STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED
+    );
+    assert_eq!(
+        inner.get_workflow_status("parent").await?.unwrap().status,
+        STATUS_ERROR
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn verifier_history_read_faults_preserve_observation_origin() -> Result<()> {
+    for fault in [Fault::StatusRead, Fault::HistoryRead] {
+        let inner = Arc::new(InMemoryProvider::new());
+        inner
+            .insert_workflow_status(WorkflowStatus::new(
+                "history",
+                "history",
+                serde_json::Value::Null,
+                STATUS_SUCCESS,
+                "owner",
+                "version",
+            ))
+            .await?;
+        let mut engine =
+            DurableEngine::new(Arc::new(FaultProvider::new(inner.clone(), fault))).await?;
+        engine.register("history", |_: DurableContext, _: ()| async {
+            panic!("unreadable history must not run the body");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        assert!(matches!(
+            engine.verify_replay("history").await,
+            Err(Error::ObservationFailed(_))
+        ));
+        assert_eq!(
+            inner.get_workflow_status("history").await?.unwrap().status,
+            STATUS_SUCCESS
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_transaction_output_encoding_skips_body_retries() -> Result<()> {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let schema = format!("encoding_{}", uuid::Uuid::new_v4().simple());
+    let admin = sqlx::PgPool::connect(&url).await?;
+    use futures_util::FutureExt;
+    let result = std::panic::AssertUnwindSafe(async {
+        let provider = Arc::new(PostgresProvider::connect_with_schema(&url, &schema).await?);
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let count = effects.clone();
+        engine.register("encoding", move |ctx: DurableContext, _: ()| {
+            let count = count.clone();
+            async move {
+                ctx.transaction_with(
+                    TransactionOptions::new("effect")
+                        .max_retries(3)
+                        .base_interval(Duration::ZERO)
+                        .retry_if(|_| panic!("output conversion is not a body failure")),
+                    move |_| {
+                        let count = count.clone();
+                        Box::pin(async move {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Ok(Unserializable)
+                        })
+                    },
+                )
+                .await
+                .map(|_| ())
+            }
+        });
+        let error = engine
+            .start::<_, ()>("encoding", (), WorkflowOptions::with_id("encoding"))
+            .await?
+            .result()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Serialization);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+        assert!(provider.get_step_result("encoding", 0).await?.is_some());
+        engine.shutdown(Duration::from_secs(1)).await?;
+        Ok::<_, Error>(())
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&admin)
+        .await;
+    let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    cleanup?;
+    result
 }

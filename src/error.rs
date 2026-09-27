@@ -11,8 +11,8 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ErrorCode {
-    /// Execution or result observation was interrupted without establishing a
-    /// business outcome; recovery must reconcile durable state before continuing.
+    /// An execution was interrupted without establishing a business outcome;
+    /// recovery must reconcile durable state before that execution continues.
     RecoveryRequired,
     /// A database query or connection failed.
     Database,
@@ -67,13 +67,23 @@ pub enum ErrorCode {
 #[derive(Debug, Error)]
 pub enum Error {
     /// Execution stopped without a durable business outcome (for example a
-    /// storage/decoding failure or workflow panic). This is not a recorded failure. The workflow remains recoverable unless a
-    /// concurrent terminal transition already committed. It cannot be encoded
+    /// storage/decoding failure or workflow panic). This is not a recorded failure.
+    /// The workflow remains recoverable unless a concurrent terminal transition
+    /// already committed. It cannot be encoded
     /// as a business failure, even when returned by another workflow. Its `is_*`
     /// predicates describe the cause, not permission to retry a business body.
     /// See the durability guide.
     #[error("workflow execution requires recovery: {0}")]
     RecoveryRequired(#[source] std::sync::Arc<Error>),
+
+    /// An infrastructure failure while creating, locating or observing a
+    /// workflow. It says nothing about whether the target execution stopped.
+    /// Retry the observation (or creation with the same id), not recovery of
+    /// the target. A durable body that propagates this signal interrupts its
+    /// own execution; the observation failure cannot be recorded as an outcome.
+    /// [`code`](Self::code) and the diagnostic predicates describe the cause.
+    #[error("workflow operation could not be observed: {0}")]
+    ObservationFailed(#[source] std::sync::Arc<Error>),
 
     /// A persisted driver, migration, or JSON error. Its message, [`code`](Self::code),
     /// and `is_*` classifications survive replay; its original source object does
@@ -92,6 +102,12 @@ pub enum Error {
     /// A JSON (de)serialization error.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// The body returned successfully, but its output could not be serialized.
+    /// Retrying the body cannot repair this conversion. Durable operations
+    /// record its serialization diagnostic without consulting body retry policy.
+    #[error("serialization error: {0}")]
+    OutputSerialization(#[source] serde_json::Error),
 
     /// A stored value could not be decoded: an unrecognized serialization
     /// format, or corrupt base64.
@@ -340,10 +356,13 @@ impl Error {
     pub fn code(&self) -> ErrorCode {
         match self {
             Error::RecoveryRequired(_) => ErrorCode::RecoveryRequired,
+            Error::ObservationFailed(cause) => cause.code(),
             Error::Recorded(error) => error.code,
             Error::Db(_) => ErrorCode::Database,
             Error::Migrate(_) => ErrorCode::Initialization,
-            Error::Serde(_) | Error::Serialization(_) => ErrorCode::Serialization,
+            Error::Serde(_) | Error::OutputSerialization(_) | Error::Serialization(_) => {
+                ErrorCode::Serialization
+            }
             Error::UnknownWorkflow(_) => ErrorCode::WorkflowNotRegistered,
             Error::UnknownQueue(_) => ErrorCode::QueueNotRegistered,
             Error::NonExistentWorkflow(_) => ErrorCode::NonExistentWorkflow,
@@ -372,7 +391,7 @@ impl Error {
 
     /// Whether this wraps a database unique-constraint violation.
     pub fn is_unique_violation(&self) -> bool {
-        if let Self::RecoveryRequired(cause) = self {
+        if let Self::RecoveryRequired(cause) | Self::ObservationFailed(cause) = self {
             return cause.is_unique_violation();
         }
         if let Self::Recorded(error) = self {
@@ -383,7 +402,7 @@ impl Error {
 
     /// Whether this wraps a database foreign-key violation.
     pub fn is_foreign_key_violation(&self) -> bool {
-        if let Self::RecoveryRequired(cause) = self {
+        if let Self::RecoveryRequired(cause) | Self::ObservationFailed(cause) = self {
             return cause.is_foreign_key_violation();
         }
         if let Self::Recorded(error) = self {
@@ -399,7 +418,7 @@ impl Error {
     /// For [`Error::Recorded`], this describes the original failure; it does
     /// not authorize the engine's unbounded live-database retry loop.
     pub fn is_retryable(&self) -> bool {
-        if let Self::RecoveryRequired(cause) = self {
+        if let Self::RecoveryRequired(cause) | Self::ObservationFailed(cause) = self {
             return cause.is_retryable();
         }
         if let Self::Recorded(error) = self {
@@ -419,7 +438,7 @@ impl Error {
     /// transaction on a fresh one: Postgres `40001` serialization_failure / `40P01`
     /// deadlock_detected, or SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`.
     pub fn is_tx_conflict(&self) -> bool {
-        if let Self::RecoveryRequired(cause) = self {
+        if let Self::RecoveryRequired(cause) | Self::ObservationFailed(cause) = self {
             return cause.is_tx_conflict();
         }
         if let Self::Recorded(error) = self {

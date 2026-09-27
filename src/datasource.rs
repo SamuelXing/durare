@@ -65,7 +65,9 @@ pub(crate) mod sealed {
         async fn commit(&self, tx: Self::NativeTx) -> Result<()>;
 
         /// Roll back `tx`. Explicit rollback failures propagate as infrastructure
-        /// failures; the driver's rollback on drop remains best-effort.
+        /// failures, except when an insert already established a competing
+        /// checkpoint: that path reads and validates the authoritative row even
+        /// if cleanup fails. The driver's rollback on drop remains best-effort.
         async fn rollback(&self, tx: Self::NativeTx) -> Result<()>;
 
         /// An identifier of the connection's *current* transaction, used to

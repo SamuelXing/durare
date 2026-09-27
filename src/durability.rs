@@ -139,16 +139,21 @@
 //! terminal outcome wins, otherwise the caller receives `RecoveryRequired`.
 //! Concurrent cancellation/completion may already have changed the stored status.
 //!
-//! A launched queue returns its stopped executions to the queue after backoff,
-//! using an atomic ownership check. Recovery obeys the configured recovery-attempt
-//! cap; exceeding it parks the workflow in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` and
-//! releases its queue slot. Recovery-claim storage failures retry with backoff
-//! against the same ownership generation. If a claim committed but its reply was
-//! lost, retrying cannot claim it again or spend another recovery attempt.
-//! Shutdown stops these attempts and leaves unfinished rows for later recovery.
-//! The same rule applies to a workflow-body panic: only a still-PENDING row
-//! owned by the stopped execution can be recovered. Recorded business failures
-//! and concurrent terminal transitions are never requeued.
+//! All execution entries share automatic recovery after backoff: direct starts,
+//! children, schedules, recovery dispatch and queues. An atomic ownership check
+//! uses the executor and recovery generation captured when that run started.
+//! Queued runs return to their queue; direct runs are dispatched after a won
+//! claim. Exceeding `max_recovery_attempts` parks the workflow and releases its
+//! queue slot. Recorded business failures do not schedule recovery claims.
+//!
+//! Storage failures while claiming retry the same generation at most eight
+//! times, without running a body. If these attempts fail, an error event reports
+//! that explicit recovery is required after repair; a database refusing writes
+//! cannot reliably store a parking transition. If a claim's response is lost,
+//! the stale generation cannot be claimed twice. A lost claim is never permission
+//! to dispatch: another executor may already be running it. An ambiguous direct
+//! claim may therefore need explicit recovery after the previous owner is known
+//! to have stopped. Shutdown stops automatic recovery and leaves unfinished rows.
 //!
 //! The cap counts successful recovery claims, including restarts after storage
 //! interruptions and panics, not only process crashes. Progress does not reset
@@ -158,8 +163,8 @@
 //! them. Repair the cause and explicitly resume a parked workflow to reset the
 //! budget; increasing the cap alone does not make a persistent cause recoverable.
 //!
-//! Non-queued executions still require the engine's explicit recovery APIs.
-//! Launch-time recovery does not pick up new failures in a live process. Every
+//! Explicit recovery remains available for unfinished executions whose owner has
+//! stopped, including after shutdown or exhausted claim retries. Every
 //! execution path emits an error event with `workflow_id`, `workflow`, `error`,
 //! and `recovery_required=true`. Persistent decoding failures require a compatible
 //! reader or repaired data before recovery can succeed.
@@ -167,20 +172,33 @@
 //! Stopping drops the workflow future: code after a caught storage failure,
 //! including asynchronous compensation, is not guaranteed to run. Keep necessary
 //! compensation durable and perform it from a separate, healthy execution.
+//! This also drops sibling durable-call futures whose bodies may have finished
+//! while their checkpoint writes are in flight. Recovery reuses a committed row;
+//! if that write did not commit, the sibling's effect may repeat. Cancellation
+//! does not strengthen the plain-step at-least-once guarantee.
 //!
-//! Workflow-body panics and task cancellation also use `RecoveryRequired`:
-//! neither establishes a business failure. Local and polling handles preserve
-//! infrastructure origin, including result-read and error-envelope decode faults.
-//! Workflow creation and handle retrieval do too; retry a failed start/enqueue
-//! with the same workflow id to reconcile an insert whose response was lost.
-//! A `RecoveryRequired` returned through a child handle is still an execution
-//! interruption. Step/transaction/workflow error writers refuse to checkpoint
-//! it, and body retry policies do not retry it. A parent durable boundary adopts
-//! that signal, so catching the returned error cannot finalize the parent.
+//! Workflow-body panics and failed local tasks return `RecoveryRequired`; they
+//! did not establish a business outcome. A local handle reports the interruption
+//! even when automatic recovery is already scheduled; a polling handle can wait
+//! for the recovered outcome. Externally aborting the entire owning task bypasses
+//! its completion path and can still require explicit recovery.
+//!
+//! Creation, retrieval and polling infrastructure failures instead return
+//! [`Error::ObservationFailed`]. This says the operation could not be observed,
+//! not that its target stopped. Retry a read; retry ambiguous creation with the
+//! same workflow id. Do not recover the target based on this error alone.
+//! Its `code()` and diagnostic predicates describe the underlying cause.
+//! Neither signal can be checkpointed as a business outcome or sent through
+//! business retry policy. When propagated through a parent durable body, it
+//! interrupts that parent's execution; catching the durable call's returned
+//! error cannot authorize the parent's finalization.
 //! Other errors returned by user step/transaction bodies remain business outcomes,
 //! including database errors. Failure to encode a body's return value is saved
-//! as a step failure, so recovery does not repeat the body merely to reproduce
-//! that encoding error. This still requires the failure checkpoint to commit.
+//! as a step failure. Transaction output conversion uses
+//! [`Error::OutputSerialization`] to bypass body retry policy, while an error
+//! explicitly returned by user code retains that policy. Once the failure
+//! checkpoint commits, recovery will not repeat the body for the encoding error.
+//! Rollback or failure-checkpoint storage faults can still require recovery.
 //! Provider semantic rejections (for example a missing message destination or
 //! closed stream) and conversion of a recorded value to an incompatible requested
 //! Rust type remain catchable API errors. The provider's storage error contract

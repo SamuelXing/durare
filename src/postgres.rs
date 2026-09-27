@@ -1289,7 +1289,9 @@ impl StateProvider for PostgresProvider {
                                 // back, then classify against the stored row —
                                 // an identical write converges, anything else
                                 // errors.
-                                tx.rollback().await?;
+                                if let Err(error) = tx.rollback().await {
+                                    tracing::warn!(%error, "rollback after duplicate checkpoint failed; reading the committed outcome");
+                                }
                                 self.classify_lost_txn_checkpoint(
                                     workflow_id,
                                     seq,

@@ -420,7 +420,8 @@ impl TransactionOptions {
     }
 
     /// Set a predicate deciding whether a body error is retryable. It is
-    /// consulted on every failure before backoff; returning `false` stops retries
+    /// consulted on body failures before backoff; output-encoding failures and
+    /// execution/observation interruptions bypass it. Returning `false` stops retries
     /// at once (the error propagates), so a permanent failure doesn't burn
     /// attempts:
     ///
@@ -453,8 +454,12 @@ impl TransactionOptions {
     /// not count against this budget, so an exhausted conflict fails immediately
     /// rather than re-running the whole body.
     pub(crate) fn should_user_retry(&self, err: &Error, attempt: u32) -> bool {
-        !matches!(err, Error::RecoveryRequired(_))
-            && !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
+        !matches!(
+            err,
+            Error::RecoveryRequired(_)
+                | Error::ObservationFailed(_)
+                | Error::OutputSerialization(_)
+        ) && !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
             && attempt < self.max_retries
             && self.retry_if.as_ref().is_none_or(|p| p(err))
     }

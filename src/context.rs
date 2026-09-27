@@ -971,7 +971,7 @@ impl DurableContext {
                     let execution = execution.clone();
                     Box::pin(async move {
                         let out = running.await.map_err(|error| execution.body_error(error))?;
-                        Ok::<_, Error>(serde_json::to_value(out)?)
+                        serde_json::to_value(out).map_err(Error::OutputSerialization)
                     })
                 });
                 let result = self
@@ -1332,7 +1332,7 @@ impl DurableContext {
                     Ok(value) => value,
                     Err(error) => {
                         ds.rollback(tx).await?;
-                        return Ok(DsAttempt::BodyFailed(error.into()));
+                        return Ok(DsAttempt::BodyFailed(Error::OutputSerialization(error)));
                     }
                 };
                 // A body that ended our transaction via raw SQL would make the
@@ -1365,7 +1365,12 @@ impl DurableContext {
                     )
                     .await?
                 {
-                    ds.rollback(tx).await?;
+                    // The competing commit, not this cleanup response, decides
+                    // the outcome. Dropping the consumed transaction cannot
+                    // commit our writes. The caller must read the winner's row.
+                    if let Err(error) = ds.rollback(tx).await {
+                        tracing::warn!(%error, "rollback after duplicate checkpoint failed; reading the committed outcome");
+                    }
                     return Ok(DsAttempt::AlreadyCompleted { value });
                 }
                 ds.commit(tx).await?;
@@ -1520,7 +1525,7 @@ impl DurableContext {
                     Ok(value) => value,
                     Err(error) => {
                         ds.rollback(tx).await?;
-                        return Ok(DsAttempt::BodyFailed(error.into()));
+                        return Ok(DsAttempt::BodyFailed(Error::OutputSerialization(error)));
                     }
                 };
                 // Ending our transaction via raw SQL would split the writes
@@ -1556,7 +1561,12 @@ impl DurableContext {
                     // back — discarding this attempt's writes keeps the step
                     // exactly-once even under duplicate execution — and let
                     // the caller classify the stored row.
-                    ds.rollback(tx).await?;
+                    // The competing commit, not this cleanup response, decides
+                    // the outcome. Dropping the consumed transaction cannot
+                    // commit our writes. The caller must read the winner's row.
+                    if let Err(error) = ds.rollback(tx).await {
+                        tracing::warn!(%error, "rollback after duplicate checkpoint failed; reading the committed outcome");
+                    }
                     return Ok(DsAttempt::AlreadyCompleted { value });
                 }
                 ds.commit(tx).await?;
@@ -1883,8 +1893,8 @@ impl DurableContext {
         loop {
             match run_step_catching(&opts.name, in_body(&mut *f)).await {
                 Ok(v) => return Ok(v),
-                Err(Error::RecoveryRequired(cause)) => {
-                    return Err(self.execution.interrupt(Error::RecoveryRequired(cause)));
+                Err(error @ (Error::RecoveryRequired(_) | Error::ObservationFailed(_))) => {
+                    return Err(self.execution.body_error(error));
                 }
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,

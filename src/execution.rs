@@ -1,7 +1,7 @@
 //! Per-execution storage-failure channel. It is deliberately separate from the
 //! workflow's Result: catching an error must not authorize a terminal write.
 use crate::{Error, Result};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Notify;
 
 #[derive(Clone, Default)]
@@ -9,19 +9,13 @@ pub(crate) struct Execution(Arc<Inner>);
 
 #[derive(Default)]
 struct Inner {
-    failure: Mutex<Option<Arc<Error>>>,
+    failure: OnceLock<Arc<Error>>,
     changed: Notify,
 }
 
 impl Execution {
     pub(crate) fn check(&self) -> Result<()> {
-        match self
-            .0
-            .failure
-            .lock()
-            .expect("execution failure lock poisoned")
-            .as_ref()
-        {
+        match self.0.failure.get() {
             Some(error) => Err(Error::RecoveryRequired(error.clone())),
             None => Ok(()),
         }
@@ -41,7 +35,10 @@ impl Execution {
     /// a child handle). Adopt that control signal before rollback or retry can
     /// replace it. Ordinary body errors, including Db, remain business errors.
     pub(crate) fn body_error(&self, error: Error) -> Error {
-        if matches!(error, Error::RecoveryRequired(_)) {
+        if matches!(
+            error,
+            Error::RecoveryRequired(_) | Error::ObservationFailed(_)
+        ) {
             self.interrupt(error)
         } else {
             error
@@ -51,13 +48,10 @@ impl Execution {
     /// A known infrastructure failure, including an inconsistent stored row
     /// whose diagnostic uses App. Do not use for user-value serialization.
     pub(crate) fn interrupt(&self, error: Error) -> Error {
-        let mut failure = self
+        let first = self
             .0
             .failure
-            .lock()
-            .expect("execution failure lock poisoned");
-        let first = failure
-            .get_or_insert_with(|| match error {
+            .get_or_init(|| match error {
                 Error::RecoveryRequired(cause) => cause,
                 error => Arc::new(error),
             })
@@ -100,6 +94,17 @@ pub(crate) fn provider_error(error: Error) -> Error {
     }
 }
 
+/// Failure to observe an operation does not establish that its target stopped.
+/// Keep the cause for retry diagnostics without making it recordable business data.
+pub(crate) fn observation_error(error: Error) -> Error {
+    match error {
+        Error::ObservationFailed(_) => error,
+        Error::RecoveryRequired(cause) => Error::ObservationFailed(cause),
+        error if is_storage_failure(&error) => Error::ObservationFailed(Arc::new(error)),
+        error => error,
+    }
+}
+
 /// The provider boundary's error contract, not a global classification of an
 /// arbitrary Error: a Db/Serde returned by application code is a business result.
 /// Recorded driver errors are snapshots of business failures, not live failures.
@@ -111,5 +116,9 @@ pub(crate) fn is_storage_failure(error: &Error) -> bool {
             | Error::Serde(_)
             | Error::Serialization(_)
             | Error::RecoveryRequired(_)
+            | Error::ObservationFailed(_)
     )
 }
+
+#[cfg(test)]
+pub(crate) mod test_provider;

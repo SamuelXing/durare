@@ -186,12 +186,12 @@ impl Client {
                             opts.dedup_id.as_deref().unwrap_or(""),
                         )
                         .await
-                        .map_err(crate::execution::provider_error)?
+                        .map_err(crate::execution::observation_error)?
                     {
                         return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
                     }
                 }
-                Err(e) => return Err(crate::execution::provider_error(e)),
+                Err(e) => return Err(crate::execution::observation_error(e)),
             }
         }
     }
@@ -273,7 +273,7 @@ impl Client {
         self.provider
             .get_workflow_status(id)
             .await
-            .map_err(crate::execution::provider_error)?
+            .map_err(crate::execution::observation_error)?
             .ok_or_else(|| Error::UnknownWorkflow(id.to_string()))?;
         Ok(WorkflowHandle::polling(
             id.to_string(),

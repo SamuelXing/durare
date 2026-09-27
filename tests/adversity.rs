@@ -21,7 +21,7 @@ mod common;
 
 use durare::{
     DurableContext, DurableEngine, EngineConfig, Error, ErrorCode, PostgresProvider, Result,
-    StateProvider, WorkflowOptions, WorkflowQueue, STATUS_PENDING, STATUS_SUCCESS,
+    StateProvider, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING, STATUS_SUCCESS,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -237,25 +237,25 @@ async fn pg_recovery_honors_executor_ownership() -> Result<()> {
         engine.register(&wf, move |_ctx: DurableContext, _: ()| {
             let attempts = attempts.clone();
             async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    panic!("boom on the first attempt");
-                }
+                attempts.fetch_add(1, Ordering::SeqCst);
                 Ok::<_, Error>(())
             }
         });
     };
 
-    // Executor A runs the workflow; it panics and is left PENDING, owned by A.
-    {
-        let mut a = fleet_engine(&url, &exec_a).await?;
-        register(&mut a, attempts.clone());
-        let _ = a
-            .start::<(), ()>(&wf, (), WorkflowOptions::with_id(&wf_id))
-            .await?
-            .result()
-            .await;
-    }
     let probe = PostgresProvider::connect(&url).await?;
+    let stopped_owner = fleet_engine(&url, &exec_a).await?;
+    probe
+        .insert_workflow_status(WorkflowStatus::new(
+            &wf_id,
+            &wf,
+            serde_json::Value::Null,
+            STATUS_PENDING,
+            &exec_a,
+            stopped_owner.app_version(),
+        ))
+        .await?;
+    drop(stopped_owner);
     assert_eq!(
         probe.get_workflow_status(&wf_id).await?.unwrap().status,
         STATUS_PENDING,
@@ -277,6 +277,15 @@ async fn pg_recovery_honors_executor_ownership() -> Result<()> {
         STATUS_PENDING,
         "B's launch-recovery does not steal A's pending workflow"
     );
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        probe
+            .get_workflow_status(&wf_id)
+            .await?
+            .unwrap()
+            .executor_id,
+        exec_a
+    );
 
     // An explicit takeover of A's executor id — the operator handoff — does.
     let recovered = b.recover_pending_for(std::slice::from_ref(&exec_a)).await?;
@@ -296,8 +305,8 @@ async fn pg_recovery_honors_executor_ownership() -> Result<()> {
     assert_eq!(status, STATUS_SUCCESS, "the taken-over workflow completes");
     assert_eq!(
         attempts.load(Ordering::SeqCst),
-        2,
-        "crashed once under A, recovered once under B"
+        1,
+        "only explicit takeover by B runs the stopped owner's workflow"
     );
 
     b.shutdown(Duration::from_secs(10)).await?;
