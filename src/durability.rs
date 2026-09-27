@@ -167,8 +167,20 @@
 //! budget; increasing the cap alone does not make a persistent cause recoverable.
 //!
 //! Explicit recovery remains available for unfinished executions whose owner has
-//! stopped, including after shutdown or exhausted claim retries. Every
-//! execution path emits an error event with `workflow_id`, `workflow`, `error`,
+//! stopped, including after exhausted claim retries. `PENDING` alone does not
+//! prove the old execution stopped. [`DurableEngine::shutdown`] returns `Ok(())`
+//! even when its drain timeout expires; running bodies can still finish and
+//! commit afterward. Deactivation and dropping the engine do not prove process
+//! death either. Before explicit recovery or resume, establish that the selected
+//! previous executions cannot still run. Prefer
+//! [`DurableEngine::recover_pending_for`] with confirmed-stopped executor ids;
+//! an unfiltered recovery call is not a safe periodic sweep over a live fleet.
+//! The claim CAS chooses between recoverers but does not fence the old body.
+//! Resume resets the recovery counter, so it must not overlap an old recovery
+//! claim that could match the reset generation. Stop those claim tasks as part
+//! of the handoff too; later checkpoint conflicts cannot undo duplicate effects.
+//!
+//! Every execution path emits an error event with `workflow_id`, `workflow`, `error`,
 //! and `recovery_required=true`. Persistent decoding failures require a compatible
 //! reader or repaired data before recovery can succeed.
 //!
@@ -190,6 +202,21 @@
 //! Externally aborting the entire owning task bypasses this settlement path and
 //! can still require explicit recovery. Parking requires writable storage; failed
 //! parking claims follow the same bounded claim retries described above.
+//!
+//! A child started with [`DurableContext::start_workflow`] returns a polling
+//! handle. If the child parks, the handle returns
+//! [`Error::MaxRecoveryAttemptsExceeded`]. A parent that propagates that error
+//! becomes `ERROR`, releasing its own queue slot; it does not pause alongside
+//! the child. Parent code may handle the error explicitly instead. Resuming the
+//! child later resumes only the child: it does not reopen the parent's recorded
+//! failure, and resume is a no-op for an `ERROR` or `SUCCESS` parent.
+//!
+//! Queue progress requires readable/writable storage and a running dispatcher.
+//! A waiting parent is still running and occupies capacity. If a child's ownership
+//! is ambiguous, or its recovery cannot write a parking/requeue transition, the
+//! parent may keep waiting until safe operator recovery, cancellation or a deadline.
+//! The recovery budgets above do not bound every wait: handle polling and existing
+//! live transaction-conflict retries have separate semantics.
 //!
 //! Creation, retrieval and polling infrastructure failures instead return
 //! [`Error::ObservationFailed`]. This says the operation could not be observed,

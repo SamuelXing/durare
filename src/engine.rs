@@ -197,7 +197,10 @@ pub struct EngineConfig {
     /// pending work assumes the previous owner is gone, not running concurrently).
     /// Enable it for a single-process app, or when you set a distinct
     /// `DBOS__VMID` per process; otherwise drive recovery yourself with
-    /// [`recover`](DurableEngine::recover).
+    /// [`recover_pending_for`](DurableEngine::recover_pending_for) after confirming
+    /// the selected owners have stopped. Before launch, all executions in this
+    /// executor's recovery snapshot must have stopped too; a unique executor id
+    /// alone does not make it safe to recover work started before launch.
     pub recover_on_launch: Option<bool>,
     /// Automatic history retention. When set, [`launch`](DurableEngine::launch)
     /// starts a background sweeper that periodically enforces the policy via
@@ -1429,9 +1432,10 @@ impl DurableEngine {
     /// (off by default), this also recovers this executor's workflows left
     /// pending by a previous run, re-dispatching them on a background task — so a
     /// crash and restart resumes unfinished work without a separate call. It is
-    /// opt-in because it is only sound when each live process has a *unique*
-    /// executor id; otherwise drive recovery yourself with
-    /// [`recover`](Self::recover).
+    /// opt-in because the selected executions must have stopped and each live
+    /// process needs a unique executor id. Do not include live work started before
+    /// launch in that snapshot. For other stopped owners, use
+    /// [`recover_pending_for`](Self::recover_pending_for).
     pub async fn launch(&self) -> Result<()> {
         // A deactivated process must not start claiming work again.
         if self.is_deactivated() {
@@ -1818,6 +1822,12 @@ impl DurableEngine {
     /// recovery still working through its snapshot finishes the run it is on,
     /// starts no more, and leaves the untouched remainder `PENDING` for a later
     /// recovery.
+    ///
+    /// If the timeout expires, this still returns `Ok(())`. Running workflow
+    /// tasks are not aborted and may continue to commit results. Neither this
+    /// return value nor subsequently dropping the engine proves that its old
+    /// executions stopped. Confirm they have stopped before another executor
+    /// takes them over; see [`recover_pending_for`](Self::recover_pending_for).
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
         self.shutdown_token
             .lock()
@@ -1836,7 +1846,7 @@ impl DurableEngine {
         }
         // Drain in-flight runs, bounded by `timeout`: `close` lets `wait` return
         // once the tracked set empties. A run still going when the deadline passes
-        // is left mid-flight — durable, so a later recovery resumes it.
+        // keeps running. A takeover must wait for the old execution to stop.
         self.tasks.close();
         let _ = tokio::time::timeout(timeout, self.tasks.wait()).await;
         Ok(())
@@ -2401,13 +2411,17 @@ impl DurableEngine {
         self.provider.cancel_workflow(id).await
     }
 
-    /// Resume a cancelled (or otherwise non-terminal) workflow. It is re-queued
-    /// onto the internal queue — which every engine dispatches, so it always
-    /// makes progress — and re-run from its checkpoints; the returned handle
-    /// tracks it by polling. Resuming an already-completed workflow is a no-op:
-    /// the handle simply reads its recorded outcome. A missing id is a typed
-    /// [`Error::NonExistentWorkflow`]. Requires a launched engine to make
-    /// progress.
+    /// Resume a cancelled, parked or unfinished workflow whose previous execution
+    /// has stopped. It is re-queued onto the internal queue and re-run from its
+    /// checkpoints; the returned handle tracks it by polling. Requires a launched
+    /// dispatcher and working storage to make progress. Resuming a `SUCCESS` or
+    /// `ERROR` workflow is a no-op: the handle reads its recorded outcome. A missing
+    /// id is a typed [`Error::NonExistentWorkflow`].
+    ///
+    /// This resumes only the named workflow. If a parent returned its child's
+    /// parked error and became `ERROR`, resuming the child does not reopen the
+    /// parent. Resume resets the recovery counter; stop any in-flight recovery
+    /// claims before doing so. See the [durability guide](crate::durability).
     pub async fn resume_workflow<O>(&self, id: &str) -> Result<WorkflowHandle<O>> {
         self.resume_workflow_on(id, INTERNAL_QUEUE).await
     }
@@ -2440,6 +2454,8 @@ impl DurableEngine {
     /// to re-run. A polling handle is returned for **every id that exists**, in
     /// input order — an already-terminal workflow is a no-op whose handle reads
     /// its recorded outcome; missing ids yield no handle (and no error).
+    /// As with [`resume_workflow`](Self::resume_workflow), previous executions
+    /// must have stopped. Only the named workflows are resumed, not their parents.
     pub async fn resume_workflows<O>(&self, ids: &[String]) -> Result<Vec<WorkflowHandle<O>>> {
         self.resume_workflows_on(ids, INTERNAL_QUEUE).await
     }
@@ -2578,6 +2594,16 @@ impl DurableEngine {
     /// for you when you enable
     /// [`recover_on_launch`](EngineConfig::recover_on_launch).
     ///
+    /// # Recovery precondition
+    ///
+    /// Every selected workflow's previous execution must have stopped. This call
+    /// scans all owners of the matching application version; do not use it as an
+    /// unfiltered sweep of a live fleet. Prefer
+    /// [`recover_pending_for`](Self::recover_pending_for) with confirmed-stopped
+    /// executor ids. The ownership CAS arbitrates recovery claimants; it does not
+    /// stop or fence a live original body. `PENDING`, deactivation and a successful
+    /// return from [`shutdown`](Self::shutdown) do not establish this precondition.
+    ///
     /// Returns the number of workflows re-dispatched; their in-flight runs
     /// drain on [`shutdown`](Self::shutdown) like any other run.
     pub async fn recover(&self) -> Result<usize> {
@@ -2588,6 +2614,9 @@ impl DurableEngine {
     /// given executor ids (empty = any executor), returning the id of every
     /// workflow that was recovered. Backs the admin server's
     /// `POST /dbos-workflow-recovery`, which recovers a named set of executors.
+    /// The caller must confirm those executions have stopped; the API does not
+    /// detect a dead owner. An empty list has the same live-fleet restriction as
+    /// [`recover`](Self::recover). A timed-out shutdown is not a safe handoff.
     pub async fn recover_pending_for(&self, executor_ids: &[String]) -> Result<Vec<String>> {
         let cancel = self
             .shutdown_token
@@ -2712,7 +2741,8 @@ pub(crate) async fn dispatch_pending_workflows(
         // it: concurrent sweeps recovering the same executor each observe the
         // same (executor, attempts) pair, exactly one lands the increment, and
         // the rest lose — at most one process dispatches each pending
-        // workflow. Losing is normal, not an error: someone else owns the run.
+        // workflow, assuming its old execution stopped. Losing does not prove
+        // there is a runner: an earlier claim reply may have been lost.
         let claim = rt
             .provider
             .claim_for_recovery(&RecoveryClaimRequest {
@@ -2728,7 +2758,7 @@ pub(crate) async fn dispatch_pending_workflows(
             RecoveryClaim::Lost => {
                 tracing::debug!(
                     id = %record.id,
-                    "recovery claim lost: another process moved this workflow first"
+                    "recovery claim lost: expected state changed; no dispatch"
                 );
             }
             RecoveryClaim::Parked { attempts } => {

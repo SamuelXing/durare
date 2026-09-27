@@ -18,6 +18,7 @@ pub enum Fault {
     WriteThenClaimFailure,
     ClaimFailure,
     ClaimAlways,
+    ClaimAfter,
     WriteAfter,
     TerminalBefore,
     TerminalAfter,
@@ -45,6 +46,10 @@ pub struct FaultProvider {
     pub claim_finished: Notify,
     pub claim_permit: Semaphore,
     pub claim_calls: AtomicUsize,
+    pub block_claim_reply: AtomicBool,
+    pub claim_committed: Notify,
+    pub claim_reply_permit: Semaphore,
+    pub claim_outcomes: Mutex<Vec<RecoveryClaim>>,
 }
 impl FaultProvider {
     pub fn new(inner: Arc<dyn StateProvider>, fault: Fault) -> Self {
@@ -65,6 +70,10 @@ impl FaultProvider {
             claim_finished: Notify::new(),
             claim_permit: Semaphore::new(0),
             claim_calls: AtomicUsize::new(0),
+            block_claim_reply: AtomicBool::new(false),
+            claim_committed: Notify::new(),
+            claim_reply_permit: Semaphore::new(0),
+            claim_outcomes: Mutex::new(Vec::new()),
         }
     }
     pub fn arm(&self, faults: impl IntoIterator<Item = Fault>) {
@@ -337,6 +346,20 @@ impl StateProvider for FaultProvider {
             Self::failure()
         } else {
             self.inner.claim_for_recovery(req).await
+        };
+        if let Ok(outcome) = &result {
+            self.claim_outcomes.lock().unwrap().push(*outcome);
+            if !matches!(outcome, RecoveryClaim::Lost) {
+                self.claim_committed.notify_one();
+                if self.block_claim_reply.swap(false, Ordering::SeqCst) {
+                    self.claim_reply_permit.acquire().await.unwrap().forget();
+                }
+            }
+        }
+        let result = if result.is_ok() && self.take(Fault::ClaimAfter) {
+            Self::failure()
+        } else {
+            result
         };
         self.claim_finished.notify_one();
         result

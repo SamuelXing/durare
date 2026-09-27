@@ -1314,9 +1314,11 @@ pub enum RecoveryClaim {
         /// `recovery_attempts` after the parking increment.
         attempts: i32,
     },
-    /// The row no longer matches what the sweep observed — a rival sweep
-    /// claimed it, or it completed, was cancelled, or was resumed. Another
-    /// process is responsible for it now; do nothing.
+    /// The row no longer matches the expected state. It may have completed,
+    /// been cancelled/resumed, or been claimed by a rival or by an earlier call
+    /// whose reply was lost. This is not permission to dispatch, and does not
+    /// prove that any process is running the workflow. An unfinished direct run
+    /// may require explicit recovery once its previous execution has stopped.
     Lost,
 }
 
@@ -1822,19 +1824,18 @@ pub trait StateProvider: Send + Sync {
     /// it*: it applies only while the row is still `PENDING`, still owned by
     /// [`expected_executor`](RecoveryClaimRequest::expected_executor), and still
     /// at [`expected_attempts`](RecoveryClaimRequest::expected_attempts). Any
-    /// interleaved transition — a rival sweep's claim (which bumps the attempt
-    /// count), a completion, a cancellation, a resume — makes the predicate
-    /// miss, and the caller gets [`RecoveryClaim::Lost`]: at most one process
-    /// dispatches each pending workflow, no matter how many recover the same
-    /// dead executor at once.
+    /// change to those fields makes the predicate miss, returning
+    /// [`RecoveryClaim::Lost`]. With a stopped old execution and no concurrent
+    /// counter reset, only one claimant can dispatch that generation. A lost
+    /// reply can leave a successful claim without a runner, so Lost does not
+    /// establish that another process is executing it.
     ///
     /// One caveat: a resume *resets* the attempt counter, so a cancel-then-
     /// resume can reconstruct the exact triple a sweep observed before either
     /// happened, and a claim that stayed in flight across both would land on
-    /// the resumed run. The window requires a sweep stalled across two operator
-    /// actions; the terminal-write guard and the step-checkpoint conflict in
-    /// [`record_step_result`](Self::record_step_result) contain the doubled
-    /// execution if it ever occurs.
+    /// the resumed run. Stop in-flight recovery claims before resetting the
+    /// counter. Terminal-write and checkpoint conflict checks preserve recorded
+    /// outcomes but cannot undo effects already performed by a duplicate body.
     ///
     /// A successful claim increments `recovery_attempts` and, depending on the
     /// request, either re-stamps `executor_id` with the claimant

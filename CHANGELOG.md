@@ -26,6 +26,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it. Exhausted workflows park and release queue capacity. Repair and explicit
   resume reset a parked workflow (including on the in-memory backend).
   Shutdown and deactivation stop automatic recovery.
+  A shutdown timeout still returns `Ok(())` and leaves running bodies alive;
+  explicit recovery/resume requires confirming that the previous executions
+  stopped. The recovery CAS does not fence a live old body.
   Failed storage claims retry at most eight times, then emit an error and leave
   the unfinished row for explicit recovery after repair. A lost/ambiguous direct
   claim never authorizes duplicate dispatch; it may need explicit recovery once
@@ -39,7 +42,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   owner. A lost creation reply can require explicit recovery after the original
   owner stops. Do not recover a target based on an observation fault alone.
   Existing children are observed, never redispatched merely because their
-  parent's relationship checkpoint is missing. Propagating either
+  parent's relationship checkpoint is missing. A polling child handle reports
+  `MaxRecoveryAttemptsExceeded` when the child parks. A parent that returns that
+  error becomes `ERROR`; resuming the child does not reopen its parent, and
+  resume preserves `SUCCESS`/`ERROR` outcomes. Propagating either
   signal through a durable body interrupts that execution and bypasses business
   retries. Output-to-Rust-type mismatches remain catchable.
   SQL transaction machinery errors do not become business failures or enter

@@ -395,9 +395,11 @@ async fn a_panicked_direct_child_does_not_hold_its_parents_queue_slot() -> Resul
     engine.register("child", move |_: DurableContext, _: ()| {
         let counted = counted.clone();
         async move {
-            counted.fetch_add(1, Ordering::SeqCst);
-            panic!("child cannot complete until repaired");
-            #[allow(unreachable_code)]
+            assert_ne!(
+                counted.fetch_add(1, Ordering::SeqCst),
+                0,
+                "child cannot complete until repaired"
+            );
             Ok(42)
         }
     });
@@ -430,7 +432,6 @@ async fn a_panicked_direct_child_does_not_hold_its_parents_queue_slot() -> Resul
         )
         .await?;
     let next = tokio::time::timeout(Duration::from_secs(3), healthy.result()).await;
-    engine.shutdown(Duration::from_secs(1)).await?;
     assert_eq!(
         outcome.unwrap().unwrap_err().code(),
         ErrorCode::MaxRecoveryAttemptsExceeded
@@ -441,5 +442,231 @@ async fn a_panicked_direct_child_does_not_hold_its_parents_queue_slot() -> Resul
     );
     assert_eq!(next.unwrap()?, 42);
     assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let parent_before = inner.get_workflow_status("parent").await?.unwrap();
+    assert_eq!(parent_before.status, STATUS_ERROR);
+
+    // Resuming the child repairs only that workflow, not its parent's recorded
+    // error. Explicitly resuming an ERROR parent must also be a no-op.
+    let child = engine.resume_workflow::<i32>("parent-0").await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), child.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    let parent = engine.resume_workflow::<i32>("parent").await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), parent.result())
+            .await
+            .unwrap()
+            .unwrap_err()
+            .code(),
+        ErrorCode::MaxRecoveryAttemptsExceeded
+    );
+    let parent_after = inner.get_workflow_status("parent").await?.unwrap();
+    assert_eq!(parent_after.status, STATUS_ERROR);
+    assert_eq!(parent_after.error, parent_before.error);
+    assert_eq!(effects.load(Ordering::SeqCst), 2);
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+async fn wait_for_attempts_to_stop(engine: &DurableEngine) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.metrics().await?.workflows_in_flight != 0 {
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    })
+    .await
+    .expect("workflow and recovery tasks must finish")
+}
+
+#[tokio::test]
+async fn shutdown_timeout_does_not_stop_a_running_body() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(inner.clone()).await?;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (started, gate) = (entered.clone(), release.clone());
+    engine.register("held", move |ctx: DurableContext, _: ()| {
+        let (started, gate) = (started.clone(), gate.clone());
+        async move {
+            ctx.step("held", || async {
+                started.notify_one();
+                gate.acquire().await.unwrap().forget();
+                Ok(42)
+            })
+            .await
+        }
+    });
+    let handle = engine
+        .start::<_, i32>("held", (), WorkflowOptions::with_id("held"))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .unwrap();
+    engine.shutdown(Duration::ZERO).await?;
+    assert_eq!(engine.metrics().await?.workflows_in_flight, 1);
+    assert_eq!(
+        inner.get_workflow_status("held").await?.unwrap().status,
+        STATUS_PENDING
+    );
+    release.add_permits(1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), handle.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    wait_for_attempts_to_stop(&engine).await?;
+    assert_eq!(
+        inner.get_workflow_status("held").await?.unwrap().status,
+        STATUS_SUCCESS
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lost_recovery_claim_reply_never_authorizes_direct_dispatch() -> Result<()> {
+    for queued in [false, true] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteBefore));
+        provider.arm([Fault::WriteBefore, Fault::ClaimAfter]);
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let counted = effects.clone();
+        engine.register("effect", move |ctx: DurableContext, _: ()| {
+            let counted = counted.clone();
+            async move {
+                ctx.step("effect", || async {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(42)
+                })
+                .await
+            }
+        });
+        let mut options = WorkflowOptions::with_id("effect");
+        if queued {
+            engine.register_queue(
+                WorkflowQueue::new("one")
+                    .global_concurrency(1)
+                    .base_polling_interval(Duration::from_millis(10)),
+            );
+            engine.launch().await?;
+            options = options.queue("one");
+        }
+        let handle = engine.start::<_, i32>("effect", (), options).await?;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle.result())
+            .await
+            .unwrap();
+        if queued {
+            assert_eq!(outcome?, 42);
+        } else {
+            assert!(matches!(outcome, Err(Error::RecoveryRequired(_))));
+        }
+        wait_for_attempts_to_stop(&engine).await?;
+        let claims = provider.claim_outcomes.lock().unwrap().clone();
+        assert_eq!(provider.claim_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[1], RecoveryClaim::Lost);
+        let row = inner.get_workflow_status("effect").await?.unwrap();
+        if queued {
+            assert_eq!(claims[0], RecoveryClaim::Requeued);
+            assert_eq!(row.status, STATUS_SUCCESS);
+            assert_eq!(effects.load(Ordering::SeqCst), 2);
+        } else {
+            assert_eq!(claims[0], RecoveryClaim::Claimed { attempts: 1 });
+            assert_eq!(row.status, STATUS_PENDING);
+            assert_eq!(row.recovery_attempts, 1);
+            assert!(row.error.is_none());
+            assert_eq!(effects.load(Ordering::SeqCst), 1);
+            // This test has drained the stopped attempt and its supervisor.
+            // Lost/PENDING alone would not authorize this explicit takeover.
+            assert_eq!(
+                engine.recover_pending_for(&[row.executor_id]).await?,
+                vec!["effect"]
+            );
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    engine.retrieve_workflow::<i32>("effect").await?.result()
+                )
+                .await
+                .unwrap()?,
+                42
+            );
+            assert_eq!(effects.load(Ordering::SeqCst), 2);
+        }
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_or_cancel_after_a_committed_claim_never_dispatches_its_body() -> Result<()> {
+    for action in ["deactivate", "shutdown", "cancel"] {
+        let inner = Arc::new(InMemoryProvider::new());
+        let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteBefore));
+        provider.arm([Fault::WriteBefore, Fault::ClaimAfter]);
+        provider.block_claim_reply.store(true, Ordering::SeqCst);
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        let effects = Arc::new(AtomicUsize::new(0));
+        let counted = effects.clone();
+        engine.register("effect", move |ctx: DurableContext, _: ()| {
+            let counted = counted.clone();
+            async move {
+                ctx.step("effect", || async {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }
+        });
+        assert!(matches!(
+            engine
+                .start::<_, ()>("effect", (), WorkflowOptions::with_id("effect"))
+                .await?
+                .result()
+                .await,
+            Err(Error::RecoveryRequired(_))
+        ));
+        tokio::time::timeout(Duration::from_secs(3), provider.claim_committed.notified())
+            .await
+            .expect("claim must commit before the stop/cancel action");
+        let row = inner.get_workflow_status("effect").await?.unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(row.recovery_attempts, 1);
+        match action {
+            "deactivate" => engine.deactivate(),
+            "shutdown" => engine.shutdown(Duration::ZERO).await?,
+            _ => engine.cancel_workflow("effect").await?,
+        }
+        provider.claim_reply_permit.add_permits(1);
+        wait_for_attempts_to_stop(&engine).await?;
+        assert_eq!(effects.load(Ordering::SeqCst), 1, "{action}");
+        let row = inner.get_workflow_status("effect").await?.unwrap();
+        assert_eq!(row.recovery_attempts, 1);
+        assert_eq!(
+            row.status,
+            if action == "cancel" {
+                STATUS_CANCELLED
+            } else {
+                STATUS_PENDING
+            }
+        );
+        assert!(row.error.is_none());
+        let claims = provider.claim_outcomes.lock().unwrap().clone();
+        assert_eq!(claims[0], RecoveryClaim::Claimed { attempts: 1 });
+        if action == "cancel" {
+            assert_eq!(
+                claims,
+                vec![RecoveryClaim::Claimed { attempts: 1 }, RecoveryClaim::Lost]
+            );
+        } else {
+            assert_eq!(claims.len(), 1);
+        }
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
     Ok(())
 }
