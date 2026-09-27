@@ -86,9 +86,10 @@
 //! A cloned context retains that identity; even another execution of the same
 //! workflow id cannot use it. A refused constructor consumes no position;
 //! moving an already-built call does not undo its previously claimed position.
-//! Plain tasks inside a step remain allowed. Native transactions and patches
-//! retain their existing poll-time position allocation, so this check does not
-//! make timing-dependent construction order deterministic.
+//! Plain tasks inside a step remain allowed. Native transactions also claim
+//! their positions at construction; patches still allocate conditionally when
+//! polled and must be awaited in sequence. These checks do not make a
+//! timing-dependent construction order deterministic.
 //!
 //! ```no_run
 //! # use durare::{DurableContext, Error, Result};

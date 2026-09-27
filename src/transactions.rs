@@ -193,6 +193,25 @@
 //! workflows before migrating a database, or move `transaction_completion`
 //! along with the data.
 //!
+//! # Construction order and replay
+//!
+//! Both transaction APIs claim a checkpoint position when called, before their
+//! returned futures are polled. Calls constructed in a repeatable order keep
+//! their positions even if awaited in another order. Constructing a call and
+//! dropping it still spends that position, without opening a transaction or
+//! invoking the body. The guard against overlapping transactions is acquired
+//! only when execution begins; constructing several calls does not lock it.
+//! Execute those transactions sequentially: overlapping transactions in one
+//! workflow remain unsupported.
+//!
+//! Native transactions keep their `async |conn|` callbacks and return opaque
+//! futures, so existing `.await` call sites need no syntax changes. Immediately
+//! awaited native calls keep their numbering. Histories that stored a native
+//! call for later polling, interleaved it with other constructed calls, or
+//! dropped it unpolled may use different positions. Finish affected histories
+//! on their old code version: reusing them with the new numbering can mismatch
+//! operations or exchange same-named outputs.
+//!
 //! # Which transaction API?
 //!
 //! | Your situation | Use | Body receives | Body written as | Commits |
