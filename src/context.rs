@@ -915,8 +915,9 @@ impl DurableContext {
     /// The child runs durably and independently of the parent. It is keyed to
     /// this call's step position: unless `opts.workflow_id` is set, it gets the
     /// deterministic id `{parent_id}-{seq}`, and the parent→child link is
-    /// checkpointed. On replay the same child is re-attached instead of being
-    /// started again, so the child runs at most once per logical call.
+    /// checkpointed. On replay the parent re-attaches to that child instead of
+    /// creating another child for this call. The child's own workflow body can
+    /// still run again during recovery.
     ///
     /// The child inherits this workflow's identity ([`AuthContext`]) field by
     /// field — each auth field set on `opts` overrides just that field — and
@@ -1036,9 +1037,10 @@ impl DurableContext {
     /// Run a durable step with the default policy (no retries).
     ///
     /// On the first execution, `f` runs and its result is checkpointed to the
-    /// state backend. On any later replay (e.g. after a crash) the stored result
-    /// is returned and `f` is **not** run again — so side effects inside `f`
-    /// execute at most once per logical step under normal operation.
+    /// state backend. Once that checkpoint commits, later replays return its
+    /// result without running `f` again. If an external side effect succeeds
+    /// but the checkpoint does not commit, recovery can run `f` again; see the
+    /// [at-least-once window](crate::durability#the-at-least-once-window).
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Error, Result};
