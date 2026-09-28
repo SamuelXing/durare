@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `StepCtx` gives an ordinary step body its own workflow id, claimed step
+  position, zero-based attempt, and total allowed attempts. Both `step` and
+  `step_with` accept either an existing `||` callback or an opt-in `|step|`
+  callback on the same method; existing call sites and stored histories need no
+  migration. A completed checkpoint still skips the body on replay. This
+  metadata does not include a cancellation token or promise exactly-once
+  external effects; those contracts remain separate.
+
 ### Changed
 
 - **Breaking: native transactions claim checkpoint positions when called.**
