@@ -168,6 +168,43 @@ macro_rules! claim {
     };
 }
 
+/// Box several plain async branches for [`DurableContext::select`].
+///
+/// Different `async` blocks have different concrete future types. This macro
+/// erases those types into the vector `select` already accepts; it does not
+/// poll the branches or add a checkpoint. Branch order determines the returned
+/// winner index. The branches remain plain work, so durable calls inside them
+/// are refused by `select`.
+///
+/// For branches built dynamically, pass a vector directly to `select`.
+///
+/// ```no_run
+/// # use durare::{DurableContext, Result};
+/// # async fn demo(ctx: DurableContext) -> Result<()> {
+/// let base = 1_i64;
+/// let branches = durare::select_branches![
+///     async { base },
+///     async { base + 1 },
+/// ];
+/// let (winner, value) = ctx.select(branches).await?;
+/// # let _ = (winner, value);
+/// # Ok(())
+/// # }
+/// ```
+#[macro_export]
+macro_rules! select_branches {
+    ($($branch:expr),+ $(,)?) => {{
+        let branches: ::std::vec::Vec<
+            ::std::pin::Pin<
+                ::std::boxed::Box<
+                    dyn ::std::future::Future<Output = _> + ::std::marker::Send + '_
+                >
+            >
+        > = ::std::vec![$(::std::boxed::Box::pin($branch)),+];
+        branches
+    }};
+}
+
 /// Predicate deciding whether a step error is retryable — see
 /// [`StepOptions::retry_if`]. Returning `false` stops retries at once.
 pub type RetryPredicate = Arc<dyn Fn(&Error) -> bool + Send + Sync>;
@@ -2023,6 +2060,9 @@ impl DurableContext {
     /// Race several async `branches` and return the `(index, value)` of the first
     /// to complete — a **durable** select.
     ///
+    /// [`select_branches!`](crate::select_branches) boxes a fixed list of
+    /// different future types. For dynamically built branches, pass a vector.
+    ///
     /// The winning index and value are recorded as a single step, so a replay
     /// returns the same winner without re-running anything. On a tie the lowest
     /// index wins.
@@ -2052,9 +2092,9 @@ impl DurableContext {
     /// # async fn fetch_fallback() -> String { String::new() }
     /// # async fn demo(ctx: DurableContext) -> Result<()> {
     /// let (winner, value) = ctx
-    ///     .select(vec![
-    ///         Box::pin(async { fetch_primary().await }),
-    ///         Box::pin(async { fetch_fallback().await }),
+    ///     .select(durare::select_branches![
+    ///         async { fetch_primary().await },
+    ///         async { fetch_fallback().await },
     ///     ])
     ///     .await?;
     /// # let _ = (winner, value);

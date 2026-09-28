@@ -7,8 +7,6 @@ use durare::{
     SqliteProvider, TransactionOptions, WorkflowOptions, WorkflowQueue, STATUS_CANCELLED,
     STATUS_SUCCESS,
 };
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -340,15 +338,15 @@ async fn sqlite_select_winner_is_durable() -> Result<()> {
 
     let register = |engine: &mut DurableEngine| {
         engine.register("racer", |ctx: DurableContext, _: ()| async move {
-            let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
-                Box::pin(async {
+            let branches = durare::select_branches![
+                async {
                     FAST_RUNS.fetch_add(1, Ordering::Relaxed);
                     2_i64
-                }),
-                Box::pin(async {
+                },
+                async {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     1_i64
-                }),
+                },
             ];
             ctx.select(branches).await
         });

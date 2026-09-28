@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `select_branches![a, b, ...]` boxes a fixed list of plain async branches for
+  `DurableContext::select`. It removes per-branch `Box::pin` and explicit
+  future-vector types at call sites; `select` still records the same winner and
+  value, and dynamically built vectors remain supported.
+
 - `StepCtx::cancelled().await` lets a running step observe a persisted workflow
   cancellation, including one requested by another client or process. The
   observation polls only while awaited and reports storage faults for recovery.

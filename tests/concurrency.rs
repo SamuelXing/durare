@@ -42,12 +42,12 @@ async fn concurrent_steps_via_try_join() -> Result<()> {
 async fn select_returns_first_to_complete() -> Result<()> {
     let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
     engine.register("racer", |ctx: DurableContext, _: ()| async move {
-        let branches: Vec<Pin<Box<dyn Future<Output = i64> + Send>>> = vec![
-            Box::pin(async {
+        let branches = durare::select_branches![
+            async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 1
-            }),
-            Box::pin(async { 2 }),
+            },
+            async { 2 },
         ];
         ctx.select(branches).await
     });
