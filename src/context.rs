@@ -4,9 +4,11 @@ use crate::handle::WorkflowHandle;
 use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
 use crate::replay::{Divergence, Verification};
 use crate::tx::{TransactionOptions, Tx, TxBody};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use futures_util::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::future::{poll_fn, Future};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -220,6 +222,49 @@ impl StepCtx {
     /// A `retry_if` predicate may stop the step before this many attempts run.
     pub fn max_attempts(&self) -> u64 {
         self.max_attempts
+    }
+
+    /// A stable, fixed-length key for one external effect in this step.
+    ///
+    /// Use a distinct, stable `effect` label for each external operation whose
+    /// receiver shares an idempotency-key namespace. Include an application
+    /// namespace in the label if several applications share that receiver. The
+    /// key is the same across this step's retries and recovery, but a fork gets
+    /// a new workflow id and therefore a different key for re-executed steps.
+    /// The attempt number and retry policy are deliberately excluded.
+    ///
+    /// The key is a versioned SHA-256 digest of the workflow id, step position,
+    /// and effect label, with unambiguous field lengths. Its encoding is stable
+    /// across SDK versions. It is not a secret or an authorization token.
+    /// Durare cannot make an external effect exactly once by generating a key:
+    /// pass it to a receiver that atomically deduplicates requests by that key.
+    /// Do not use the same label for two distinct effects at one receiver. If
+    /// the meaning of an effect changes, give it a new label so an earlier
+    /// accepted request cannot suppress the changed request.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Error, Result, StepCtx};
+    /// # async fn demo(ctx: DurableContext) -> Result<String> {
+    /// ctx.step("charge", |step: StepCtx| async move {
+    ///     let key = step.idempotency_key_for("payments/charge");
+    ///     // Send `key` with the external request; its receiver must deduplicate.
+    ///     Ok::<_, Error>(key)
+    /// }).await
+    /// # }
+    /// ```
+    pub fn idempotency_key_for(&self, effect: &str) -> String {
+        const DOMAIN: &[u8] = b"durare.step.idempotency.v1\0";
+        let mut digest = Sha256::new();
+        digest.update(DOMAIN);
+        digest.update((self.workflow_id.len() as u64).to_be_bytes());
+        digest.update(self.workflow_id.as_bytes());
+        digest.update(self.step_id.to_be_bytes());
+        digest.update((effect.len() as u64).to_be_bytes());
+        digest.update(effect.as_bytes());
+        format!(
+            "durare-step-v1-{}",
+            URL_SAFE_NO_PAD.encode(digest.finalize())
+        )
     }
 }
 

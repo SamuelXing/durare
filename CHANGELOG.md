@@ -8,6 +8,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StepCtx::idempotency_key_for(effect)` derives a fixed-length, versioned key
+  from the workflow id, claimed step position, and an application-chosen effect
+  label. It remains stable across retry and recovery; a fork uses its new
+  workflow id and gets a different key for re-executed steps. The external
+  receiver must atomically deduplicate by that key. The label distinguishes
+  multiple effects inside one step and must change if the effect's meaning
+  changes.
+
 - `StepCtx` gives an ordinary step body its own workflow id, claimed step
   position, zero-based attempt, and total allowed attempts. Both `step` and
   `step_with` accept either an existing `||` callback or an opt-in `|step|`
