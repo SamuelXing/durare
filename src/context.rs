@@ -170,6 +170,122 @@ macro_rules! claim {
 /// [`StepOptions::retry_if`]. Returning `false` stops retries at once.
 pub type RetryPredicate = Arc<dyn Fn(&Error) -> bool + Send + Sync>;
 
+/// Identity and retry metadata for the attempt currently running inside a
+/// durable step body.
+///
+/// The step position is claimed when [`DurableContext::step`] or
+/// [`DurableContext::step_with`] is constructed. It does not change when an
+/// attempt is retried or when a saved result is replayed. The attempt number
+/// starts at zero and increases only for retries within this execution.
+/// Replay serves a completed checkpoint without calling the body, so it does
+/// not create another `StepCtx` for that saved result.
+///
+/// This value does not grant permission to make nested durable calls. It does
+/// not carry a cancellation token until a real workflow cancellation signal
+/// can be connected to the running body.
+#[derive(Clone, Debug)]
+pub struct StepCtx {
+    workflow_id: Arc<str>,
+    step_id: i32,
+    attempt: u32,
+    max_attempts: u64,
+}
+
+impl StepCtx {
+    fn new(workflow_id: Arc<str>, step_id: i32, attempt: u32, max_attempts: u64) -> Self {
+        Self {
+            workflow_id,
+            step_id,
+            attempt,
+            max_attempts,
+        }
+    }
+
+    /// The workflow whose history owns this step.
+    pub fn workflow_id(&self) -> &str {
+        &self.workflow_id
+    }
+
+    /// This step's claimed position, stable across its retries and replay.
+    pub fn step_id(&self) -> i32 {
+        self.step_id
+    }
+
+    /// Zero-based attempt number within this execution.
+    pub fn attempt(&self) -> u32 {
+        self.attempt
+    }
+
+    /// Maximum attempts allowed by the retry policy, including the first.
+    /// A `retry_if` predicate may stop the step before this many attempts run.
+    pub fn max_attempts(&self) -> u64 {
+        self.max_attempts
+    }
+}
+
+/// Accepts both existing `|| async { ... }` bodies and bodies that opt in to
+/// `|step: StepCtx| async { ... }`, without a second public step method.
+#[doc(hidden)]
+pub trait StepBody<Args, T>: Send {
+    type Future: Future<Output = Result<T>> + Send;
+    fn call(self, make_step: impl FnOnce() -> StepCtx) -> Self::Future;
+}
+
+impl<T, F, Fut> StepBody<(), T> for F
+where
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = Result<T>> + Send,
+{
+    type Future = Fut;
+
+    fn call(self, _: impl FnOnce() -> StepCtx) -> Fut {
+        self()
+    }
+}
+
+impl<T, F, Fut> StepBody<(StepCtx,), T> for F
+where
+    F: FnOnce(StepCtx) -> Fut + Send,
+    Fut: Future<Output = Result<T>> + Send,
+{
+    type Future = Fut;
+
+    fn call(self, make_step: impl FnOnce() -> StepCtx) -> Fut {
+        self(make_step())
+    }
+}
+
+/// Retry-capable counterpart of [`StepBody`].
+#[doc(hidden)]
+pub trait RetryStepBody<Args, T>: Send {
+    type Future: Future<Output = Result<T>> + Send;
+    fn call(&mut self, make_step: impl FnOnce() -> StepCtx) -> Self::Future;
+}
+
+impl<T, F, Fut> RetryStepBody<(), T> for F
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<T>> + Send,
+{
+    type Future = Fut;
+
+    fn call(&mut self, _: impl FnOnce() -> StepCtx) -> Fut {
+        self()
+    }
+}
+
+impl<T, F, Fut> RetryStepBody<(StepCtx,), T> for F
+where
+    F: FnMut(StepCtx) -> Fut + Send,
+    Fut: Future<Output = Result<T>> + Send,
+{
+    type Future = Fut;
+
+    fn call(&mut self, make_step: impl FnOnce() -> StepCtx) -> Fut {
+        self(make_step())
+    }
+}
+
 /// Retry policy for a durable step.
 ///
 /// Defaults: no retries, factor 2.0, 100ms base, 5s cap.
@@ -806,7 +922,23 @@ impl DurableContext {
     /// ```
     ///
     /// `f` is `FnOnce`: it is invoked at most once per call. For automatic
-    /// retries, use [`step_with`](Self::step_with).
+    /// retries, use [`step_with`](Self::step_with). Existing zero-argument
+    /// closures continue to work. A closure that needs this step's claimed
+    /// position can accept a [`StepCtx`] instead. Spell out the parameter type
+    /// on an async closure so Rust can distinguish the two callback shapes:
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Error, Result, StepCtx};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// let id = ctx.step("charge", |step: StepCtx| async move {
+    ///     // `current_step_id()` on the outer context points to the *next*
+    ///     // position. This id belongs to the body actually running here.
+    ///     Ok::<_, Error>((step.workflow_id().to_owned(), step.step_id()))
+    /// }).await?;
+    /// # let _ = id;
+    /// # Ok(())
+    /// # }
+    /// ```
     ///
     /// # Errors
     ///
@@ -815,11 +947,11 @@ impl DurableContext {
     /// workflow was cancelled, and [`Error::UnexpectedStep`] if a replay finds a
     /// different operation recorded at this step position (a non-deterministic
     /// workflow function).
-    pub fn step<'a, T, F, Fut>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
+    pub fn step<'a, T, F, Args>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
-        F: FnOnce() -> Fut + Send + 'a,
-        Fut: Future<Output = Result<T>> + Send + 'a,
+        F: StepBody<Args, T> + 'a,
+        F::Future: 'a,
     {
         let position = claim!(self, "step");
         let seq = position.seq();
@@ -831,7 +963,14 @@ impl DurableContext {
                     return Ok(stored);
                 }
                 let started = chrono::Utc::now().timestamp_millis();
-                match run_step_catching(&name, in_body(f)).await {
+                match run_step_catching(
+                    &name,
+                    in_body(|| {
+                        f.call(|| StepCtx::new(Arc::from(self.workflow_id.as_str()), seq, 0, 1))
+                    }),
+                )
+                .await
+                {
                     Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
                 }
@@ -851,6 +990,10 @@ impl DurableContext {
     /// fresh (non-replayed) attempt, the workflow's status is checked: a
     /// `CANCELLED` workflow refuses to run the step and returns
     /// [`Error::Cancelled`].
+    /// The closure may take a [`StepCtx`] by value to inspect its zero-based
+    /// attempt and the total allowed attempts; its step id stays fixed. A
+    /// zero-argument closure still works and does not construct this metadata.
+    /// Annotate the parameter as `|step: StepCtx|` when opting in.
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Error, Result, StepOptions};
@@ -874,11 +1017,11 @@ impl DurableContext {
     /// checkpointed, so a replay yields the same error without re-running.
     /// Also [`Error::Cancelled`] if the workflow was cancelled, and
     /// [`Error::UnexpectedStep`] on a divergent replay.
-    pub fn step_with<'a, T, F, Fut>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
+    pub fn step_with<'a, T, F, Args>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
-        F: FnMut() -> Fut + Send + 'a,
-        Fut: Future<Output = Result<T>> + Send + 'a,
+        F: RetryStepBody<Args, T> + 'a,
+        F::Future: 'a,
     {
         let position = claim!(self, "step");
         let seq = position.seq();
@@ -891,7 +1034,7 @@ impl DurableContext {
                 // Run with retries; only the final result/error is observed, then
                 // checkpointed — a success as its output, a failure as its error.
                 let started = chrono::Utc::now().timestamp_millis();
-                match self.run_with_retries(&opts, &mut f).await {
+                match self.run_with_retries(seq, &opts, &mut f).await {
                     Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
                     Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
                 }
@@ -1950,14 +2093,32 @@ impl DurableContext {
 
     /// Drive `f` to success, retrying on error per `opts` with exponential
     /// backoff. Returns the last error if all attempts are exhausted.
-    async fn run_with_retries<T, F, Fut>(&self, opts: &StepOptions, f: &mut F) -> Result<T>
+    async fn run_with_retries<T, F, Args>(
+        &self,
+        seq: i32,
+        opts: &StepOptions,
+        f: &mut F,
+    ) -> Result<T>
     where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        F: RetryStepBody<Args, T>,
     {
         let mut attempt: u32 = 0;
+        let mut workflow_id: Option<Arc<str>> = None;
+        let max_attempts = u64::from(opts.max_retries) + 1;
         loop {
-            match run_step_catching(&opts.name, in_body(&mut *f)).await {
+            match run_step_catching(
+                &opts.name,
+                in_body(|| {
+                    f.call(|| {
+                        let id = workflow_id
+                            .get_or_insert_with(|| Arc::from(self.workflow_id.as_str()))
+                            .clone();
+                        StepCtx::new(id, seq, attempt, max_attempts)
+                    })
+                }),
+            )
+            .await
+            {
                 Ok(v) => return Ok(v),
                 Err(error @ (Error::RecoveryRequired(_) | Error::ObservationFailed(_))) => {
                     return Err(self.execution.body_error(error));
