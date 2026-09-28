@@ -8,13 +8,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Breaking: native transactions claim checkpoint positions when called.**
+  `transaction_on` and `transaction_on_with` now keep their construction-order
+  positions when awaited in another order, matching `step` and `transaction`.
+  Previously, same-named native transactions could silently exchange recorded
+  outputs on replay. A call constructed inside a durable body is now refused
+  even if first polled outside it. Refused construction spends no position;
+  dropping a valid unpolled call spends its position without opening a database
+  transaction. Execution placement is still checked on every poll.
+  The `async |conn|` callback and ordinary `.await` syntax are unchanged; the
+  returned future remains opaque so stable Rust can infer `Send` per callback.
+  Immediately awaited calls keep their numbering. Histories that saved native
+  calls for later polling, interleaved their construction with other calls, or
+  dropped them unpolled may use different positions; finish affected histories
+  on the previous application version. This applies to both checkpoints and
+  application-database completion rows. A same-name mismatch may return the
+  wrong result without an error. Patches retain conditional poll-time allocation
+  and must still be awaited in sequence.
+
 - **Breaking: durable calls require their original workflow execution.** Moving
   an owned or cloned `DurableContext` into `tokio::spawn`, or using it from
   another execution, now returns `Error::DurableCallOutsideExecution` before
   claiming a position. Already-built calls check on every poll; refusing one
   does not reclaim its position. Native transactions and patches also check
-  every poll, without changing their existing position allocation or callback
-  signatures. Use `join!` in the workflow, child workflows for independent
+  every poll. Use `join!` in the workflow, child workflows for independent
   durable work, or plain tasks inside a checkpointed step. Context metadata
   remains accessible outside the execution. This is a recordable programming
   error, not an infrastructure recovery signal. This error and the existing
@@ -172,11 +189,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `#[must_use]`. Bodies and outputs need `Send`, and a call that cannot encode
   its argument now fails without moving the counter.
 
-  Two calls keep the old shape and must be awaited where they are written, both
-  documented in place: `ctx.patch` / `deprecate_patch`, whose position is
-  claimed only if a database read says so, and `ctx.transaction_on` /
-  `transaction_on_with`, whose `AsyncFn` body cannot be required to return a
-  `Send` future on stable Rust (`async_fn_traits`).
+  `ctx.patch` / `deprecate_patch` keep the old shape and must be awaited where
+  they are written: their positions are claimed only if a database read says
+  so. Native transactions now also claim at construction, as described above,
+  while preserving their async-closure callbacks.
 
   **Upgrading renumbers work already in flight.** A workflow whose durable calls
   were polled in an order other than the one they are written in was recorded

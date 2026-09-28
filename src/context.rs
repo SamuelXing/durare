@@ -300,9 +300,9 @@ impl AuthContext {
 /// calls must claim their positions and be polled within that execution,
 /// including after a future returns `Pending`. A spawned task or another execution cannot use
 /// them and receives [`Error::DurableCallOutsideExecution`]. Metadata access
-/// does not require this scope. Use `join!` for concurrent durable calls, child
-/// workflows for independent durable work, and ordinary tasks inside a step
-/// for work covered by that step's checkpoint.
+/// does not require this scope. Use `join!` for independent checkpointed steps,
+/// child workflows for independent multi-step work, and ordinary tasks inside a
+/// step for work covered by that step's checkpoint.
 #[derive(Clone)]
 pub struct DurableContext {
     workflow_id: String,
@@ -1052,16 +1052,7 @@ impl DurableContext {
         })
     }
 
-    /// Run a durable transaction on a **separate application database**.
-    ///
-    /// **Await this where it is written.** The body is an `AsyncFn`, and stable
-    /// Rust has no way to say that the future it returns is `Send` — the bound
-    /// needs `async_fn_traits`, which is unstable — so this call cannot hand back
-    /// the [`PendingStep`] every other durable call does, and takes its position
-    /// when it is first polled rather than when it is built. Building one
-    /// alongside other durable calls and awaiting them out of order would give it
-    /// a position one of them already holds. A transaction is a sequence point by
-    /// nature, so this is a rule to keep rather than a cost to pay.
+    /// Run a durable transaction with a native SQL connection.
     ///
     /// [`transaction`](Self::transaction) commits the body's SQL and the step
     /// checkpoint together — but only in the *system* database. This runs the
@@ -1089,6 +1080,16 @@ impl DurableContext {
     /// `AsyncFnOnce`): a serialization conflict or deadlock restarts it on a
     /// fresh transaction, so write `async move |conn|` and clone anything the
     /// body consumes rather than moving it out of a capture.
+    ///
+    /// The call claims its checkpoint position immediately, before its future
+    /// is polled, just like [`step`](Self::step). Construct calls in a repeatable
+    /// order; awaiting them in another order does not change their positions.
+    /// Dropping an unpolled call still spends its position but does no database
+    /// work. Scope violations are refused at construction without taking a
+    /// position, and the execution scope is checked again on every poll.
+    /// Constructing several calls is allowed, but native transactions within
+    /// one workflow must be awaited sequentially: overlapping execution is
+    /// refused by the transaction guard.
     ///
     /// If your application tables live **in the system database**, get the
     /// data source from the provider instead —
@@ -1140,14 +1141,19 @@ impl DurableContext {
     /// # Ok(()) }
     /// ```
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn transaction_on<DS, T, F>(&self, ds: &DS, name: &str, f: F) -> Result<T>
+    #[must_use = "await this durable call to run it or observe a construction error"]
+    pub fn transaction_on<'ctx, 'ds, DS, T, F>(
+        &'ctx self,
+        ds: &'ds DS,
+        name: &str,
+        f: F,
+    ) -> impl Future<Output = Result<T>> + use<'ctx, 'ds, DS, T, F>
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
         F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
         self.transaction_on_with(ds, TransactionOptions::new(name), f)
-            .await
     }
 
     /// Like [`transaction_on`](Self::transaction_on) but with explicit
@@ -1158,30 +1164,39 @@ impl DurableContext {
     /// budget is exhausted the failure is recorded in **both** databases, so a
     /// replay returns the same error without re-running the body.
     #[cfg(any(feature = "postgres", feature = "sqlite"))]
-    pub async fn transaction_on_with<DS, T, F>(
-        &self,
-        ds: &DS,
+    #[must_use = "await this durable call to run it or observe a construction error"]
+    pub fn transaction_on_with<'ctx, 'ds, DS, T, F>(
+        &'ctx self,
+        ds: &'ds DS,
         opts: TransactionOptions,
         f: F,
-    ) -> Result<T>
+    ) -> impl Future<Output = Result<T>> + use<'ctx, 'ds, DS, T, F>
     where
         DS: crate::datasource::DataSource,
         T: Serialize + DeserializeOwned + 'static,
         F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
-        let seq = self.claim_position("transaction")?.seq();
-        poll_in_execution(&self.execution, "transaction", async {
-            let _guard = self.begin_transaction()?;
+        let position = self.claim_position("transaction");
+        // Keep the concrete future: boxing into PendingStep would require a
+        // Send bound on AsyncFn's returned future that stable Rust cannot name.
+        // Its Send implementation is instead inferred for each callback, as
+        // with an async fn. Only identity is eager; database work stays lazy.
+        async move {
+            let position = position?;
+            let seq = position.seq();
+            poll_in_execution(&position.execution, "transaction", async {
+                let _guard = self.begin_transaction()?;
 
-            let span = self.op_span("transaction", &opts.name, seq);
-            let out = self
-                .run_datasource_transaction(ds, &opts, &f, seq)
-                .instrument(span.clone())
-                .await;
-            span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
-            out
-        })
-        .await
+                let span = self.op_span("transaction", &opts.name, seq);
+                let out = self
+                    .run_datasource_transaction(ds, &opts, &f, seq)
+                    .instrument(span.clone())
+                    .await;
+                span.record("otel.status_code", if out.is_ok() { "OK" } else { "ERROR" });
+                out
+            })
+            .await
+        }
     }
 
     /// The two-commit protocol behind [`transaction_on`](Self::transaction_on):
@@ -2770,8 +2785,9 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
 /// not run yet.
 ///
 /// Most durable calls on a [`DurableContext`] return this type. Native
-/// transactions and patches remain async exceptions. The difference from an
-/// `async fn` is where the call's **position** is
+/// transactions return an opaque future with the same construction-time
+/// position rule; patches allocate conditionally when polled. The difference
+/// from an `async fn` is where the call's **position** is
 /// decided. A position is the `(workflow_id, seq)` key its checkpoint is written
 /// under, and a replay finds the recorded result only by asking for the same
 /// position the first run asked for.
@@ -2784,11 +2800,12 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
 /// differently, and two calls that share a name then replay each other's
 /// results with nothing to notice it.
 ///
-/// Building one of these takes the position immediately, in the order the calls
-/// appear in the source, so what fixes a position is a rule the language
-/// guarantees rather than one the runtime happens to follow. Awaiting is then
-/// only *running* something that already knows where it stands, and
-/// `tokio::join!` over several is ordinary code.
+/// Building one of these takes the position immediately. When calls are
+/// constructed in a repeatable order, polling order cannot change their
+/// positions. Awaiting is then
+/// only *running* something that already knows where it stands. Independent
+/// non-transaction steps may be awaited together with `tokio::join!`; this
+/// does not permit overlapping transactions or dynamic multi-step branches.
 ///
 /// A call can only run in its originating workflow execution and outside any
 /// step, transaction, or select body. This is checked on every poll, including
@@ -2801,7 +2818,7 @@ async fn run_step_catching<T>(name: &str, body: impl Future<Output = Result<T>>)
 /// awaiting still moves the counter. That is deterministic — a replay runs the
 /// same code and skips the same position — but it is no longer the no-op it
 /// would be for a plain future, which is why this is `#[must_use]`.
-#[must_use = "this durable call has already claimed its position; awaiting it is what runs it"]
+#[must_use = "await this durable call to run it or observe a construction error"]
 pub struct PendingStep<'a, T> {
     running: Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>,
     /// The claimed position and its execution, or `None` for a call refused
