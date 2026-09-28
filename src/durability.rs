@@ -193,7 +193,12 @@
 //! This also drops sibling durable-call futures whose bodies may have finished
 //! while their checkpoint writes are in flight. Recovery reuses a committed row;
 //! if that write did not commit, the sibling's effect may repeat. Cancellation
-//! does not strengthen the plain-step at-least-once guarantee.
+//! does not strengthen the plain-step at-least-once guarantee. A running step
+//! can opt in to [`StepCtx::cancelled`], which reads the persisted `CANCELLED`
+//! status even when another process requested it. The body must stop its own
+//! work and return [`Error::Cancelled`]; that control error is not checkpointed
+//! or retried, so an explicit resume can re-run the unfinished step. The signal
+//! cannot undo a side effect already completed.
 //!
 //! Workflow-body panics have zero automatic body retries. Their ownership CAS
 //! parks the row in `MAX_RECOVERY_ATTEMPTS_EXCEEDED`, releasing queue capacity;

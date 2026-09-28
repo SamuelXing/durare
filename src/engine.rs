@@ -3456,7 +3456,7 @@ fn run_to_completion(
         Err(Error::WorkflowConflict(_)) => {
             adopt_recorded_outcome(&provider, &id, &recorder).await
         }
-        Err(Error::Cancelled(_)) => {
+        Err(e) if e.is_cancellation_for(&id) => {
             // The workflow stopped because it was cancelled; reflect that
             // terminal state rather than ERROR.
             let landed = write_terminal_status(&provider, &id, STATUS_CANCELLED, None, Some("cancelled")).await?;
