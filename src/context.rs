@@ -182,24 +182,59 @@ pub type RetryPredicate = Arc<dyn Fn(&Error) -> bool + Send + Sync>;
 /// Replay serves a completed checkpoint without calling the body, so it does
 /// not create another `StepCtx` for that saved result.
 ///
-/// This value does not grant permission to make nested durable calls. It does
-/// not carry a cancellation token until a real workflow cancellation signal
-/// can be connected to the running body.
-#[derive(Clone, Debug)]
+/// This value does not grant permission to make nested durable calls.
 pub struct StepCtx {
     workflow_id: Arc<str>,
     step_id: i32,
     attempt: u32,
     max_attempts: u64,
+    // These are used only for a read while the step body runs. A caught body
+    // panic drops the future; it does not resume a partially-polled observer.
+    // Preserve StepCtx's existing unwind-safety auto traits for callers.
+    provider: AssertUnwindSafe<Arc<dyn StateProvider>>,
+    execution: AssertUnwindSafe<crate::execution::Execution>,
+}
+
+impl Clone for StepCtx {
+    fn clone(&self) -> Self {
+        Self {
+            workflow_id: self.workflow_id.clone(),
+            step_id: self.step_id,
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
+            provider: AssertUnwindSafe(self.provider.0.clone()),
+            execution: AssertUnwindSafe(self.execution.0.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for StepCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepCtx")
+            .field("workflow_id", &self.workflow_id)
+            .field("step_id", &self.step_id)
+            .field("attempt", &self.attempt)
+            .field("max_attempts", &self.max_attempts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StepCtx {
-    fn new(workflow_id: Arc<str>, step_id: i32, attempt: u32, max_attempts: u64) -> Self {
+    fn new(
+        workflow_id: Arc<str>,
+        step_id: i32,
+        attempt: u32,
+        max_attempts: u64,
+        provider: Arc<dyn StateProvider>,
+        execution: crate::execution::Execution,
+    ) -> Self {
         Self {
             workflow_id,
             step_id,
             attempt,
             max_attempts,
+            provider: AssertUnwindSafe(provider),
+            execution: AssertUnwindSafe(execution),
         }
     }
 
@@ -222,6 +257,59 @@ impl StepCtx {
     /// A `retry_if` predicate may stop the step before this many attempts run.
     pub fn max_attempts(&self) -> u64 {
         self.max_attempts
+    }
+
+    /// Wait until this workflow's stored status becomes `CANCELLED`.
+    ///
+    /// This is an opt-in, fallible observation of persisted state, so it also
+    /// sees cancellation from another process or a standalone [`crate::Client`].
+    /// It checks immediately and then polls storage about twice per second
+    /// while this future is awaited. Drop it to stop polling. A successful
+    /// return means cancellation was observed; it does not undo an external
+    /// effect already performed by the body. A storage read failure interrupts
+    /// the execution for recovery.
+    ///
+    /// Cancellation is cooperative. Use this future in `select!` with the
+    /// body's work, stop that work, and return [`Error::Cancelled`]. That control
+    /// error is neither retried nor checkpointed, allowing an explicit resume
+    /// to run the unfinished step again. A workflow deadline still drops the
+    /// body at its deadline; this method does not provide a cleanup grace period.
+    /// Resume only after the previous execution has stopped. A cancel followed
+    /// immediately by resume can change the stored status before this polling
+    /// future observes it.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Error, Result, StepCtx};
+    /// # async fn send_request() -> Result<()> { Ok(()) }
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// ctx.step("request", |step: StepCtx| async move {
+    ///     tokio::select! {
+    ///         result = send_request() => result,
+    ///         signal = step.cancelled() => {
+    ///             signal?;
+    ///             Err(Error::Cancelled(step.workflow_id().to_owned()))
+    ///         }
+    ///     }
+    /// }).await
+    /// # }
+    /// ```
+    pub async fn cancelled(&self) -> Result<()> {
+        loop {
+            self.execution.0.check()?;
+            let status = self
+                .execution
+                .0
+                .storage(self.provider.0.get_workflow_status(&self.workflow_id).await)?
+                .ok_or_else(|| {
+                    self.execution
+                        .0
+                        .interrupt(Error::nonexistent_workflow(self.workflow_id.as_ref()))
+                })?;
+            if status.status == STATUS_CANCELLED {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// A stable, fixed-length key for one external effect in this step.
@@ -988,10 +1076,10 @@ impl DurableContext {
     /// # Errors
     ///
     /// Returns the error `f` failed with — checkpointed, so a replay yields the
-    /// same error without re-running `f`. Also [`Error::Cancelled`] if the
-    /// workflow was cancelled, and [`Error::UnexpectedStep`] if a replay finds a
-    /// different operation recorded at this step position (a non-deterministic
-    /// workflow function).
+    /// same error without re-running `f`. [`Error::Cancelled`] is a control
+    /// outcome: it stops without checkpointing this step, so an explicit resume
+    /// can run it again. Also [`Error::UnexpectedStep`] if a replay finds a
+    /// different operation recorded at this step position.
     pub fn step<'a, T, F, Args>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
@@ -1011,12 +1099,22 @@ impl DurableContext {
                 match run_step_catching(
                     &name,
                     in_body(|| {
-                        f.call(|| StepCtx::new(Arc::from(self.workflow_id.as_str()), seq, 0, 1))
+                        f.call(|| {
+                            StepCtx::new(
+                                Arc::from(self.workflow_id.as_str()),
+                                seq,
+                                0,
+                                1,
+                                self.provider.clone(),
+                                self.execution.clone(),
+                            )
+                        })
                     }),
                 )
                 .await
                 {
                     Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
+                    Err(e @ Error::Cancelled(_)) => Err(e),
                     Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
                 }
             }
@@ -1060,8 +1158,9 @@ impl DurableContext {
     /// Returns the **final** error once retries are exhausted (or immediately,
     /// if a [`retry_if`](StepOptions::retry_if) predicate rejects it) —
     /// checkpointed, so a replay yields the same error without re-running.
-    /// Also [`Error::Cancelled`] if the workflow was cancelled, and
-    /// [`Error::UnexpectedStep`] on a divergent replay.
+    /// [`Error::Cancelled`] bypasses retry and checkpointing, allowing an
+    /// explicit resume to run the unfinished step. Also [`Error::UnexpectedStep`]
+    /// on a divergent replay.
     pub fn step_with<'a, T, F, Args>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
@@ -1081,6 +1180,7 @@ impl DurableContext {
                 let started = chrono::Utc::now().timestamp_millis();
                 match self.run_with_retries(seq, &opts, &mut f).await {
                     Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
+                    Err(e @ Error::Cancelled(_)) => Err(e),
                     Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
                 }
             }
@@ -2158,7 +2258,14 @@ impl DurableContext {
                         let id = workflow_id
                             .get_or_insert_with(|| Arc::from(self.workflow_id.as_str()))
                             .clone();
-                        StepCtx::new(id, seq, attempt, max_attempts)
+                        StepCtx::new(
+                            id,
+                            seq,
+                            attempt,
+                            max_attempts,
+                            self.provider.clone(),
+                            self.execution.clone(),
+                        )
                     })
                 }),
             )
@@ -2168,6 +2275,7 @@ impl DurableContext {
                 Err(error @ (Error::RecoveryRequired(_) | Error::ObservationFailed(_))) => {
                     return Err(self.execution.body_error(error));
                 }
+                Err(error @ Error::Cancelled(_)) => return Err(error),
                 Err(error) if error.is_scope_violation() => return Err(error),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,

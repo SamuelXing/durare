@@ -7,6 +7,56 @@ use std::sync::{
 use std::time::Duration;
 
 #[tokio::test]
+async fn cancellation_observer_storage_fault_interrupts_without_recording_a_step() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::Read));
+    provider.arm([]);
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (body_entered, body_gate, body_attempts) =
+        (entered.clone(), gate.clone(), attempts.clone());
+    engine.register("watch", move |ctx: DurableContext, _: ()| {
+        let (entered, gate, attempts) = (
+            body_entered.clone(),
+            body_gate.clone(),
+            body_attempts.clone(),
+        );
+        async move {
+            ctx.step("watch", move |step: StepCtx| async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    entered.notify_one();
+                    gate.acquire().await.unwrap().forget();
+                    step.cancelled().await?;
+                }
+                Ok::<_, Error>(())
+            })
+            .await
+        }
+    });
+    let handle = engine
+        .start::<_, ()>("watch", (), WorkflowOptions::with_id("cancel-read-fault"))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("body did not start");
+    provider.arm([Fault::StatusRead]);
+    gate.add_permits(1);
+    let result = tokio::time::timeout(Duration::from_secs(2), handle.result())
+        .await
+        .expect("storage fault did not interrupt the execution");
+    assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+    let rows = inner.get_workflow_steps("cancel-read-fault").await?;
+    assert!(
+        rows.iter().all(|row| row.error.is_none()),
+        "an observation fault must not become a step's business failure"
+    );
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn parent_recovery_observes_an_existing_running_child() -> Result<()> {
     let inner = Arc::new(InMemoryProvider::new());
     let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::ChildRecordBefore));

@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StepCtx::cancelled().await` lets a running step observe a persisted workflow
+  cancellation, including one requested by another client or process. The
+  observation polls only while awaited and reports storage faults for recovery.
+  This does not undo external effects or add a grace period to workflow deadlines.
+
 - `StepCtx::idempotency_key_for(effect)` derives a fixed-length, versioned key
   from the workflow id, claimed step position, and an application-chosen effect
   label. It remains stable across retry and recovery; a fork uses its new
@@ -25,6 +30,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   external effects; those contracts remain separate.
 
 ### Changed
+
+- **Breaking: `Error::Cancelled` returned by a plain step body is a control
+  outcome.** `step` no longer checkpoints it and `step_with` no longer retries
+  it. Once the previous execution stops, an explicit resume can run the
+  unfinished step. Previously, a failed-step checkpoint could make cancellation
+  replay forever after resume. Existing histories with a recorded cancellation
+  failure still replay that saved failure; this change applies to fresh step
+  executions.
 
 - **Breaking: native transactions claim checkpoint positions when called.**
   `transaction_on` and `transaction_on_with` now keep their construction-order
