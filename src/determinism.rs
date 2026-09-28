@@ -36,7 +36,7 @@
 //! | iterating a `HashMap` / `HashSet` | order is randomized per map, so a loop issues its steps in a different order | a `BTreeMap` / `BTreeSet`, or sort the keys first |
 //! | `tokio::spawn` of durable work | refused with `DurableCallOutsideExecution` before executing the call | build independent steps in the workflow and use `join!`; use child workflows for multi-step work |
 //! | a durable call built *after* an `.await` inside a `join!` branch | `join!` rotates which branch it polls first, so which branch reaches its call first is decided by wake-up order, not by the source | build independent steps first and join those prebuilt calls; use child workflows for multi-step branches |
-//! | `tokio::select!` over prebuilt steps | positions are fixed, but which branch wins turns on real timing, so a replay can pick a different branch and leave the loser's position with nothing recorded at it | race plain async work with [`ctx.select`](DurableContext::select), which records the winner, or give each branch a child workflow |
+//! | `tokio::select!` over prebuilt steps or child results | positions may be fixed, but which branch wins turns on real timing; child workflows isolate their own histories but do not record the parent's choice | race plain async work with [`ctx.select`](DurableContext::select), which records its result; a choice among child outcomes also needs the selected child's identity recorded |
 //! | `FuturesUnordered`, `buffer_unordered`, any "handle them as they finish" loop | the first run observes real I/O latencies; a replay serves every step from its checkpoint at once, so the completion order — and anything derived from it, including which durable call is reached next — differs | collect prebuilt independent steps with `join!` and process results in input order, or give each multi-step branch a child workflow |
 //! | reading env vars, config, files, or the network | the value can differ between runs | read it inside a [step](DurableContext::step) |
 //! | side effects in `Drop` | drop timing and order are not part of the recorded log | put the effect in a step |
@@ -112,6 +112,40 @@
 //!
 //! What a body may do is call ordinary functions, as deeply as it likes. The
 //! rule is about durable calls, not about nesting code.
+//!
+//! # Concurrent work and recorded choices
+//!
+//! For fixed independent steps, construct both calls before `join!` and use
+//! its input-ordered results. Tokio may poll them in either order, but neither
+//! position depends on polling order:
+//!
+//! ```no_run
+//! # use durare::{DurableContext, Error, Result};
+//! # async fn workflow(ctx: DurableContext) -> Result<(i32, i32)> {
+//! let a = ctx.step("A", || async { Ok::<_, Error>(1) });
+//! let b = ctx.step("B", || async { Ok::<_, Error>(2) });
+//! let (a, b) = tokio::join!(a, b);
+//! Ok((a?, b?))
+//! # }
+//! ```
+//!
+//! If each branch must issue more durable calls after an await, give each
+//! branch a registered child workflow with its own history. Awaiting both
+//! child results with `join!` preserves input order. **Racing** those results
+//! is different: a raw `tokio::select!` exposes whichever child happens to
+//! finish first, but does not checkpoint that choice in the parent. On replay
+//! both children may already be complete, so a different one can win.
+//!
+//! A durable choice must record the selected child's id along with the value
+//! the parent will use, before the parent makes its next durable call. An
+//! ordinary [`step`](DurableContext::step) or
+//! [`select`](DurableContext::select) can record a successful application's
+//! choice. The built-in `select` records `(index, value)`; an index alone is
+//! not a child identity, because reordering candidates can make it refer to
+//! another child on replay. Neither primitive currently validates the full
+//! candidate set or defines a general child-error, cancellation, and retention
+//! protocol. A child workflow's own checkpoints do not supply that parent
+//! decision record.
 //!
 //! # Checking a change before you ship it
 //!
