@@ -2173,6 +2173,32 @@ impl DurableContext {
         }
     }
 
+    /// Persist one step outcome and return the provider's canonical result.
+    /// A concurrent writer may have committed a different result first.
+    async fn write_step_outcome<T: DeserializeOwned>(
+        &self,
+        seq: i32,
+        name: &str,
+        value: Value,
+        encoded_error: Option<&str>,
+        started_at_ms: Option<i64>,
+    ) -> Result<T> {
+        let outcome = self
+            .provider
+            .record_step_result(
+                &self.workflow_id,
+                seq,
+                name,
+                value,
+                encoded_error,
+                started_at_ms,
+                Some(self.runtime.executor_id()),
+            )
+            .await
+            .map_err(|error| self.execution.record(error))?;
+        self.recorded_value(outcome)
+    }
+
     /// Durably record a successful `result` under `(workflow_id, seq)` and return
     /// the canonical stored value (a racing writer's outcome wins if there is one
     /// — including a recorded failure, which is then surfaced as an error).
@@ -2195,20 +2221,8 @@ impl DurableContext {
                     .await;
             }
         };
-        let outcome = self
-            .provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                name,
-                json,
-                None,
-                started_at_ms,
-                Some(self.runtime.executor_id()),
-            )
+        self.write_step_outcome(seq, name, json, None, started_at_ms)
             .await
-            .map_err(|error| self.execution.record(error))?;
-        self.recorded_value(outcome)
     }
 
     /// Durably record a failed step's error under `(workflow_id, seq)`. Returns
@@ -2224,20 +2238,8 @@ impl DurableContext {
         self.execution.check()?;
         let encoded = crate::serialize::encode_error(&self.provider.serializer(), &err)
             .map_err(|error| self.execution.record(error))?;
-        let outcome = self
-            .provider
-            .record_step_result(
-                &self.workflow_id,
-                seq,
-                name,
-                Value::Null,
-                Some(&encoded),
-                started_at_ms,
-                Some(self.runtime.executor_id()),
-            )
+        self.write_step_outcome(seq, name, Value::Null, Some(&encoded), started_at_ms)
             .await
-            .map_err(|error| self.execution.record(error))?;
-        self.recorded_value(outcome)
     }
 
     /// Drive `f` to success, retrying on error per `opts` with exponential
