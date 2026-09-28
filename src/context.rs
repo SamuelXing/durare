@@ -1076,10 +1076,11 @@ impl DurableContext {
     /// # Errors
     ///
     /// Returns the error `f` failed with — checkpointed, so a replay yields the
-    /// same error without re-running `f`. [`Error::Cancelled`] is a control
-    /// outcome: it stops without checkpointing this step, so an explicit resume
-    /// can run it again. Also [`Error::UnexpectedStep`] if a replay finds a
-    /// different operation recorded at this step position.
+    /// same error without re-running `f`. [`Error::Cancelled`] naming this
+    /// workflow is a control outcome: it stops without checkpointing this step,
+    /// so an explicit resume can run it again. Cancellation of another workflow
+    /// is checkpointed as this step's failure. Also [`Error::UnexpectedStep`]
+    /// if a replay finds a different operation recorded at this step position.
     pub fn step<'a, T, F, Args>(&'a self, name: &str, f: F) -> PendingStep<'a, T>
     where
         T: Serialize + DeserializeOwned + Send + 'a,
@@ -1114,7 +1115,7 @@ impl DurableContext {
                 .await
                 {
                     Ok(v) => self.checkpoint(seq, &name, v, Some(started)).await,
-                    Err(e @ Error::Cancelled(_)) => Err(e),
+                    Err(e) if e.is_cancellation_for(&self.workflow_id) => Err(e),
                     Err(e) => self.record_failure(seq, &name, e, Some(started)).await,
                 }
             }
@@ -1158,8 +1159,9 @@ impl DurableContext {
     /// Returns the **final** error once retries are exhausted (or immediately,
     /// if a [`retry_if`](StepOptions::retry_if) predicate rejects it) —
     /// checkpointed, so a replay yields the same error without re-running.
-    /// [`Error::Cancelled`] bypasses retry and checkpointing, allowing an
-    /// explicit resume to run the unfinished step. Also [`Error::UnexpectedStep`]
+    /// [`Error::Cancelled`] for this workflow bypasses retry and checkpointing,
+    /// allowing an explicit resume to run the unfinished step. Cancellation of
+    /// another workflow is handled as a step failure. Also [`Error::UnexpectedStep`]
     /// on a divergent replay.
     pub fn step_with<'a, T, F, Args>(&'a self, opts: StepOptions, mut f: F) -> PendingStep<'a, T>
     where
@@ -1180,7 +1182,7 @@ impl DurableContext {
                 let started = chrono::Utc::now().timestamp_millis();
                 match self.run_with_retries(seq, &opts, &mut f).await {
                     Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
-                    Err(e @ Error::Cancelled(_)) => Err(e),
+                    Err(e) if e.is_cancellation_for(&self.workflow_id) => Err(e),
                     Err(e) => self.record_failure(seq, &opts.name, e, Some(started)).await,
                 }
             }
@@ -2275,7 +2277,7 @@ impl DurableContext {
                 Err(error @ (Error::RecoveryRequired(_) | Error::ObservationFailed(_))) => {
                     return Err(self.execution.body_error(error));
                 }
-                Err(error @ Error::Cancelled(_)) => return Err(error),
+                Err(error) if error.is_cancellation_for(&self.workflow_id) => return Err(error),
                 Err(error) if error.is_scope_violation() => return Err(error),
                 Err(e) => {
                     // A predicate that rejects the error stops retries immediately,

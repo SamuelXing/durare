@@ -31,13 +31,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Breaking: `Error::Cancelled` returned by a plain step body is a control
-  outcome.** `step` no longer checkpoints it and `step_with` no longer retries
-  it. Once the previous execution stops, an explicit resume can run the
-  unfinished step. Previously, a failed-step checkpoint could make cancellation
-  replay forever after resume. Existing histories with a recorded cancellation
-  failure still replay that saved failure; this change applies to fresh step
-  executions.
+- **Breaking: `Error::Cancelled` naming the current workflow is control flow
+  when returned by a step body.** `step` no longer checkpoints it and
+  `step_with` no longer retries it. Once the previous execution stops, an
+  explicit resume can run the unfinished step. Previously, a failed-step
+  checkpoint could make cancellation replay forever after resume. Existing
+  histories with a recorded cancellation failure still replay that saved
+  failure; this change applies to fresh step executions. A cancelled child
+  workflow awaited inside a step remains a recorded step failure; it does not
+  cancel the parent workflow.
 
 - **Breaking: native transactions claim checkpoint positions when called.**
   `transaction_on` and `transaction_on_with` now keep their construction-order

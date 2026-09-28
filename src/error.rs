@@ -299,6 +299,11 @@ pub enum Error {
 }
 
 impl Error {
+    /// A cancellation is a control outcome only for the workflow it names.
+    pub(crate) fn is_cancellation_for(&self, workflow_id: &str) -> bool {
+        matches!(self, Self::Cancelled(id) if id == workflow_id)
+    }
+
     /// Retrying a body cannot repair an invalid durable-call scope. Use the
     /// stable code so a re-raised recorded diagnostic follows the same policy.
     pub(crate) fn is_scope_violation(&self) -> bool {
