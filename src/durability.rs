@@ -278,8 +278,10 @@
 //! two systems, and a crash can land between them. On replay the step re-runs.
 //! So a step's side effect is **at-least-once**: exactly-once except when a
 //! crash splits that window. Where it matters, make the effect idempotent —
-//! pass a key derived from [`ctx.workflow_id()`](DurableContext::workflow_id)
-//! and the step name to the downstream API, so the retry is recognized.
+//! pass [`StepCtx::idempotency_key_for`] to a downstream API that atomically
+//! deduplicates by that key, so a retry is recognized. A step name alone is
+//! insufficient: the same name can occur more than once in one workflow.
+//! Use a stable effect label for each external operation inside the step.
 //!
 //! Two cases are already closed for you:
 //!
@@ -320,4 +322,4 @@
 //! [child starts]: DurableContext::start_workflow
 
 #[allow(unused_imports)]
-use crate::{DurableContext, DurableEngine, Error};
+use crate::{DurableContext, DurableEngine, Error, StepCtx};
