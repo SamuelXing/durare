@@ -131,10 +131,14 @@
 //!
 //! If each branch must issue more durable calls after an await, give each
 //! branch a registered child workflow with its own history. Awaiting both
-//! child results with `join!` preserves input order. **Racing** those results
-//! is different: a raw `tokio::select!` exposes whichever child happens to
-//! finish first, but does not checkpoint that choice in the parent. On replay
-//! both children may already be complete, so a different one can win.
+//! child results with `join!` preserves input order. A child's handle observes
+//! its current status; `result()` does not checkpoint that observation in the
+//! parent. A child that is later resumed or whose status is deleted may not
+//! produce the same observation on parent replay. Record a value the parent
+//! must retain before relying on it for later durable decisions. **Racing**
+//! those results is different: a raw `tokio::select!` exposes whichever child
+//! happens to finish first, but does not checkpoint that choice in the parent.
+//! On replay both children may already be complete, so a different one can win.
 //!
 //! A durable choice must record the selected child's id along with the value
 //! the parent will use, before the parent makes its next durable call. An
@@ -245,9 +249,11 @@
 //! need is concrete, a global is the whole story.
 //!
 //! [`examples/dependencies.rs`](https://github.com/SamuelXing/durare/blob/main/examples/dependencies.rs)
-//! runs this pattern end to end: a dependency wired through a global, read inside
-//! a step, and — because the step's result is checkpointed — invoked exactly once
-//! even across a replay.
+//! runs this pattern end to end: a dependency wired through a global and read
+//! inside a step. Once the step's checkpoint commits, replay returns its
+//! recorded result without calling the dependency again. A crash between an
+//! external effect and that commit can repeat the effect; see the
+//! [at-least-once window](crate::durability#the-at-least-once-window).
 
 #[allow(unused_imports)]
 use crate::{Divergence, DurableContext, DurableEngine, Error, ReplayReport, Serializer};
