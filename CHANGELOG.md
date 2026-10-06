@@ -6,6 +6,65 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-06
+
+Durable semantics now survive code motion or fail loudly. Every durable call
+claims its checkpoint position where it is written, not where it is first
+polled, so `tokio::select!` and out-of-order awaits can no longer renumber a
+workflow's history; a call built inside another operation's body, awaited
+across a body boundary, or made from a task that is not its workflow's
+execution is refused before any position is spent. A checkpoint that cannot be
+written stops the execution for recovery instead of being recorded as a
+business failure, and a failure that was recorded replays as the same error it
+was. Steps get their own identity (`StepCtx`: position, attempt, a stable
+idempotency key, cancellation observation), `transaction_on` takes an async
+closure, and `DurableEngine::verify_replay` checks an edited workflow body
+against its recorded histories before deploy. `durare-macros` moves to `0.2.0`:
+`#[durare::step]` and `#[durare::transaction]` emit the same `PendingStep`
+shape as the hand-written calls and are required by this release.
+
+Compatibility (the 0.x minor lane allows breaking changes), grouped by what to
+change:
+
+- *Call sites.* `ctx.step(..).await?` and every other durable call read as
+  before. `transaction_on` / `transaction_on_with` bodies become
+  `async |conn| { .. }`; a `|conn| Box::pin(..)` body still compiles but may
+  need `|conn: &mut sqlx::PgConnection|` to infer. `ctx.transaction` is
+  unchanged. A durable call built and never awaited now spends its position,
+  and `PendingStep` is `#[must_use]`; step bodies and outputs need `Send`.
+- *Exhaustive matches on `Error` / `ErrorCode`.* New variants:
+  `RecoveryRequired`, `ObservationFailed`, `OutputSerialization`,
+  `DurableCallOutsideExecution`, `NestedDurableCall`, `DurableCallCrossedBody`,
+  `WorkflowConflict`, `ReplayDiverged`, and `Recorded` (which carries a replayed
+  driver, migration or JSON error with its `ErrorCode` and `is_*`
+  classifications). `Error::Cancelled` returned from a step body is control
+  flow: not checkpointed, not retried.
+- *Histories written by 0.4.x.* A workflow whose durable calls were polled in
+  a different order than written was numbered under the old rule; recovering it
+  under 0.5.0 fails with `UnexpectedStep` or, for same-named calls, replays the
+  wrong result. This cannot happen by default — `app_version` hashes the
+  executable — but a deployment that pins `app_version` must drain in-flight
+  workflows first or move the pin. Fieldless portable `DBOSNotAuthorizedError`
+  records now decode as `Error::NotAuthorized` rather than `Error::Portable`;
+  review workflows that branch on authorization failures before replaying old
+  histories.
+- *Rollout order.* This release records new persisted error kinds (the
+  versioned recorded-error envelope, `DurableCallOutsideExecution`,
+  `RecoveryRequired` settlement). Upgrade every reader before any writer: a
+  0.4.x binary cannot decode a record a 0.5.0 binary wrote.
+- *Custom `StateProvider`s.* `set_workflow_status` returns `Result<bool>`,
+  `bump_recovery_attempts` is replaced by `claim_for_recovery`,
+  `record_step_result` takes an `executor_id`, and the provider error contract
+  (documented on the trait) separates storage faults from semantic rejections;
+  a provider that flattens its own commit or insert failure into a recorded
+  error defeats recovery.
+- *Operations.* Interrupted executions recover automatically after backoff
+  under an ownership CAS; `max_recovery_attempts` now counts those claims as
+  well as process loss, and exhausted or panicked workflows park in
+  `MAX_RECOVERY_ATTEMPTS_EXCEEDED` for explicit resume. Retention collects on
+  `completed_at` rather than `created_at`, so long-running workflows keep more
+  history than before.
+
 ### Added
 
 - A `design` guide explaining execution context, call positions, and the
@@ -32,6 +91,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   migration. A completed checkpoint still skips the body on replay. This
   metadata does not include a cancellation token or promise exactly-once
   external effects; those contracts remain separate.
+
+- `DurableEngine::verify_replay(workflow_id)`: re-runs a recorded workflow's
+  function against the code in this binary and reports the first durable
+  operation the two disagree about — the pre-deploy check for an edited
+  workflow body, which the runs still in flight would otherwise discover at
+  recovery time. The pass runs nothing: every operation is served from its
+  record and the first one with nothing recorded at its position stops the
+  run, so no body executes and nothing is written. It returns a `ReplayReport`
+  (`recorded` / `matched` counts, whether the history is `complete`) with the
+  first `Divergence`: `Mismatch`, `Extra`, `Missing` or `Failed`; `passes()`
+  and `into_result()` make it a `?` in a test or a CI step, the latter with the
+  new `Error::ReplayDiverged` variant (`ErrorCode::ReplayDiverged`), so a CI
+  caller can tell a divergence from a failure in its own code. A workflow that
+  is still running has a history that legitimately ends early, so `Extra` is
+  never reported against one. What the check cannot see is in the determinism
+  guide.
+
+- `PostgresProvider::from_pool_with_schema(pool, schema)`: a caller-owned
+  pool with the system tables pinned to an explicit schema — created on
+  `init`, every system query schema-qualified — closing the hole where
+  `from_pool` providers depended entirely on the pool's `search_path`
+  configuration for where durable state lives. The caller's pool is left
+  untouched: a transactional step's user SQL still resolves unqualified
+  names per the pool's own configuration.
 
 ### Changed
 
@@ -263,32 +346,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   data source, so it has no such boundary. The asymmetry is documented in the
   `transactions` guide's "Which transaction API?" table; use
   `#[durare::transaction]` to skip the scaffolding on the `Tx` path.
-
-### Added
-
-- `DurableEngine::verify_replay(workflow_id)`: re-runs a recorded workflow's
-  function against the code in this binary and reports the first durable
-  operation the two disagree about — the pre-deploy check for an edited
-  workflow body, which the runs still in flight would otherwise discover at
-  recovery time. The pass runs nothing: every operation is served from its
-  record and the first one with nothing recorded at its position stops the
-  run, so no body executes and nothing is written. It returns a `ReplayReport`
-  (`recorded` / `matched` counts, whether the history is `complete`) with the
-  first `Divergence`: `Mismatch`, `Extra`, `Missing` or `Failed`; `passes()`
-  and `into_result()` make it a `?` in a test or a CI step, the latter with the
-  new `Error::ReplayDiverged` variant (`ErrorCode::ReplayDiverged`), so a CI
-  caller can tell a divergence from a failure in its own code. A workflow that
-  is still running has a history that legitimately ends early, so `Extra` is
-  never reported against one. What the check cannot see is in the determinism
-  guide.
-
-- `PostgresProvider::from_pool_with_schema(pool, schema)`: a caller-owned
-  pool with the system tables pinned to an explicit schema — created on
-  `init`, every system query schema-qualified — closing the hole where
-  `from_pool` providers depended entirely on the pool's `search_path`
-  configuration for where durable state lives. The caller's pool is left
-  untouched: a transactional step's user SQL still resolves unqualified
-  names per the pool's own configuration.
 
 ### Fixed
 
@@ -900,7 +957,8 @@ workflows after a crash.
   tables the DBOS Transact SDKs use, plus a portable cross-SDK serialization
   envelope.
 
-[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/SamuelXing/durare/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/SamuelXing/durare/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/SamuelXing/durare/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/SamuelXing/durare/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/SamuelXing/durare/compare/v0.3.2...v0.3.3
