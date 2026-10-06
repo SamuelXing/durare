@@ -31,9 +31,15 @@ exclude = [
 # dependency below), so `cargo <cmd> -p durare-macros` works from the root and
 # the two crates share one lockfile. Publishing stays two steps: durare-macros
 # first, then durare.
+#
+# Resolver 3 selects dependency versions against `rust-version`: a release of a
+# dependency that raises its own floor above ours is passed over for the newest
+# one that still builds on our MSRV, instead of being picked and failing there.
+# The lockfile is not committed, so without this every fresh resolve tracks the
+# latest release and the MSRV job breaks whenever any dependency moves first.
 [workspace]
 members = ["durare-macros"]
-resolver = "2"
+resolver = "3"
 
 [features]
 # Backends are on by default. Enable just one to drop the other's driver: a
