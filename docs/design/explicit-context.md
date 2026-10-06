@@ -1,154 +1,137 @@
 # Explicit context
 
-**Status:** accepted, 2026-10-06. In effect from durare 0.5.0.
+**Status:** accepted for durare 0.5.0.
 
-A workflow in durare takes a `DurableContext` argument, and every durable
-call is a method on it. This note records why, what the alternative was, and
-what was set aside along the way. The user-facing statement of the result is
-the `design` guide in the crate documentation; this is the derivation.
+Workflows take a `DurableContext` argument. Helpers that perform durable work
+receive that context from the workflow. This note explains the choice and the
+replay rules it supports. The crate's `design` guide lists the guarantees,
+checks, and tests.
 
-## The question the design has to answer
+## Call positions
 
-Durable execution replays a workflow function to recover it. Replay is sound
-only if each durable call finds the record the first run wrote for it, which
-means each call has to be matched to a stable position in the workflow's
-history. The design question is where that position comes from, and what
-happens to it when the code around the call changes.
+Recovery re-runs a workflow function. Each durable operation must find the
+same position in the history that it used on the first run. Otherwise it can
+read another operation's result or repeat an effect that was already recorded.
 
-Three concrete questions, about any one call:
+Before 0.5.0, steps claimed positions when first polled. Awaiting two calls in
+reverse order reversed their positions, and `tokio::select!` could change them
+through randomized poll order. A crash-and-recover test with two same-named
+steps reproduced the failure: the first call returned the second call's value.
 
-1. On recovery, does it re-run or return its record?
-2. If the effect happened but the record did not commit, can it repeat?
-3. If the call moves — into a helper, a `join!` branch, a `select`, a spawned
-   task — do the first two answers still hold?
+Most durable calls now return `PendingStep` and reserve a position during
+construction. Poll order does not affect that position. Dropping a successfully
+built call leaves its position spent, which is why `PendingStep` is `#[must_use]`.
 
-The third is the design question. Code moves constantly. An API where moving
-a line can silently change whether it is recorded makes every refactor a
-correctness review, and the failure mode is the worst kind: a step that runs
-twice, or returns a neighbour's result, with no error.
+Patches are an exception. `patch` and `deprecate_patch` inspect recorded history
+before deciding whether to consume a position, so they allocate when polled.
+Await them sequentially, before constructing subsequent durable calls.
 
-The principle adopted: **durable semantics survive code motion, or the SDK
-refuses early and loudly.** Every rule in the `design` guide's contract table
-is an application of it, and the table's "enforced by" column is the honest
-accounting of how far the principle reaches — compiler, runtime check, or the
-programmer's own discipline.
+Construction order must also be reproducible. Prebuilt calls work with `join!`.
+Calls constructed after an await in concurrent branches can still be ordered
+by timing. The SDK does not check that case; use child workflows when each
+branch needs its own sequence of durable operations.
 
-## Where the position comes from
+These rules preserve replay when a step moves into a helper or a concurrent
+block with a fixed construction order. Moving it into another operation's body
+or a spawned task requires additional checks.
 
-Before 0.5.0 a durable call was an `async fn`, and it claimed its position
-when first polled. Poll order is decided by the combinator, not the code:
-`tokio::select!` randomises it, and awaiting two calls in the reverse of the
-order they were written reversed their positions. Two same-named steps that
-swapped positions replayed each other's output, silently. Measured on a real
-crash-and-recover run, the recovered workflow returned the second step's value
-for the first.
+## Operation bodies
 
-The fix was mechanical once seen: claim the position in the call's synchronous
-prelude, so it follows source order, which a replay reproduces by
-construction. The call became a plain `fn` returning a `PendingStep` future.
-Call sites did not change. What did change is that building a call and
-dropping it spends a position — deterministic, since a replay does the same,
-but no longer a no-op, hence `#[must_use]`.
+A recorded step's body is skipped on replay. A durable call inside that body
+would consume a position on the first run that replay never consumes. Later
+operations would then read the wrong positions. Different operation names can
+expose this as `UnexpectedStep`; identical names can hide it.
 
-This settles question 3 for helpers, branches, and `join!`. It does not settle
-it for a body nested in a body, or for a task.
+We considered running nested steps as plain functions, without checkpoints.
+We chose to reject them because a `ctx.step` call should not lose its checkpoint
+when moved into another body. Rejecting this placement also leaves room to
+support it later with a defined replay contract.
 
-## Bodies
+A task-local marker identifies body execution during each poll. It is restored
+when the poll returns or panics. A flag held for the body's entire lifetime
+would incorrectly reject sibling calls while the body was waiting at an await.
 
-A step's body does not run on a replay; the step is served from its record. So
-a durable call made *inside* a body claimed a position on the first run that
-no replay claims again, and every later call shifted onto it. Under a
-different name this surfaced as `UnexpectedStep` somewhere unrelated; under
-the same name nothing detected it. The `select` documentation asked callers
-to keep this rule themselves, and nothing checked it.
+For `PendingStep`, construction inside a body returns `NestedDurableCall`
+without claiming a position. Polling a prebuilt call inside a body returns
+`DurableCallCrossedBody`; the position reserved at construction remains spent.
+The poll check runs every time, including after a future has already yielded.
+Async patch calls also check placement when polled.
 
-Two designs were considered. **Degrade**: a nested call runs as a plain
-function, unrecorded. **Refuse**: a nested call is an error at the call. The
-first is what an ambient-context model naturally does (see below). durare
-refuses, for two reasons. Refuse-then-allow is a relaxation that can ship
-later without breaking anyone; allow-then-refuse is not. And a degraded call
-is the quiet kind of change the principle rules out: the programmer wrote
-`ctx.step` and got a function call.
+Prebuilt calls carried into bodies are rejected too. Allowing them inside a
+`select` branch would let a losing branch write a separate checkpoint, although
+`select` records the race as one operation. Supporting that would require rules
+for replaying losers and assigning retry and cancellation ownership.
 
-The mechanism is a task-local marker set around a body's *poll*, not held for
-its lifetime. A lifetime flag cannot tell a body that is running from one that
-is parked at an await, and would refuse a sibling call the workflow makes
-while a step waits. The marker is restored however the poll ends, including a
-panic. Two checks follow from it: at construction (`NestedDurableCall`, no
-position spent) and on every poll of a `PendingStep` (`DurableCallCrossedBody`,
-because a call built outside and moved inside after its first poll has
-already claimed). A call *carried into* a body is refused for now: allowing
-it would let a losing `select` branch write a row, which falsifies `select`'s
-"plain work, one checkpoint" contract, and the retry and cancellation
-ownership between the two layers has no answer yet. That is a separate
-proposal if anyone needs it.
+## Spawned tasks
 
-## Tasks
+A cloned `DurableContext` shares its workflow's position counter. If a spawned
+task could use it, the order of positions would depend on task scheduling.
+A prototype without the check produced nine position orderings in forty runs.
 
-A `DurableContext` moved into `tokio::spawn` shares the workflow's position
-counter with a task whose timing is not part of the history. Forty identical
-runs produced nine distinct position orderings. The call is refused at
-construction and on every poll (`DurableCallOutsideExecution`), before any
-position is claimed, because the context carries its execution's identity and
-the spawned task is not that execution. Plain work inside a step, or a child
-workflow, are the supported shapes.
+The context carries an execution identity, checked against a task-local scope
+around workflow construction and polling. A spawned task does not inherit
+that scope. Constructing a `PendingStep` there returns
+`DurableCallOutsideExecution` without claiming a position. Polling a call moved
+there also fails, but retains any position it already reserved. Calls check
+placement on every poll, before polling their body or provider work; work done
+on an earlier valid poll is not undone.
 
-This check is at runtime. A compile-time version exists and was prototyped:
-make the context a borrow, `&DurableContext`, so a `'static` task cannot hold
-it. That is deferred, not rejected. The runtime refusal already makes the
-mistake loud; the compile-time upgrade costs every capturing registration
-closure a `Box::pin` wrapper, returns `transaction_on` to the boxed-future
-shape 0.4.x removed, and forbids holding the context across an await inside a
-transaction callback. The evaluation measured a 94-file migration for one
-hazard that is already caught. It can be revisited with evidence that runtime
-refusal is not enough.
+For concurrent durable work, use prebuilt calls or child workflows. Plain
+spawned work inside a step remains allowed.
 
-## The alternative: ambient context
+We also prototyped a borrowed context, `&DurableContext`, to prevent a `'static`
+task from capturing it. That change is deferred. The prototype required
+`Box::pin` wrappers for capturing registration closures, restored the boxed
+future form of `transaction_on`, and prevented holding the context across an
+await in a transaction callback. The evaluated migration touched 94 files.
+The runtime check already catches the placement error, so those API changes
+need a stronger justification.
 
-The other way to supply a call's execution identity is ambient state — a
-`tokio::task_local` the call looks up — so a workflow is a plain `async fn`
-with no context parameter. DBOS's own Rust SDK takes this route. The two
-models answer the three questions identically for inline calls, helpers and
-`join!`. They diverge at the boundaries:
+## Comparison with DBOS's Rust SDK
 
-| Situation | Explicit (durare) | Ambient |
+DBOS's Rust SDK supplies context through task-local state, so workflow functions
+need no context parameter. For steps called inline, through helpers, or as
+prebuilt `join!` arguments, both SDKs reserve positions at construction.
+Their step placement rules differ:
+
+| Step placement | durare | DBOS Rust SDK |
 |---|---|---|
-| Call inside a spawned task | Refused at the call. | The task-local is empty; the call runs as a plain function, unrecorded, and re-runs on every replay. |
-| Call inside another body | Refused at the call. | Runs as a plain function, no position. |
-| Call built in one scope, polled in another | Refused on poll (`DurableCallCrossedBody`). | Refused on poll (`StepBuiltElsewhere`). |
+| Constructed inside a spawned task | Rejected without claiming a position. | Runs without a checkpoint. It repeats if the code spawning it runs again. |
+| Constructed inside another step's body | Rejected without claiming a position. | Runs as plain work within the enclosing body. |
+| Constructed in the workflow body, then polled inside a step body | `DurableCallCrossedBody`; the reserved position stays spent. | `StepBuiltElsewhere`. |
+| Constructed in one execution, then polled in another | `DurableCallOutsideExecution`. | `StepBuiltElsewhere`. |
 
-The ambient model's spawn behaviour is documented and tested there as the
-intended default, on the reasoning that spawned work is not part of the
-workflow. That is a coherent position. durare's is that the programmer wrote
-a durable call and should get one or an error — the same sentence as the
-principle. The cost is the parameter.
+This comparison is specific to step calls, verified against upstream commit
+[`7937413`](https://github.com/dbos-inc/dbos-transact-rust/tree/7937413).
+Other operations have different rules: upstream `set_event` and `recv`, for
+example, reject calls outside a workflow or inside a step. Running a step
+without a checkpoint is an SDK policy, not a requirement of task-local context.
 
-## Set aside
+The practical tradeoff is a context parameter for workflows and durable helpers
+in exchange for rejecting step placements that would silently lose a checkpoint.
+Both models still require deterministic workflow control flow.
 
-- **Generic error channel.** An `Error<E>` with a typed application variant
-  was considered and kept off. The durable boundary serialises every error;
-  a typed `E` has to round-trip through that, and the common path — a
-  recorded failure replaying as the same failure — is served by the versioned
-  envelope without it. Model expected business outcomes as values the step
-  returns. Reopen if a user needs typed errors *across* the boundary.
-- **Narrowing `select` to durable branches.** `select` stays a race over plain
-  work recorded as one step. A durable race over `PendingStep`s would have a
-  different contract (every branch recorded; losers' rows reconciled on
-  replay) and would need a different name.
-- **A step without its own identity.** A step body needs its own position to
-  build an idempotency key, and it cannot get it by capturing the outer
-  context — the outer counter has moved on. So `StepCtx` exists, carrying the
-  position, the attempt, and `idempotency_key_for`, with the key defined as
-  `(workflow_id, step_id)` and never the attempt. This did not require the
-  borrowed context; it shipped on the owned one.
+## Other decisions
 
-## Consequences
+- **Typed application errors.** A generic `Error<E>` was considered. Errors
+  crossing a durable boundary must serialize and replay with the same
+  classification; the versioned error envelope handles that today. Expected
+  business outcomes can be modeled as return values. A typed error channel
+  remains an option if users need it across that boundary.
+- **Racing durable branches.** `select` races plain futures and records one
+  winner. Racing `PendingStep` calls would require separate branch checkpoints
+  and a replay policy for losing branches. That would be a separate operation.
+- **Step identity.** `StepCtx` exposes the step's reserved position and attempt.
+  Capturing the outer context cannot supply that position because its counter
+  may already have advanced. `idempotency_key_for` derives a key from the
+  workflow id, step id, and effect label. The attempt is excluded so retries
+  reuse the key.
 
-Every workflow and helper takes a `DurableContext`. Durable work does not
-happen on spawned tasks. A nested durable call, a crossed body, or a
-detached context is an error at the call with no position spent, and the
-error is a recordable programming error that bypasses retry. A built call is
-`#[must_use]`. One case remains the programmer's: two calls whose
-construction order depends on an await between them. The contract table in
-the `design` guide names it as documented-only rather than implying a
-mechanism.
+## Caller rules
+
+Placement errors are recordable programming errors and bypass retry. A refused
+constructor spends no position; a refusal while polling does not release an
+already reserved position. These checks prevent nested and detached calls,
+but do not validate all workflow ordering. Keep construction order fixed,
+await patches sequentially, and record timing-dependent choices before using
+them to decide later durable work. See the `determinism` guide for examples.

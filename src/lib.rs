@@ -126,9 +126,9 @@
 //! [`messaging`], [`transactions`], [`observability`] (spans, probes, and
 //! metrics), [`operations`] (connections, pool sizing, and the resource
 //! model), and [`security`] (trust boundaries, exposure, and the SQL and
-//! secret-handling invariants). [`design`] is the one to read when a rule
-//! seems arbitrary: the principle the API is built on, the contract it
-//! produces, and what enforces each line of it. Twelve runnable, end-to-end examples live in
+//! secret-handling invariants). [`design`] explains execution context, call
+//! positions, and the checks and caller rules that keep replay consistent.
+//! Twelve runnable, end-to-end examples live in
 //! [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
 //!
 //! # Cargo features
