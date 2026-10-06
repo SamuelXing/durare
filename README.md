@@ -20,33 +20,33 @@ See [DBOS compatibility](#dbos-compatibility). Full API documentation is on
 
 DBOS also publishes an official Rust SDK,
 [`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust). `durare` is
-community-maintained. The two share the schema and interoperate on one
-database; where they differ is the context model, and the difference is a
-deliberate one.
+community-maintained. Both use the DBOS system schema.
 
 ## Why the context is explicit
 
-A durable call has to know which workflow execution it belongs to. The
-official SDK supplies that ambiently, through task-local state, so a workflow
-is a plain `async fn`. `durare` passes it as an argument, `DurableContext`, so
-the call carries its execution with it wherever the code moves. The principle
-behind the choice: **durable semantics survive code motion, or the SDK refuses
-early and loudly.** For a step inline, in a helper, or under `join!`, the two
-models behave identically. They diverge at the boundaries:
+Workflows in `durare` take a `DurableContext` argument and pass it to helpers
+that perform durable work. The official Rust SDK supplies context through
+task-local state instead, so its workflow functions need no context parameter.
 
-| A durable call made… | `durare` | ambient context |
+For step calls inline, in helpers, or as prebuilt `join!` arguments, both SDKs
+reserve positions at construction. Their placement rules differ:
+
+| Step placement | `durare` | Official Rust SDK |
 |---|---|---|
-| inside a spawned task | refused at the call, no position claimed | runs as a plain function, unrecorded, and re-runs on every replay |
-| inside another step's body | refused at the call | runs as a plain function |
-| built in one scope, polled in another | refused on poll | refused on poll |
+| constructed inside a spawned task | rejected without claiming a position | runs without a checkpoint; repeats if the spawning code runs again |
+| constructed inside another step's body | rejected without claiming a position | runs as plain work within the enclosing body |
+| constructed in the workflow body, then polled inside a step body | rejected on poll; the reserved position stays spent | rejected on poll |
 
-The cost is the parameter on every workflow and helper. What it buys is that
-every durable call either does what its name says or returns an error naming
-why — never a silent change in what gets recorded. The
-[`design` guide](https://docs.rs/durare/latest/durare/design/) lays out the
-contract that follows, one row per guarantee with what enforces it; the
+These are step rules. Other upstream operations, such as `set_event` and
+`recv`, reject calls outside a workflow or inside a step.
+
+The context parameter lets `durare` reject step placements that would lose a
+checkpoint. Construction order still has to be deterministic, and patches
+must be awaited sequentially. The
+[`design` guide](https://docs.rs/durare/latest/durare/design/) covers the checks
+and caller rules; the
 [design note](https://github.com/SamuelXing/durare/blob/main/docs/design/explicit-context.md)
-records the derivation and the alternatives set aside.
+explains the alternatives considered.
 
 ```rust
 use std::time::Duration;
