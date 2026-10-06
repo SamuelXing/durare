@@ -20,7 +20,33 @@ See [DBOS compatibility](#dbos-compatibility). Full API documentation is on
 
 DBOS also publishes an official Rust SDK,
 [`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust). `durare` is
-community-maintained.
+community-maintained. The two share the schema and interoperate on one
+database; where they differ is the context model, and the difference is a
+deliberate one.
+
+## Why the context is explicit
+
+A durable call has to know which workflow execution it belongs to. The
+official SDK supplies that ambiently, through task-local state, so a workflow
+is a plain `async fn`. `durare` passes it as an argument, `DurableContext`, so
+the call carries its execution with it wherever the code moves. The principle
+behind the choice: **durable semantics survive code motion, or the SDK refuses
+early and loudly.** For a step inline, in a helper, or under `join!`, the two
+models behave identically. They diverge at the boundaries:
+
+| A durable call made… | `durare` | ambient context |
+|---|---|---|
+| inside a spawned task | refused at the call, no position claimed | runs as a plain function, unrecorded, and re-runs on every replay |
+| inside another step's body | refused at the call | runs as a plain function |
+| built in one scope, polled in another | refused on poll | refused on poll |
+
+The cost is the parameter on every workflow and helper. What it buys is that
+every durable call either does what its name says or returns an error naming
+why — never a silent change in what gets recorded. The
+[`design` guide](https://docs.rs/durare/latest/durare/design/) lays out the
+contract that follows, one row per guarantee with what enforces it; the
+[design note](https://github.com/SamuelXing/durare/blob/main/docs/design/explicit-context.md)
+records the derivation and the alternatives set aside.
 
 ```rust
 use std::time::Duration;
