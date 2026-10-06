@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A `design` guide explaining execution context, call positions, and the
+  checks and caller rules that keep replay consistent. The companion
+  `docs/design/explicit-context.md` records the design decisions and alternatives.
+
 - `StepCtx::cancelled().await` lets a running step observe a persisted workflow
   cancellation, including one requested by another client or process. The
   observation polls only while awaited and reports storage faults for recovery.
