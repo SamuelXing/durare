@@ -8,6 +8,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A `design` guide: the principle the API is built on — durable semantics
+  survive code motion, or the SDK refuses early and loudly — and the contract
+  it produces, one row per guarantee with what enforces it (the compiler, a
+  check at the call, or the guide alone) and the test that pins it. With it,
+  `docs/design/explicit-context.md` records the derivation: why the context is
+  an argument rather than ambient state, what that costs, and the alternatives
+  set aside.
+
 - `StepCtx::cancelled().await` lets a running step observe a persisted workflow
   cancellation, including one requested by another client or process. The
   observation polls only while awaited and reports storage faults for recovery.

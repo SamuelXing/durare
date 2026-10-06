@@ -118,7 +118,7 @@
 //!
 //! # Guides
 //!
-//! Eight module-level guides explain the concepts in depth, `std`-style, each
+//! Nine module-level guides explain the concepts in depth, `std`-style, each
 //! with tested examples: start with [`durability`] (checkpoints, replay, and
 //! the determinism contract — read this first), then its companion
 //! [`determinism`] (the rules for writing a correct workflow body — deterministic
@@ -126,7 +126,9 @@
 //! [`messaging`], [`transactions`], [`observability`] (spans, probes, and
 //! metrics), [`operations`] (connections, pool sizing, and the resource
 //! model), and [`security`] (trust boundaries, exposure, and the SQL and
-//! secret-handling invariants). Twelve runnable, end-to-end examples live in
+//! secret-handling invariants). [`design`] is the one to read when a rule
+//! seems arbitrary: the principle the API is built on, the contract it
+//! produces, and what enforces each line of it. Twelve runnable, end-to-end examples live in
 //! [`examples/`](https://github.com/SamuelXing/durare/tree/main/examples).
 //!
 //! # Cargo features
@@ -167,6 +169,7 @@ compile_error!(
 // modules below; the guides re-export the relevant types with
 // `#[doc(no_inline)]` so every item's canonical documentation stays at the
 // crate root.
+pub mod design;
 pub mod determinism;
 pub mod durability;
 pub mod messaging;
