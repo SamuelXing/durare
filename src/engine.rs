@@ -2,10 +2,11 @@ use crate::context::{AuthContext, DurableContext};
 use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    is_terminal, DequeueRequest, ForkParams, ListFilter, RecoveryClaim, RecoveryClaimRequest,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
+    is_terminal, CancelOptions, DequeueRequest, ForkParams, ListFilter, RecoveryClaim,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use crate::replay::{History, ReplayReport, Verification};
@@ -2430,6 +2431,23 @@ impl DurableEngine {
         self.provider.cancel_workflow(id).await
     }
 
+    /// Cancel a workflow, optionally including all its descendants.
+    /// Completed workflows keep their outcomes; their unfinished descendants
+    /// are still cancelled when `options.cancel_children` is set, even if the
+    /// root row was deleted. Cancellation
+    /// is cooperative: a running body observes it at a durable boundary or via
+    /// [`crate::StepCtx::cancelled`]. Newly created descendants after the
+    /// cancellation snapshot are not included.
+    pub async fn cancel_workflow_with_options(
+        &self,
+        id: &str,
+        options: CancelOptions,
+    ) -> Result<()> {
+        self.provider
+            .cancel_workflows_with_options(&[id.to_owned()], options)
+            .await
+    }
+
     /// Resume a cancelled, parked or unfinished workflow whose previous execution
     /// has stopped. It is re-queued onto the internal queue and re-run from its
     /// checkpoints; the returned handle tracks it by polling. Requires a launched
@@ -2460,12 +2478,25 @@ impl DurableEngine {
         ))
     }
 
-    /// Cancel many workflows in one round-trip. Each that exists and is not
-    /// terminal is set `CANCELLED` and removed from its queue; missing or
-    /// already-terminal ids are silently skipped (no error). An empty slice is a
-    /// no-op.
+    /// Cancel many workflows in one round-trip. Missing, completed or
+    /// already-cancelled ids are skipped; parked workflows may be cancelled.
+    /// Each changed row is removed from its queue. An empty slice is a no-op.
     pub async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
         self.provider.cancel_workflows(ids).await
+    }
+
+    /// Cancel a set of workflows with the same descendant option as
+    /// [`cancel_workflow_with_options`](Self::cancel_workflow_with_options).
+    /// Missing rows are skipped, but their existing descendants are still
+    /// followed when requested. An empty set is a no-op.
+    pub async fn cancel_workflows_with_options(
+        &self,
+        ids: &[String],
+        options: CancelOptions,
+    ) -> Result<()> {
+        self.provider
+            .cancel_workflows_with_options(ids, options)
+            .await
     }
 
     /// Resume many workflows in one round-trip. Each that exists and is not

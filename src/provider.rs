@@ -1180,6 +1180,15 @@ pub(crate) fn col_bool(m: &Map<String, Value>, key: &str) -> Option<bool> {
     m.get(key).and_then(Value::as_bool)
 }
 
+/// Options for cancelling one or more workflows.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CancelOptions {
+    /// Also cancel all existing descendants linked by `parent_workflow_id`.
+    /// Completed ancestors are traversed without changing their outcome.
+    /// Workflows created after the provider's traversal are not included.
+    pub cancel_children: bool,
+}
+
 /// Parameters for [`StateProvider::fork_workflow`]. The fork is created
 /// directly `ENQUEUED` on `queue_name`, in the same transaction that copies the
 /// original's checkpoints, so a fork is never observable half-made.
@@ -1630,9 +1639,10 @@ pub trait StateProvider: Send + Sync {
     /// at least one dimension and selects at least one aggregate before calling.
     async fn get_step_aggregates(&self, query: &StepAggregateQuery) -> Result<Vec<StepAggregate>>;
 
-    /// Cancel a workflow: if it is not already terminal, set it `CANCELLED`,
-    /// stamp `completed_at`, and clear queue assignment / dedup so it leaves any
-    /// queue. A running workflow stops cooperatively at its next step.
+    /// Set a workflow `CANCELLED`, stamp `completed_at`, and clear its queue
+    /// assignment / dedup. `SUCCESS`, `ERROR` and already `CANCELLED` rows are
+    /// skipped; parked workflows may be cancelled. A running workflow stops
+    /// cooperatively at its next step.
     async fn cancel_workflow(&self, id: &str) -> Result<()>;
 
     /// Resume a `CANCELLED` (or otherwise non-terminal) workflow by returning it
@@ -1648,11 +1658,49 @@ pub trait StateProvider: Send + Sync {
     /// re-running it locally. A no-op if the id is gone.
     async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()>;
 
-    /// Cancel many workflows in one round-trip. Each existing, non-terminal id is
-    /// set `CANCELLED` (same effect as [`cancel_workflow`](Self::cancel_workflow));
-    /// missing or already-terminal ids are silently skipped (no error). An empty
-    /// slice is a no-op.
+    /// Cancel many workflows in one round-trip. Each existing id other than
+    /// `SUCCESS`, `ERROR` or `CANCELLED` is set `CANCELLED`, with the same effect
+    /// as [`cancel_workflow`](Self::cancel_workflow). Missing, completed or
+    /// already-cancelled ids are skipped (no error). An empty slice is a no-op.
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()>;
+
+    /// Cancel workflows, optionally including their transitive descendants.
+    /// `SUCCESS`, `ERROR` and `CANCELLED` rows keep their recorded outcomes;
+    /// traversal still follows their children, including children whose root
+    /// row has been deleted. Missing rows themselves are skipped; empty input
+    /// is a no-op. A parked workflow may be cancelled.
+    ///
+    /// Built-in providers collect descendants and update them in one SQL
+    /// statement or under one memory lock. This compatibility default discovers
+    /// descendants through reads before calling `cancel_workflows`; custom
+    /// providers may override it to provide an atomic snapshot/update.
+    async fn cancel_workflows_with_options(
+        &self,
+        ids: &[String],
+        options: CancelOptions,
+    ) -> Result<()> {
+        if !options.cancel_children || ids.is_empty() {
+            return self.cancel_workflows(ids).await;
+        }
+        let mut targets: std::collections::HashSet<String> = ids.iter().cloned().collect();
+        let mut frontier: Vec<String> = targets.iter().cloned().collect();
+        while !frontier.is_empty() {
+            let children = self
+                .list_workflows(&ListFilter {
+                    parent_workflow_ids: frontier,
+                    load_input: false,
+                    load_output: false,
+                    ..Default::default()
+                })
+                .await?;
+            frontier = children
+                .into_iter()
+                .filter_map(|row| targets.insert(row.id.clone()).then_some(row.id))
+                .collect();
+        }
+        self.cancel_workflows(&targets.into_iter().collect::<Vec<_>>())
+            .await
+    }
 
     /// Resume many workflows in one round-trip. Each existing id that is not
     /// `SUCCESS`/`ERROR` returns to `PENDING` (same effect as

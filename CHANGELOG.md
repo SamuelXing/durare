@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `CancelOptions` and engine/client cancellation methods with options can cancel
+  all existing descendants, including through completed ancestors. The conductor
+  now honors `cancel_children`. Existing cancellation calls remain root-only.
+  In-memory cancellation now matches SQL providers for parked workflows.
+
 ### Fixed
 
 - Forked workflows retain their source's searchable attributes on all backends.

@@ -1,10 +1,10 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, ChangeWait,
-    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
-    RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
+    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
+    ChangeWait, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo,
+    NotificationInsert, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
     WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS,
     NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
@@ -1949,14 +1949,42 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        self.cancel_workflows_with_options(ids, CancelOptions::default())
+            .await
+    }
+
+    async fn cancel_workflows_with_options(
+        &self,
+        ids: &[String],
+        options: CancelOptions,
+    ) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
+        let targets = if options.cancel_children {
+            format!(
+                "WITH RECURSIVE targets AS (
+                SELECT workflow_uuid FROM {table}
+                    WHERE workflow_uuid = ANY($1) OR parent_workflow_id = ANY($1)
+                UNION
+                SELECT w.workflow_uuid FROM {table} w
+                    JOIN targets t ON w.parent_workflow_id = t.workflow_uuid
+            ) ",
+                table = self.tables.workflow_status
+            )
+        } else {
+            String::new()
+        };
+        let predicate = if options.cancel_children {
+            "workflow_uuid IN (SELECT workflow_uuid FROM targets)"
+        } else {
+            "workflow_uuid = ANY($1)"
+        };
         sqlx::query(&format!(
-            "UPDATE {workflow_status}
+            "{targets}UPDATE {workflow_status}
              SET status = $2, completed_at = $3, started_at_epoch_ms = NULL,
                  queue_name = NULL, deduplication_id = NULL, updated_at = $3
-             WHERE workflow_uuid = ANY($1) AND status NOT IN ($4, $5, $6)",
+             WHERE {predicate} AND status NOT IN ($4, $5, $6)",
             workflow_status = self.tables.workflow_status
         ))
         .bind(ids)
