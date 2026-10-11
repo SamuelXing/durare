@@ -1478,11 +1478,11 @@ impl StateProvider for SqliteProvider {
                   application_version, application_id, forked_from, recovery_attempts,
                   authenticated_user, assumed_role, authenticated_roles,
                   class_name, config_name, queue_name, queue_partition_key,
-                  created_at, updated_at)
+                  attributes, created_at, updated_at)
              SELECT ?, ?, name, inputs, serialization, '',
                     COALESCE(?, application_version), application_id, ?, 0,
                     authenticated_user, assumed_role, authenticated_roles,
-                    class_name, config_name, ?, ?, ?, ?
+                    class_name, config_name, ?, ?, attributes, ?, ?
              FROM workflow_status WHERE workflow_uuid = ?",
         )
         .bind(new_id)

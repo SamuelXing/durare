@@ -453,6 +453,25 @@ pub struct WorkflowOptions {
 }
 
 impl WorkflowOptions {
+    pub(crate) fn validate_deduplication(&self, queue: Option<&str>) -> Result<()> {
+        if self.partition_key.is_some() && self.dedup_id.is_some() {
+            return Err(Error::app(
+                "partition key and deduplication id cannot be used together",
+            ));
+        }
+        if self.dedup_policy != DeduplicationPolicy::Reject {
+            if self.dedup_id.is_none() {
+                return Err(Error::app(
+                    "a deduplication policy requires a deduplication id",
+                ));
+            }
+            if queue.is_none_or(str::is_empty) {
+                return Err(Error::app("a deduplication policy requires a queue name"));
+            }
+        }
+        Ok(())
+    }
+
     /// Convenience: options that only pin the workflow id.
     pub fn with_id(id: impl Into<String>) -> Self {
         Self {
@@ -1893,7 +1912,8 @@ impl DurableEngine {
     /// [`Error::UnknownWorkflow`] if `name` is not registered;
     /// [`Error::QueueDeduplicated`] if `opts.dedup_id` collides with an active
     /// workflow on the queue (under the default `Reject` policy); an
-    /// application error if a deduplication policy is set without a
+    /// application error if a non-default deduplication policy is set without
+    /// a deduplication id or queue, or a partition key is combined with a
     /// deduplication id.
     pub async fn start<I, O>(
         &self,
@@ -1913,11 +1933,7 @@ impl DurableEngine {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let input_json = serde_json::to_value(input)?;
-        if opts.dedup_policy != DeduplicationPolicy::Reject && opts.dedup_id.is_none() {
-            return Err(Error::app(
-                "a deduplication policy requires a deduplication id",
-            ));
-        }
+        opts.validate_deduplication(opts.queue.as_deref())?;
         let handler = rt
             .workflows
             .get(&registry_key(name, opts.config_name.as_deref()))
@@ -2987,6 +3003,7 @@ impl Runtime {
         parent_id: Option<&str>,
         auth: &AuthContext,
     ) -> Result<(WorkflowStatus, bool, bool)> {
+        opts.validate_deduplication(opts.queue.as_deref())?;
         let queued = opts.queue.is_some();
         if let Some(q) = &opts.queue {
             if !self.queues.contains_key(q) {

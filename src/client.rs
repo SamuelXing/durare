@@ -119,16 +119,7 @@ impl Client {
         if workflow_name.is_empty() {
             return Err(Error::app("workflow name is required"));
         }
-        if opts.partition_key.is_some() && opts.dedup_id.is_some() {
-            return Err(Error::app(
-                "partition key and deduplication id cannot be used together",
-            ));
-        }
-        if opts.dedup_policy != DeduplicationPolicy::Reject && opts.dedup_id.is_none() {
-            return Err(Error::app(
-                "a deduplication policy requires a deduplication id",
-            ));
-        }
+        opts.validate_deduplication(Some(queue_name))?;
 
         let id = opts
             .workflow_id

@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Forked workflows retain their source's searchable attributes on all backends.
+- Admin queue rate limits use lowercase `limit`/`period` keys and seconds,
+  including fractional seconds, matching the reference SDK wire format.
+- Engine and client enqueue paths share deduplication validation. Partition
+  keys cannot be combined with deduplication ids, and a non-default collision
+  policy requires both a deduplication id and a queue.
+
 ## [0.5.0] - 2026-10-06
 
 Durable semantics now survive code motion or fail loudly. Every durable call

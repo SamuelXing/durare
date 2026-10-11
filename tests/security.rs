@@ -42,6 +42,8 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
     let schedule_name = format!("sched{EVIL}");
     let direct_id = format!("direct{EVIL}");
     let queued_id = format!("queued{EVIL}");
+    let dedup_queue = format!("dedup-queue{EVIL}");
+    let dedup_run_id = format!("dedup-run{EVIL}");
     let user = format!("user{EVIL}");
     let version = format!("ver{EVIL}");
 
@@ -74,7 +76,8 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
         });
     }
     engine.register_queue(WorkflowQueue::new(&queue_name).partitioned());
-    engine.listen_queues([queue_name.clone()]);
+    engine.register_queue(WorkflowQueue::new(&dedup_queue));
+    engine.listen_queues([queue_name.clone(), dedup_queue.clone()]);
     engine.launch().await?;
 
     // Direct run: hostile workflow id, authenticated user, role, app version.
@@ -97,7 +100,7 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
         .await?;
     assert_eq!(handle.await?, EVIL, "message round-trips verbatim");
 
-    // Queued run: hostile queue name, dedup id, and partition key drive the
+    // Partitioned run: hostile queue name and partition key drive the
     // dispatcher's counting/claiming SQL with hostile binds.
     let queued = engine
         .start::<(), String>(
@@ -106,7 +109,6 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
             WorkflowOptions {
                 workflow_id: Some(queued_id.clone()),
                 queue: Some(queue_name.clone()),
-                dedup_id: Some(format!("dedup{EVIL}")),
                 partition_key: Some(format!("part{EVIL}")),
                 ..Default::default()
             },
@@ -114,6 +116,23 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
         .await?;
     engine.send(&queued_id, EVIL.to_string(), &topic).await?;
     assert_eq!(queued.await?, EVIL);
+
+    // Deduplication and partition keys are incompatible. Exercise the hostile
+    // deduplication bind separately rather than weakening either SQL probe.
+    let deduplicated = engine
+        .start::<(), String>(
+            &wf_name,
+            (),
+            WorkflowOptions {
+                workflow_id: Some(dedup_run_id.clone()),
+                queue: Some(dedup_queue),
+                dedup_id: Some(format!("dedup{EVIL}")),
+                ..Default::default()
+            },
+        )
+        .await?;
+    engine.send(&dedup_run_id, EVIL.to_string(), &topic).await?;
+    assert_eq!(deduplicated.await?, EVIL);
 
     // Event and stream values written under hostile keys read back verbatim.
     let event: Option<String> = engine
@@ -178,16 +197,16 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
     assert_eq!(hit.len(), 1);
     assert_eq!(hit[0].id, direct_id);
 
-    // The system tables survived the whole sweep: both runs are readable and
+    // The system tables survived the whole sweep: all three runs are readable and
     // terminal. (Had any input reached SQL text, the DROP would have landed or
     // a statement would have broken on the quotes long before this.)
     let survivors = engine
         .list_workflows(&ListFilter {
-            workflow_ids: vec![direct_id.clone(), queued_id.clone()],
+            workflow_ids: vec![direct_id.clone(), queued_id.clone(), dedup_run_id],
             ..Default::default()
         })
         .await?;
-    assert_eq!(survivors.len(), 2, "workflow_status intact");
+    assert_eq!(survivors.len(), 3, "workflow_status intact");
 
     engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())

@@ -484,8 +484,8 @@ fn to_queue_metadata(q: &WorkflowQueue) -> Value {
         "concurrency": q.global_concurrency,
         "priorityEnabled": q.priority_enabled,
         "rateLimit": q.rate_limit.as_ref().map(|r| json!({
-            "Limit": r.limit,
-            "Period": r.period.as_nanos() as i64,
+            "limit": r.limit,
+            "period": r.period.as_secs_f64(),
         })),
         "maxTasksPerIteration": q.max_tasks_per_iteration,
         "partitionQueue": q.partitioned,
