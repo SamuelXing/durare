@@ -989,6 +989,7 @@ impl StateProvider for InMemoryProvider {
         forked.authenticated_roles = original.authenticated_roles.clone();
         forked.class_name = original.class_name.clone();
         forked.config_name = original.config_name.clone();
+        forked.attributes = original.attributes.clone();
         forked.queue_name = Some(params.queue_name.clone());
         forked.queue_partition_key = params.partition_key.clone();
         g.workflows.insert(new_id.to_string(), forked);

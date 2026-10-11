@@ -274,3 +274,31 @@ async fn admin_garbage_collect_endpoint_deletes_history() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn queue_rate_limit_metadata_uses_lowercase_keys_and_seconds() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register_queue(durare::WorkflowQueue::new("limited").rate_limiter(
+        durare::RateLimiter {
+            limit: 100,
+            period: Duration::from_millis(1500),
+        },
+    ));
+    engine.register_queue(durare::WorkflowQueue::new("unlimited"));
+    let engine = Arc::new(engine);
+    engine.launch().await?;
+    let admin = AdminServer::start(engine.clone(), 0).await?;
+    let (status, body) = http(admin.port(), "GET", "/dbos-workflow-queues-metadata", None).await;
+    assert_eq!(status, 200);
+    let queues: serde_json::Value = serde_json::from_str(&body)?;
+    let rows = queues.as_array().unwrap();
+    let limited = rows.iter().find(|q| q["name"] == "limited").unwrap();
+    assert_eq!(
+        limited["rateLimit"],
+        serde_json::json!({"limit": 100, "period": 1.5})
+    );
+    assert!(rows.iter().find(|q| q["name"] == "unlimited").unwrap()["rateLimit"].is_null());
+    admin.shutdown(Duration::from_secs(2)).await?;
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

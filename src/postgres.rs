@@ -2138,11 +2138,11 @@ impl StateProvider for PostgresProvider {
                   application_version, application_id, forked_from, recovery_attempts,
                   authenticated_user, assumed_role, authenticated_roles,
                   class_name, config_name, queue_name, queue_partition_key,
-                  created_at, updated_at)
+                  attributes, created_at, updated_at)
              SELECT $1, $2, name, inputs, serialization, '',
                     COALESCE($3, application_version), application_id, $4, 0,
                     authenticated_user, assumed_role, authenticated_roles,
-                    class_name, config_name, $5, $6, $7, $7
+                    class_name, config_name, $5, $6, attributes, $7, $7
              FROM {workflow_status} WHERE workflow_uuid = $4",
             workflow_status = self.tables.workflow_status
         ))
