@@ -1260,69 +1260,55 @@ async fn pg_client_debounces() -> Result<()> {
         eprintln!("skipping pg_client_debounces: DATABASE_URL unset");
         return Ok(());
     };
-    let wf = format!("notify-{}", uuid::Uuid::new_v4());
-    let key = format!("k-{}", uuid::Uuid::new_v4());
-    // Pin a unique app version on both the engine and the client. The debouncer
-    // rides the shared internal queue, and dequeue gates on application version
-    // (`= mine OR ''`): a client-enqueued collector stamped '' can be claimed by
-    // ANY concurrently-launched test engine, which has `_dbos_debouncer` but not
-    // this test's uuid-scoped target — the collector errors and the test hangs.
-    // Version-pinning scopes the collector to this test's engine alone.
-    let ver = format!("v-{}", uuid::Uuid::new_v4());
+    let (admin, url, dbname) = common::hermetic_pg_db(&url, "client_debounce").await;
+    let result = async {
+        let wf = format!("notify-{}", uuid::Uuid::new_v4());
+        let key = format!("k-{}", uuid::Uuid::new_v4());
+        // Pin a unique app version on both the engine and the client. The debouncer
+        // rides the shared internal queue, and dequeue gates on application version
+        // (`= mine OR ''`): a client-enqueued collector stamped '' can be claimed by
+        // ANY concurrently-launched test engine, which has `_dbos_debouncer` but not
+        // this test's uuid-scoped target — the collector errors and the test hangs.
+        // Version-pinning scopes the collector to this test's engine alone.
+        let ver = format!("v-{}", uuid::Uuid::new_v4());
 
-    let provider = Arc::new(PostgresProvider::connect(&url).await?);
-    let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
-    engine.register(&wf, |_ctx: DurableContext, msg: String| async move {
-        Ok::<_, Error>(msg)
-    });
-    engine.launch().await?;
+        let provider = Arc::new(PostgresProvider::connect(&url).await?);
+        let mut engine = DurableEngine::new_with_version(provider.clone(), &ver).await?;
+        engine.register(&wf, |_ctx: DurableContext, msg: String| async move {
+            Ok::<_, Error>(msg)
+        });
+        engine.launch().await?;
 
-    let client = Client::new(provider.clone()).with_app_version(&ver);
-    // The window must dwarf any scheduler stall on a loaded CI runner: if a
-    // later call's message reaches the collector only after the window fires,
-    // the dedup slot is already free and the debouncer *correctly* starts a
-    // fresh collector under a fresh target id — "new burst" semantics — and
-    // the same-id assertions below fail. 300ms flaked on a busy 2-vCPU runner.
-    let delay = Duration::from_secs(2);
-    let h1: WorkflowHandle<String> = client
-        .debouncer(&wf)
-        .debounce(&key, delay, "a".to_string())
-        .await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let h2: WorkflowHandle<String> = client
-        .debouncer(&wf)
-        .debounce(&key, delay, "b".to_string())
-        .await?;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let h3: WorkflowHandle<String> = client
-        .debouncer(&wf)
-        .debounce(&key, delay, "c".to_string())
-        .await?;
+        let client = Client::new(provider.clone()).with_app_version(&ver);
+        // Keep the collector open until all inputs are acknowledged. The final
+        // push uses zero delay to close the burst explicitly, so coalescing does
+        // not depend on completing multiple database round trips within 2 seconds.
+        let delay = Duration::from_secs(3600);
+        let h1: WorkflowHandle<String> = client
+            .debouncer(&wf)
+            .debounce(&key, delay, "a".to_string())
+            .await?;
+        let h2: WorkflowHandle<String> = client
+            .debouncer(&wf)
+            .debounce(&key, delay, "b".to_string())
+            .await?;
+        let h3: WorkflowHandle<String> = client
+            .debouncer(&wf)
+            .debounce(&key, Duration::ZERO, "c".to_string())
+            .await?;
 
-    assert_eq!(h1.id(), h2.id());
-    assert_eq!(h2.id(), h3.id());
-    let out = h3.result().await?;
-    assert_eq!(out, "c", "the debounced run used the latest input");
+        assert_eq!(h1.id(), h2.id());
+        assert_eq!(h2.id(), h3.id());
+        let out = h3.result().await?;
+        assert_eq!(out, "c", "the debounced run used the latest input");
 
-    engine.shutdown(Duration::from_secs(2)).await?;
+        engine.shutdown(Duration::from_secs(2)).await?;
 
-    // The pinned engine registered `ver` at launch, making it the latest
-    // application version. Unversioned-row dequeue gating is latest-only, so
-    // restore this binary's real version as latest or other tests' ('')
-    // client-enqueued claims on the shared database would starve. Register it
-    // first (idempotent): registration happens at `launch()`, which this
-    // engine never does, and on a fresh database (CI) no other test may have
-    // registered it yet.
-    let real = DurableEngine::new(provider.clone()).await?;
-    provider
-        .create_application_version(real.app_version())
-        .await?;
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    assert!(
-        real.set_latest_application_version(real.app_version())
-            .await?
-    );
-    Ok(())
+        Ok(())
+    }
+    .await;
+    common::drop_hermetic_pg_db(&admin, &dbname).await;
+    result
 }
 
 /// Dequeue version gating over live Postgres: an executor claims only rows of

@@ -2154,7 +2154,15 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
-        if params.timeout_ms.is_some_and(|timeout| timeout < 0) {
+        self.fork_workflow_with_timeout(params, None).await
+    }
+
+    async fn fork_workflow_with_timeout(
+        &self,
+        params: &ForkParams,
+        timeout_ms: Option<i64>,
+    ) -> Result<()> {
+        if timeout_ms.is_some_and(|timeout| timeout < 0) {
             return Err(crate::error::Error::app("fork timeout cannot be negative"));
         }
         let original_id = params.original_id.as_str();
@@ -2186,7 +2194,7 @@ impl StateProvider for PostgresProvider {
         .bind(&params.queue_name)
         .bind(params.partition_key.as_deref())
         .bind(now)
-        .bind(params.timeout_ms)
+        .bind(timeout_ms)
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {

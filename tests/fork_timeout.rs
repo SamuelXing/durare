@@ -84,15 +84,17 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         assert!(provider.get_workflow_status(&id).await?.is_none());
     }
     assert!(provider
-        .fork_workflow(&ForkParams {
-            original_id: "source".into(),
-            new_id: "negative".into(),
-            start_step: 0,
-            app_version: None,
-            queue_name: "q".into(),
-            partition_key: None,
-            timeout_ms: Some(-1),
-        })
+        .fork_workflow_with_timeout(
+            &ForkParams {
+                original_id: "source".into(),
+                new_id: "negative".into(),
+                start_step: 0,
+                app_version: None,
+                queue_name: "q".into(),
+                partition_key: None,
+            },
+            Some(-1)
+        )
         .await
         .is_err());
     assert!(provider.get_workflow_status("negative").await?.is_none());

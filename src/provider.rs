@@ -1231,10 +1231,6 @@ pub struct ForkParams {
     pub queue_name: String,
     /// Partition key when `queue_name` is a partitioned queue.
     pub partition_key: Option<String>,
-    /// Execution timeout in milliseconds, starting when the fork is dequeued.
-    /// `None` disables the timeout; the source's timeout and deadline are never
-    /// inherited. Zero expires immediately; negative values are rejected.
-    pub timeout_ms: Option<i64>,
 }
 
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
@@ -1891,6 +1887,24 @@ pub trait StateProvider: Send + Sync {
     /// execution resumes from that step. Marks the original `was_forked_from`.
     /// Errors if the original does not exist.
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()>;
+
+    /// Fork with an independent execution timeout, armed when dequeued.
+    /// `None` disables the timeout; zero expires immediately. The source's
+    /// timeout and deadline are never inherited. Negative values are invalid.
+    /// The compatibility default delegates untimed forks to the original
+    /// method and rejects timed forks until a custom provider implements this.
+    async fn fork_workflow_with_timeout(
+        &self,
+        params: &ForkParams,
+        timeout_ms: Option<i64>,
+    ) -> Result<()> {
+        if timeout_ms.is_some() {
+            return Err(crate::Error::app(
+                "this provider does not support fork timeouts",
+            ));
+        }
+        self.fork_workflow(params).await
+    }
 
     /// Atomically claim one `PENDING` workflow for a recovery sweep — or report
     /// that another process got there first.

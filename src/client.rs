@@ -434,15 +434,17 @@ impl Client {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.provider
-            .fork_workflow(&ForkParams {
-                original_id: original_id.to_string(),
-                new_id: new_id.clone(),
-                start_step,
-                app_version: opts.app_version.filter(|v| !v.is_empty()),
-                queue_name: opts.queue.unwrap_or_else(|| INTERNAL_QUEUE.to_string()),
-                partition_key: opts.partition_key,
+            .fork_workflow_with_timeout(
+                &ForkParams {
+                    original_id: original_id.to_string(),
+                    new_id: new_id.clone(),
+                    start_step,
+                    app_version: opts.app_version.filter(|v| !v.is_empty()),
+                    queue_name: opts.queue.unwrap_or_else(|| INTERNAL_QUEUE.to_string()),
+                    partition_key: opts.partition_key,
+                },
                 timeout_ms,
-            })
+            )
             .await?;
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
     }
