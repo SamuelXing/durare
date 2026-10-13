@@ -13,8 +13,8 @@ use crate::engine::{
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    CancelOptions, ForkParams, ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus,
-    STATUS_DELAYED, STATUS_ENQUEUED,
+    CancelOptions, ForkParams, ListFilter, StateProvider, StepInfo, StepListOptions, VersionInfo,
+    WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use crate::schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
@@ -280,6 +280,18 @@ impl Client {
     /// The recorded steps of a workflow, ordered by step id.
     pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
         self.provider.get_workflow_steps(workflow_id).await
+    }
+
+    /// List a workflow's recorded operations with pagination and output loading
+    /// options. The window counts rows in ascending step id order.
+    pub async fn get_workflow_steps_with_options(
+        &self,
+        workflow_id: &str,
+        options: StepListOptions,
+    ) -> Result<Vec<StepInfo>> {
+        self.provider
+            .get_workflow_steps_with_options(workflow_id, options)
+            .await
     }
 
     /// Cancel a workflow: a non-terminal one is set `CANCELLED` and removed from

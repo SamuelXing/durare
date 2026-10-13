@@ -1301,3 +1301,67 @@ async fn conductor_honors_cancel_children() -> Result<()> {
     conductor.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn conductor_lists_step_windows() -> Result<()> {
+    use durare::{StateProvider, WorkflowStatus, STATUS_SUCCESS};
+    let provider = Arc::new(InMemoryProvider::new());
+    let engine = Arc::new(DurableEngine::new(provider.clone()).await?);
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "window",
+            "work",
+            json!(null),
+            STATUS_SUCCESS,
+            "owner",
+            "v",
+        ))
+        .await?;
+    for id in [9, 2, 5] {
+        provider
+            .record_step_result("window", id, "step", json!(id), None, None, None)
+            .await?;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        for load_output in [false, true] {
+            let response = exchange(
+                &mut ws,
+                json!({"type":"list_steps", "request_id":"page",
+                "workflow_id":"window", "limit":1, "offset":1, "load_output":load_output}),
+            )
+            .await;
+            assert!(response.get("error_message").is_none(), "{response}");
+            let rows = response["output"].as_array().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["function_id"], 5);
+            assert_eq!(rows[0].get("output").is_some(), load_output);
+            if load_output {
+                assert_eq!(rows[0]["output"], "5");
+            }
+        }
+        let response = exchange(
+            &mut ws,
+            json!({"type":"list_steps", "request_id":"empty",
+            "workflow_id":"window", "limit":0}),
+        )
+        .await;
+        assert_eq!(response["output"], json!([]));
+    });
+    let conductor = Conductor::start(
+        engine,
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+    server.await.unwrap();
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

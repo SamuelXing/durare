@@ -971,6 +971,29 @@ pub struct NotificationInsert {
     pub idempotency_key: Option<String>,
 }
 
+/// Options for listing a workflow's recorded operations in ascending step order.
+#[derive(Clone, Copy, Debug)]
+pub struct StepListOptions {
+    /// Maximum number of rows. `None` or a negative value means no limit;
+    /// zero returns no rows.
+    pub limit: Option<i64>,
+    /// Number of rows to skip, rather than a step id. Negative values mean zero.
+    pub offset: Option<i64>,
+    /// Whether to load and decode outputs. Errors and other metadata are always
+    /// returned. Defaults to `true`, matching the original listing API.
+    pub load_output: bool,
+}
+
+impl Default for StepListOptions {
+    fn default() -> Self {
+        Self {
+            limit: None,
+            offset: None,
+            load_output: true,
+        }
+    }
+}
+
 /// One recorded operation of a workflow.
 ///
 /// Materialized from an `operation_outputs` row by
@@ -982,7 +1005,8 @@ pub struct StepInfo {
     pub step_id: i32,
     /// The step's recorded name (e.g. a step name, or `DBOS.sleep`/`DBOS.send`).
     pub name: String,
-    /// The decoded output, if any (`None` for operations that record no value).
+    /// The decoded output, if any (`None` for operations that record no value
+    /// or when [`StepListOptions::load_output`] is disabled).
     pub output: Option<Value>,
     /// The recorded error string, if the operation failed.
     pub error: Option<String>,
@@ -1925,6 +1949,35 @@ pub trait StateProvider: Send + Sync {
     /// recorded serialization format. Returns an empty list for an unknown
     /// workflow or one that has run no steps.
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>>;
+
+    /// List a window of recorded operations, optionally without outputs.
+    /// Built-in providers apply pagination before loading rows and skip output
+    /// decoding when disabled. The compatibility default for custom providers
+    /// loads all steps using the original method, then applies these options.
+    async fn get_workflow_steps_with_options(
+        &self,
+        workflow_id: &str,
+        options: StepListOptions,
+    ) -> Result<Vec<StepInfo>> {
+        let steps = self.get_workflow_steps(workflow_id).await?;
+        let offset = usize::try_from(options.offset.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+        let limit = options
+            .limit
+            .filter(|n| *n >= 0)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(usize::MAX);
+        Ok(steps
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|mut step| {
+                if !options.load_output {
+                    step.output = None;
+                }
+                step
+            })
+            .collect())
+    }
 
     /// The `function_name` recorded at `(workflow_id, seq)`, if a row exists.
     /// Used by the patch system to tell a marker from a pre-patch step.

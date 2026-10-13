@@ -2,10 +2,10 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_i64, col_str, decode_roles, encode_roles, is_terminal, CancelOptions, DequeueRequest,
     ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep, RecoveryClaim,
-    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome,
-    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
@@ -1092,15 +1092,40 @@ impl StateProvider for InMemoryProvider {
     }
 
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
+        self.get_workflow_steps_with_options(workflow_id, StepListOptions::default())
+            .await
+    }
+
+    async fn get_workflow_steps_with_options(
+        &self,
+        workflow_id: &str,
+        options: StepListOptions,
+    ) -> Result<Vec<StepInfo>> {
         let g = self.inner.lock().await;
-        let mut steps: Vec<StepInfo> = g
+        let mut rows: Vec<_> = g
             .steps
             .iter()
             .filter(|((wid, _), _)| wid == workflow_id)
+            .collect();
+        rows.sort_by_key(|((_, seq), _)| *seq);
+        let offset = usize::try_from(options.offset.unwrap_or(0).max(0)).unwrap_or(usize::MAX);
+        let limit = options
+            .limit
+            .filter(|n| *n >= 0)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(usize::MAX);
+        let steps = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(|((_, seq), row)| StepInfo {
                 step_id: *seq,
                 name: row.name.clone(),
-                output: row.output.clone(),
+                output: if options.load_output {
+                    row.output.clone()
+                } else {
+                    None
+                },
                 error: row
                     .error
                     .as_deref()
@@ -1112,7 +1137,6 @@ impl StateProvider for InMemoryProvider {
                     .and_then(DateTime::from_timestamp_millis),
             })
             .collect();
-        steps.sort_by_key(|s| s.step_id);
         Ok(steps)
     }
 

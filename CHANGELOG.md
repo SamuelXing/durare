@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StepListOptions` and engine/client step listing methods with options apply
+  pagination and optional output loading in the provider. SQL providers and
+  conductor requests now fetch only the requested window and skip output
+  decoding when disabled.
+
 - `CancelOptions` and engine/client cancellation methods with options can cancel
   all existing descendants, including through completed ancestors. The conductor
   now honors `cancel_children`. Existing cancellation calls remain root-only.
