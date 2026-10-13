@@ -410,6 +410,8 @@ struct IdsRequest {
     workflow_ids: Vec<String>,
     #[serde(default)]
     delete_children: bool,
+    #[serde(default)]
+    cancel_children: bool,
     /// Resume only: re-enqueue onto this named queue instead of the internal
     /// one, so the resumed run competes under that queue's limits.
     #[serde(default)]
@@ -429,7 +431,17 @@ async fn handle_ids(
         ids = vec![req.workflow_id];
     }
     let (type_str, result) = match action {
-        IdsAction::Cancel => ("cancel", engine.cancel_workflows(&ids).await),
+        IdsAction::Cancel => (
+            "cancel",
+            engine
+                .cancel_workflows_with_options(
+                    &ids,
+                    crate::CancelOptions {
+                        cancel_children: req.cancel_children,
+                    },
+                )
+                .await,
+        ),
         IdsAction::Resume => (
             "resume",
             match req.queue_name.as_deref() {

@@ -1,13 +1,14 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, DequeueRequest,
-    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert, RecordedStep,
-    RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
+    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
+    RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate,
+    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
+    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -1296,19 +1297,39 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        self.cancel_workflows_with_options(ids, CancelOptions::default())
+            .await
+    }
+
+    async fn cancel_workflows_with_options(
+        &self,
+        ids: &[String],
+        options: CancelOptions,
+    ) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
         let now = Utc::now().timestamp_millis();
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new("UPDATE workflow_status SET status = ");
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+        if options.cancel_children {
+            qb.push("WITH RECURSIVE targets AS (SELECT workflow_uuid FROM workflow_status WHERE workflow_uuid IN (");
+            push_bind_list(&mut qb, ids);
+            qb.push(") OR parent_workflow_id IN (");
+            push_bind_list(&mut qb, ids);
+            qb.push(") UNION SELECT w.workflow_uuid FROM workflow_status w JOIN targets t ON w.parent_workflow_id = t.workflow_uuid) ");
+        }
+        qb.push("UPDATE workflow_status SET status = ");
         qb.push_bind(STATUS_CANCELLED)
             .push(", completed_at = ")
             .push_bind(now)
             .push(", started_at_epoch_ms = NULL, queue_name = NULL, deduplication_id = NULL, updated_at = ")
             .push_bind(now)
             .push(" WHERE workflow_uuid IN (");
-        push_bind_list(&mut qb, ids);
+        if options.cancel_children {
+            qb.push("SELECT workflow_uuid FROM targets");
+        } else {
+            push_bind_list(&mut qb, ids);
+        }
         qb.push(") AND status NOT IN (");
         push_bind_list(&mut qb, &[STATUS_SUCCESS, STATUS_ERROR, STATUS_CANCELLED]);
         qb.push(")");

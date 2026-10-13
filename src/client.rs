@@ -13,8 +13,8 @@ use crate::engine::{
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
-    ForkParams, ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus, STATUS_DELAYED,
-    STATUS_ENQUEUED,
+    CancelOptions, ForkParams, ListFilter, StateProvider, StepInfo, VersionInfo, WorkflowStatus,
+    STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use crate::schedule::{
     ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
@@ -288,10 +288,42 @@ impl Client {
         self.provider.cancel_workflow(id).await
     }
 
-    /// Cancel many workflows in one round-trip. Missing or already-terminal ids
-    /// are skipped; an empty slice is a no-op.
+    /// Cancel a workflow, optionally including all its descendants.
+    /// Completed workflows keep their outcomes; their unfinished descendants
+    /// are still cancelled when `options.cancel_children` is set, even if the
+    /// root row was deleted. Cancellation
+    /// is cooperative: a running body observes it at a durable boundary or via
+    /// [`crate::StepCtx::cancelled`]. Newly created descendants after the
+    /// cancellation snapshot are not included.
+    pub async fn cancel_workflow_with_options(
+        &self,
+        id: &str,
+        options: CancelOptions,
+    ) -> Result<()> {
+        self.provider
+            .cancel_workflows_with_options(&[id.to_owned()], options)
+            .await
+    }
+
+    /// Cancel many workflows in one round-trip. Missing, completed or
+    /// already-cancelled ids are skipped; parked workflows may be cancelled.
+    /// An empty slice is a no-op.
     pub async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
         self.provider.cancel_workflows(ids).await
+    }
+
+    /// Cancel a set of workflows with the same descendant option as
+    /// [`cancel_workflow_with_options`](Self::cancel_workflow_with_options).
+    /// Missing rows are skipped, but their existing descendants are still
+    /// followed when requested. An empty set is a no-op.
+    pub async fn cancel_workflows_with_options(
+        &self,
+        ids: &[String],
+        options: CancelOptions,
+    ) -> Result<()> {
+        self.provider
+            .cancel_workflows_with_options(ids, options)
+            .await
     }
 
     /// Delete many workflows and (via `ON DELETE CASCADE`) their step / event /

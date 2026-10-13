@@ -1233,3 +1233,71 @@ async fn conductor_filters_and_reports_attributes() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn conductor_honors_cancel_children() -> Result<()> {
+    use durare::{StateProvider, WorkflowStatus, STATUS_CANCELLED, STATUS_PENDING, STATUS_SUCCESS};
+    let provider = Arc::new(InMemoryProvider::new());
+    let engine = Arc::new(DurableEngine::new(provider.clone()).await?);
+    for (id, parent, status) in [
+        ("root", None, STATUS_SUCCESS),
+        ("child", Some("root"), STATUS_PENDING),
+        ("grandchild", Some("child"), STATUS_PENDING),
+        ("unrelated", None, STATUS_PENDING),
+    ] {
+        let mut row = WorkflowStatus::new(id, "noop", json!(null), status, "owner", "v");
+        row.parent_workflow_id = parent.map(str::to_owned);
+        provider.insert_workflow_status(row).await?;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let root_only = exchange(
+            &mut ws,
+            json!({"type":"cancel", "request_id":"root-only", "workflow_id":"root"}),
+        )
+        .await;
+        assert_eq!(root_only["success"], true);
+        let child = exchange(
+            &mut ws,
+            json!({"type":"get_workflow", "request_id":"before", "workflow_id":"child"}),
+        )
+        .await;
+        assert_eq!(child["output"]["Status"], STATUS_PENDING);
+        let recursive = exchange(&mut ws, json!({"type":"cancel", "request_id":"recursive", "workflow_ids":["root", "missing"], "cancel_children":true})).await;
+        assert_eq!(recursive["success"], true);
+    });
+    let conductor = Conductor::start(
+        engine,
+        ConductorConfig {
+            url: format!("ws://127.0.0.1:{port}"),
+            api_key: "k".into(),
+            app_name: "app".into(),
+            executor_metadata: None,
+            alert_handler: None,
+        },
+    )?;
+    server.await.unwrap();
+    for id in ["child", "grandchild"] {
+        assert_eq!(
+            provider.get_workflow_status(id).await?.unwrap().status,
+            STATUS_CANCELLED
+        );
+    }
+    assert_eq!(
+        provider.get_workflow_status("root").await?.unwrap().status,
+        STATUS_SUCCESS
+    );
+    assert_eq!(
+        provider
+            .get_workflow_status("unrelated")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_PENDING
+    );
+    conductor.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}

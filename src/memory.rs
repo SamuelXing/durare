@@ -1,11 +1,11 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    col_i64, col_str, decode_roles, encode_roles, is_terminal, DequeueRequest, ExportedWorkflow,
-    ForkParams, ListFilter, NotificationInfo, RecordedStep, RecoveryClaim, RecoveryClaimRequest,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
+    col_i64, col_str, decode_roles, encode_roles, is_terminal, CancelOptions, DequeueRequest,
+    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep, RecoveryClaim,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepOutcome,
+    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
 use crate::tx::TxBody;
@@ -817,19 +817,7 @@ impl StateProvider for InMemoryProvider {
     }
 
     async fn cancel_workflow(&self, id: &str) -> Result<()> {
-        let mut g = self.inner.lock().await;
-        if let Some(row) = g.workflows.get_mut(id) {
-            if !is_terminal(&row.status) {
-                let now = Utc::now();
-                row.status = STATUS_CANCELLED.to_string();
-                row.completed_at_ms = Some(now.timestamp_millis());
-                row.started_at_ms = None;
-                row.queue_name = None;
-                row.dedup_id = None;
-                row.updated_at = now;
-            }
-        }
-        Ok(())
+        self.cancel_workflows(&[id.to_owned()]).await
     }
 
     async fn resume_workflow(&self, id: &str) -> Result<bool> {
@@ -863,11 +851,38 @@ impl StateProvider for InMemoryProvider {
     }
 
     async fn cancel_workflows(&self, ids: &[String]) -> Result<()> {
+        self.cancel_workflows_with_options(ids, CancelOptions::default())
+            .await
+    }
+
+    async fn cancel_workflows_with_options(
+        &self,
+        ids: &[String],
+        options: CancelOptions,
+    ) -> Result<()> {
         let mut g = self.inner.lock().await;
+        let mut targets = ids.to_vec();
+        if options.cancel_children {
+            let mut i = 0;
+            while i < targets.len() {
+                let parent = targets[i].clone();
+                i += 1;
+                for (id, row) in &g.workflows {
+                    if row.parent_workflow_id.as_deref() == Some(parent.as_str())
+                        && !targets.contains(id)
+                    {
+                        targets.push(id.clone());
+                    }
+                }
+            }
+        }
         let now = Utc::now();
-        for id in ids {
-            if let Some(row) = g.workflows.get_mut(id) {
-                if !is_terminal(&row.status) {
+        for id in targets {
+            if let Some(row) = g.workflows.get_mut(&id) {
+                if !matches!(
+                    row.status.as_str(),
+                    STATUS_SUCCESS | STATUS_ERROR | STATUS_CANCELLED
+                ) {
                     row.status = STATUS_CANCELLED.to_string();
                     row.completed_at_ms = Some(now.timestamp_millis());
                     row.started_at_ms = None;
