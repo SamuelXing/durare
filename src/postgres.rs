@@ -10,7 +10,7 @@ use crate::provider::{
     STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
     STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
-use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
 use crate::tx::{IsolationLevel, TransactionOptions, Tx, TxBody};
 use crate::{RateLimiter, WorkflowQueue};
@@ -2551,6 +2551,35 @@ impl StateProvider for PostgresProvider {
         .bind(&schedule.queue_name)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn update_schedule(&self, name: &str, update: &ScheduleUpdate) -> Result<()> {
+        update.validate(name)?;
+        let mut qb = QueryBuilder::<Postgres>::new(format!(
+            "UPDATE {} SET schedule_name = schedule_name",
+            self.tables.workflow_schedules
+        ));
+        if let Some(cron) = &update.schedule {
+            qb.push(", schedule = ").push_bind(cron);
+        }
+        if let Some(context) = &update.context {
+            qb.push(", context = ")
+                .push_bind(encode_schedule_context(context));
+        }
+        if let Some(on) = update.automatic_backfill {
+            qb.push(", automatic_backfill = ").push_bind(on);
+        }
+        if let Some(tz) = &update.cron_timezone {
+            qb.push(", cron_timezone = ").push_bind(tz.as_deref());
+        }
+        if let Some(queue) = &update.queue_name {
+            qb.push(", queue_name = ").push_bind(queue.as_deref());
+        }
+        qb.push(" WHERE schedule_name = ").push_bind(name);
+        if qb.build().execute(&self.pool).await?.rows_affected() == 0 {
+            return Err(Error::app(format!("schedule `{name}` not found")));
+        }
         Ok(())
     }
 

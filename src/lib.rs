@@ -252,7 +252,7 @@ pub use provider::{
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use replay::{Divergence, ReplayReport};
 pub use schedule::{
-    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, ScheduledInput,
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, ScheduleUpdate, ScheduledInput,
     WorkflowSchedule,
 };
 pub use serialize::{

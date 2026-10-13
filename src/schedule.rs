@@ -98,6 +98,16 @@ pub struct WorkflowSchedule {
 }
 
 impl WorkflowSchedule {
+    pub(crate) fn same_definition(&self, other: &Self) -> bool {
+        self.schedule_id == other.schedule_id
+            && self.workflow_name == other.workflow_name
+            && self.schedule == other.schedule
+            && self.context == other.context
+            && self.automatic_backfill == other.automatic_backfill
+            && self.cron_timezone == other.cron_timezone
+            && self.queue_name == other.queue_name
+    }
+
     /// The input delivered to the workflow for the tick at `instant`: the tick
     /// time plus this schedule's attached context. The single place tick input
     /// is shaped, so every firing path (live loop, backfill, trigger) agrees.
@@ -106,6 +116,49 @@ impl WorkflowSchedule {
             scheduled_time: instant,
             context: self.context.clone(),
         }
+    }
+}
+
+/// Partial update of a persisted schedule's definition.
+///
+/// Omitted fields stay unchanged. For nullable fields, `Some(None)` clears the
+/// value. Runtime state (`schedule_id`, status, and `last_fired_at`) is preserved.
+///
+/// ```
+/// use durare::ScheduleUpdate;
+/// let update = ScheduleUpdate {
+///     schedule: Some("*/10 * * * * *".into()),
+///     queue_name: Some(None), // clear the queue; run ticks directly
+///     ..Default::default()
+/// };
+/// assert!(update.context.is_none()); // leave context unchanged
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct ScheduleUpdate {
+    /// Replacement six-field cron expression.
+    pub schedule: Option<String>,
+    /// Replacement context, or `Some(None)` to clear it. JSON null also clears.
+    pub context: Option<Option<Value>>,
+    /// Whether to backfill missed ticks.
+    pub automatic_backfill: Option<bool>,
+    /// Replacement IANA timezone, or `Some(None)` to use UTC.
+    pub cron_timezone: Option<Option<String>>,
+    /// Replacement queue, or `Some(None)` for direct execution.
+    pub queue_name: Option<Option<String>>,
+}
+
+impl ScheduleUpdate {
+    pub(crate) fn validate(&self, name: &str) -> crate::Result<()> {
+        if name.is_empty() {
+            return Err(crate::Error::app("schedule_name is required"));
+        }
+        if let Some(cron) = &self.schedule {
+            crate::engine::parse_cron(cron)?;
+        }
+        if let Some(Some(tz)) = &self.cron_timezone {
+            crate::engine::parse_timezone(tz)?;
+        }
+        Ok(())
     }
 }
 

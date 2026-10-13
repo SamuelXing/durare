@@ -11,7 +11,8 @@ use crate::provider::{
 use crate::queue::WorkflowQueue;
 use crate::replay::{History, ReplayReport, Verification};
 use crate::schedule::{
-    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, ScheduleUpdate,
+    WorkflowSchedule,
 };
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
@@ -1300,6 +1301,15 @@ impl DurableEngine {
             queue_name: opts.queue_name,
         };
         self.provider.create_schedule(&schedule).await
+    }
+
+    /// Update only the supplied definition fields of an existing schedule.
+    /// Preserves its id, active/paused status, and last fired tick. Live loops
+    /// pick up changes on the next reconciliation pass. An empty update still
+    /// errors for an unknown schedule. Nullable fields can be explicitly cleared.
+    pub async fn update_schedule(&self, name: &str, update: ScheduleUpdate) -> Result<()> {
+        update.validate(name)?;
+        self.provider.update_schedule(name, &update).await
     }
 
     /// The schedule named `schedule_name`, or `None` if there is none.
@@ -3671,9 +3681,8 @@ async fn adopt_recorded_outcome(
 
 /// A firing loop the reconciler has installed for one schedule.
 struct InstalledSchedule {
-    /// The schedule row's id when installed; a change means it was recreated, so
-    /// the loop is retired and replaced.
-    schedule_id: String,
+    /// Definition when installed; runtime cursor advances do not restart loops.
+    definition: WorkflowSchedule,
     /// Set to stop the firing loop (schedule paused, deleted, or recreated).
     stop: Arc<AtomicBool>,
 }
@@ -3838,11 +3847,11 @@ async fn schedule_reconciler(
             .collect();
         desired.extend(extra);
 
-        // Retire loops whose schedule is gone, no longer desired, or recreated.
+        // Retire loops for removed, paused, recreated, or updated definitions.
         installed.retain(|name, entry| {
             let keep = desired
                 .iter()
-                .any(|s| s.schedule_name == *name && s.schedule_id == entry.schedule_id);
+                .any(|s| s.schedule_name == *name && s.same_definition(&entry.definition));
             if !keep {
                 entry.stop.store(true, Ordering::Relaxed);
             }
@@ -3874,7 +3883,7 @@ async fn schedule_reconciler(
             installed.insert(
                 schedule.schedule_name.clone(),
                 InstalledSchedule {
-                    schedule_id: schedule.schedule_id.clone(),
+                    definition: schedule.clone(),
                     stop: stop.clone(),
                 },
             );
