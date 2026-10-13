@@ -4,7 +4,7 @@ use crate::provider::{
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
     DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
     RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, StepOutcome, VersionInfo, WorkflowAggregate,
+    StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate,
     WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS,
     STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
@@ -1638,14 +1638,30 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
-        let rows = sqlx::query(
-            "SELECT function_id, function_name, output, error, child_workflow_id,
+        self.get_workflow_steps_with_options(workflow_id, StepListOptions::default())
+            .await
+    }
+
+    async fn get_workflow_steps_with_options(
+        &self,
+        workflow_id: &str,
+        options: StepListOptions,
+    ) -> Result<Vec<StepInfo>> {
+        let rows = sqlx::query(&format!(
+            "SELECT function_id, function_name, {output}, error, child_workflow_id,
                     started_at_epoch_ms, completed_at_epoch_ms, serialization
              FROM operation_outputs
              WHERE workflow_uuid = ?
-             ORDER BY function_id ASC",
-        )
+             ORDER BY function_id ASC LIMIT ? OFFSET ?",
+            output = if options.load_output {
+                "output"
+            } else {
+                "NULL AS output"
+            },
+        ))
         .bind(workflow_id)
+        .bind(options.limit.filter(|n| *n >= 0).unwrap_or(-1))
+        .bind(options.offset.unwrap_or(0).max(0))
         .fetch_all(&self.pool)
         .await?;
         rows.iter()

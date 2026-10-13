@@ -45,9 +45,9 @@
 use crate::engine::{DurableEngine, WorkflowOptions};
 use crate::error::{Error, Result};
 use crate::provider::{
-    ExportedWorkflow, ListFilter, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED,
-    STATUS_PENDING,
+    ExportedWorkflow, ListFilter, StepAggregate, StepAggregateQuery, StepInfo, StepListOptions,
+    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_PENDING,
 };
 use crate::queue::WorkflowQueue;
 use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
@@ -600,30 +600,19 @@ async fn handle_list_steps(
     text: &str,
 ) -> Result<()> {
     let req: ListStepsRequest = serde_json::from_str(text)?;
-    let (output, err) = match engine.get_workflow_steps(&req.workflow_id).await {
-        Ok(mut steps) => {
-            // The engine returns all steps; apply the request's window in memory.
-            let off = req.offset.unwrap_or(0).max(0) as usize;
-            if off >= steps.len() {
-                steps.clear();
-            } else {
-                steps.drain(0..off);
-            }
-            if let Some(lim) = req.limit {
-                if lim >= 0 {
-                    steps.truncate(lim as usize);
-                }
-            }
-            if !req.load_output {
-                for s in &mut steps {
-                    s.output = None;
-                }
-            }
-            (
-                Some(steps.iter().map(format_step).collect::<Vec<_>>()),
-                None,
-            )
-        }
+    let options = StepListOptions {
+        limit: req.limit,
+        offset: req.offset,
+        load_output: req.load_output,
+    };
+    let (output, err) = match engine
+        .get_workflow_steps_with_options(&req.workflow_id, options)
+        .await
+    {
+        Ok(steps) => (
+            Some(steps.iter().map(format_step).collect::<Vec<_>>()),
+            None,
+        ),
         Err(e) => (None, Some(format!("failed to list workflow steps: {e}"))),
     };
     let mut resp = base_response("list_steps", rid, err);

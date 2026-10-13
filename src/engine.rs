@@ -3,10 +3,10 @@ use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{
     is_terminal, CancelOptions, DequeueRequest, ForkParams, ListFilter, RecoveryClaim,
-    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    StepListOptions, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use crate::queue::WorkflowQueue;
 use crate::replay::{History, ReplayReport, Verification};
@@ -2191,6 +2191,18 @@ impl DurableEngine {
     /// an unknown workflow or one that has run no steps.
     pub async fn get_workflow_steps(&self, workflow_id: &str) -> Result<Vec<StepInfo>> {
         self.provider.get_workflow_steps(workflow_id).await
+    }
+
+    /// List a workflow's recorded operations with pagination and output loading
+    /// options. The window counts rows in ascending step id order.
+    pub async fn get_workflow_steps_with_options(
+        &self,
+        workflow_id: &str,
+        options: StepListOptions,
+    ) -> Result<Vec<StepInfo>> {
+        self.provider
+            .get_workflow_steps_with_options(workflow_id, options)
+            .await
     }
 
     /// Re-run a recorded workflow's function against the code in this binary and
