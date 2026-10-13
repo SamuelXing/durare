@@ -1228,10 +1228,13 @@ pub struct ForkParams {
     /// fork stays runnable by the executors that could run the original).
     pub app_version: Option<String>,
     /// Queue the fork is enqueued on.
-    /// Queue the fork is enqueued on.
     pub queue_name: String,
     /// Partition key when `queue_name` is a partitioned queue.
     pub partition_key: Option<String>,
+    /// Execution timeout in milliseconds, starting when the fork is dequeued.
+    /// `None` disables the timeout; the source's timeout and deadline are never
+    /// inherited. Zero expires immediately; negative values are rejected.
+    pub timeout_ms: Option<i64>,
 }
 
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher

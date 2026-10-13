@@ -977,6 +977,9 @@ impl StateProvider for InMemoryProvider {
     }
 
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
+        if params.timeout_ms.is_some_and(|timeout| timeout < 0) {
+            return Err(crate::error::Error::app("fork timeout cannot be negative"));
+        }
         let original_id = params.original_id.as_str();
         let new_id = params.new_id.as_str();
         let start_step = params.start_step;
@@ -998,6 +1001,7 @@ impl StateProvider for InMemoryProvider {
                 .as_deref()
                 .unwrap_or(&original.app_version),
         );
+        forked.timeout_ms = params.timeout_ms;
         forked.forked_from = Some(original_id.to_string());
         forked.authenticated_user = original.authenticated_user.clone();
         forked.assumed_role = original.assumed_role.clone();

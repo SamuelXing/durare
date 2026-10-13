@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Forking through the engine or client now honors `WorkflowOptions::timeout`
+  on all backends. The timeout starts at dequeue; forks do not inherit the
+  source's timeout or deadline, matching the current reference SDKs.
+
 - `StepListOptions` and engine/client step listing methods with options apply
   pagination and optional output loading in the provider. SQL providers and
   conductor requests now fetch only the requested window and skip output
