@@ -413,6 +413,8 @@ impl Client {
     /// `opts.app_version` overrides the version stamped on the fork; unset, the
     /// fork inherits the original's, staying runnable by the executors that
     /// could run the original.
+    /// `opts.timeout` sets an independent execution timeout whose clock starts
+    /// when the fork is dequeued. Unset, no timeout or deadline is inherited.
     pub async fn fork_workflow<O>(
         &self,
         original_id: &str,
@@ -422,19 +424,27 @@ impl Client {
         if opts.partition_key.is_some() && opts.queue.is_none() {
             return Err(Error::app("a queue partition key requires a queue name"));
         }
+        let timeout_ms = opts
+            .timeout
+            .map(|d| i64::try_from(d.as_millis()))
+            .transpose()
+            .map_err(|_| Error::app("fork timeout exceeds the supported millisecond range"))?;
         let new_id = opts
             .workflow_id
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         self.provider
-            .fork_workflow(&ForkParams {
-                original_id: original_id.to_string(),
-                new_id: new_id.clone(),
-                start_step,
-                app_version: opts.app_version.filter(|v| !v.is_empty()),
-                queue_name: opts.queue.unwrap_or_else(|| INTERNAL_QUEUE.to_string()),
-                partition_key: opts.partition_key,
-            })
+            .fork_workflow_with_timeout(
+                &ForkParams {
+                    original_id: original_id.to_string(),
+                    new_id: new_id.clone(),
+                    start_step,
+                    app_version: opts.app_version.filter(|v| !v.is_empty()),
+                    queue_name: opts.queue.unwrap_or_else(|| INTERNAL_QUEUE.to_string()),
+                    partition_key: opts.partition_key,
+                },
+                timeout_ms,
+            )
             .await?;
         Ok(WorkflowHandle::polling(new_id, self.provider.clone()))
     }
