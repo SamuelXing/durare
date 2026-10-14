@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::tx::{TransactionOptions, TxBody};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -2047,6 +2047,16 @@ pub trait StateProvider: Send + Sync {
     /// Insert a schedule row. The `schedule_name` is unique, so creating one that
     /// already exists is a unique violation.
     async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()>;
+
+    /// Atomically update the supplied definition fields without changing runtime
+    /// state. Errors for a missing schedule, including for an empty update.
+    /// Custom providers must override this to support in-place updates; the
+    /// default returns an unsupported error without mutating the schedule.
+    async fn update_schedule(&self, _name: &str, _update: &ScheduleUpdate) -> Result<()> {
+        Err(Error::app(
+            "this provider does not support schedule updates",
+        ))
+    }
 
     /// Atomically replace each named schedule (delete-by-name then insert) in a
     /// single transaction, so the whole batch is all-or-nothing: a failure on

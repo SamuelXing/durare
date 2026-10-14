@@ -7,7 +7,7 @@ use crate::provider::{
     WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
-use crate::schedule::{ScheduleFilter, ScheduleStatus, WorkflowSchedule};
+use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::tx::TxBody;
 use crate::WorkflowQueue;
 use async_trait::async_trait;
@@ -1278,6 +1278,31 @@ impl StateProvider for InMemoryProvider {
         }
         g.schedules
             .insert(schedule.schedule_name.clone(), schedule.clone());
+        Ok(())
+    }
+
+    async fn update_schedule(&self, name: &str, update: &ScheduleUpdate) -> Result<()> {
+        update.validate(name)?;
+        let mut g = self.inner.lock().await;
+        let s = g
+            .schedules
+            .get_mut(name)
+            .ok_or_else(|| Error::app(format!("schedule `{name}` not found")))?;
+        if let Some(cron) = &update.schedule {
+            s.schedule = cron.clone();
+        }
+        if let Some(context) = &update.context {
+            s.context = context.clone().filter(|v| !v.is_null());
+        }
+        if let Some(on) = update.automatic_backfill {
+            s.automatic_backfill = on;
+        }
+        if let Some(tz) = &update.cron_timezone {
+            s.cron_timezone = tz.clone();
+        }
+        if let Some(queue) = &update.queue_name {
+            s.queue_name = queue.clone();
+        }
         Ok(())
     }
 

@@ -17,7 +17,8 @@ use crate::provider::{
     WorkflowStatus, STATUS_DELAYED, STATUS_ENQUEUED,
 };
 use crate::schedule::{
-    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, WorkflowSchedule,
+    ApplySchedule, ScheduleFilter, ScheduleOptions, ScheduleStatus, ScheduleUpdate,
+    WorkflowSchedule,
 };
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
@@ -611,6 +612,15 @@ impl Client {
             })
             .collect();
         self.provider.apply_schedules(&built).await
+    }
+
+    /// Update only the supplied definition fields of an existing schedule.
+    /// Preserves its id, active/paused status, and last fired tick. Live loops
+    /// pick up changes on the next reconciliation pass. An empty update still
+    /// errors for an unknown schedule. Nullable fields can be explicitly cleared.
+    pub async fn update_schedule(&self, name: &str, update: ScheduleUpdate) -> Result<()> {
+        update.validate(name)?;
+        self.provider.update_schedule(name, &update).await
     }
 
     /// The schedule named `schedule_name`, or `None` if there is none.

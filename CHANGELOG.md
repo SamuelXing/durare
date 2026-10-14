@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `ScheduleUpdate` and engine/client `update_schedule` methods modify supplied
+  definition fields in place while preserving schedule identity, status, and
+  the last fired tick. Running schedule loops pick up definition changes on
+  reconciliation; nullable context, timezone, and queue fields can be cleared.
+
 - Forking through the engine or client now honors `WorkflowOptions::timeout`
   on all backends. The timeout starts at dequeue; forks do not inherit the
   source's timeout or deadline, matching the current reference SDKs.
