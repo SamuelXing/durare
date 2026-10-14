@@ -17,13 +17,15 @@ use tokio::task::JoinHandle;
 ///
 /// Polling applies to persisted results; local handles await their task directly.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct WorkflowResultOptions {
     /// Time between database polls. Must be greater than zero.
     /// Defaults to 100 milliseconds.
     pub polling_interval: Duration,
     /// Maximum time to wait, including waiting for a sibling handle's local task.
-    /// `None` waits indefinitely. Expiration returns [`Error::Timeout`] without
-    /// cancelling the workflow or consuming its local task.
+    /// `None` waits indefinitely. Expiration returns [`Error::ObservationFailed`]
+    /// containing [`Error::Timeout`], without cancelling the workflow or
+    /// consuming its local task.
     pub timeout: Option<Duration>,
 }
 
@@ -33,6 +35,25 @@ impl Default for WorkflowResultOptions {
             polling_interval: Duration::from_millis(100),
             timeout: None,
         }
+    }
+}
+
+impl WorkflowResultOptions {
+    /// Default options: 100ms polling and no wait timeout.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the interval between database polls; it must be greater than zero.
+    pub fn polling_interval(mut self, interval: Duration) -> Self {
+        self.polling_interval = interval;
+        self
+    }
+
+    /// Set the maximum duration of this wait without cancelling the workflow.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -66,7 +87,9 @@ impl Default for WorkflowResultOptions {
 ///   post-restart waits.
 ///
 /// [`clone`](Clone::clone) is cheap and yields another handle to the *same*
-/// workflow. The in-process task can be awaited only once, so whichever clone
+/// workflow. Local waiters queue on the shared task lock; an interrupted wait
+/// releases the lock for the next waiter. The task can be awaited only once,
+/// so whichever clone
 /// resolves first consumes it and the rest fall back to polling the persisted
 /// status. Every normal outcome — success, error, cancellation, timeout — is
 /// written to that status before the task returns, so all clones observe the
@@ -166,7 +189,9 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
 
     /// Wait for the typed output with a polling interval and optional timeout.
     ///
-    /// A timeout only ends this wait; the workflow continues running. This
+    /// A wait timeout returns `ObservationFailed(Timeout)`; the workflow continues
+    /// running. A workflow's own deadline or blocking-operation timeout retains
+    /// its original error, so callers can distinguish it from a wait timeout. This
     /// method and [`result`](Self::result) are cancellation-safe: dropping the
     /// future (including through `tokio::time::timeout`) leaves a pending local
     /// task available to this handle and its clones.
@@ -175,10 +200,10 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     /// # use durare::{WorkflowHandle, WorkflowResultOptions, Result};
     /// # use std::time::Duration;
     /// # async fn example(handle: WorkflowHandle<i64>) -> Result<()> {
-    /// let result = handle.result_with_options(WorkflowResultOptions {
-    ///     polling_interval: Duration::from_millis(20),
-    ///     timeout: Some(Duration::from_secs(5)),
-    /// }).await?;
+    /// let options = WorkflowResultOptions::new()
+    ///     .polling_interval(Duration::from_millis(20))
+    ///     .timeout(Duration::from_secs(5));
+    /// let result = handle.result_with_options(options).await?;
     /// # let _ = result;
     /// # Ok(())
     /// # }
@@ -186,8 +211,10 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Timeout`] when the wait expires, an application error
-    /// for a zero polling interval, or the same errors as [`result`](Self::result).
+    /// Returns [`Error::ObservationFailed`] wrapping [`Error::Timeout`] when the
+    /// wait expires (its [`Error::code`] is still [`crate::ErrorCode::Timeout`]),
+    /// an application error for a zero polling interval, or the same errors as
+    /// [`result`](Self::result).
     pub async fn result_with_options(&self, options: WorkflowResultOptions) -> Result<O> {
         if options.polling_interval.is_zero() {
             return Err(Error::app("polling interval must be greater than zero"));
@@ -196,7 +223,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
         match options.timeout {
             Some(timeout) => tokio::time::timeout(timeout, wait)
                 .await
-                .map_err(|_| Error::Timeout)?,
+                .map_err(|_| Error::ObservationFailed(Arc::new(Error::Timeout)))?,
             None => wait.await,
         }
     }
@@ -325,7 +352,7 @@ mod tests {
                     ..Default::default()
                 })
                 .await,
-            Err(Error::Timeout)
+            Err(Error::ObservationFailed(cause)) if matches!(cause.as_ref(), Error::Timeout)
         ));
         release.send(()).unwrap();
         assert_eq!(
@@ -335,6 +362,21 @@ mod tests {
                 .unwrap(),
             42
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_timeout_is_not_an_observation_timeout() {
+        let handle = WorkflowHandle::<i64>::local(
+            "workflow-timeout".into(),
+            Arc::new(InMemoryProvider::new()),
+            tokio::spawn(async { Err(Error::Timeout) }),
+        );
+        let error = handle
+            .result_with_options(WorkflowResultOptions::new().timeout(Duration::from_secs(2)))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Timeout));
+        assert_eq!(error.code(), crate::ErrorCode::Timeout);
     }
 
     #[tokio::test]
@@ -359,7 +401,7 @@ mod tests {
                     ..Default::default()
                 })
                 .await,
-            Err(Error::Timeout)
+            Err(Error::ObservationFailed(cause)) if matches!(cause.as_ref(), Error::Timeout)
         ));
         release.send(()).unwrap();
         assert_eq!(owner.await.unwrap(), 42);

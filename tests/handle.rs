@@ -84,25 +84,29 @@ async fn result_options_contract(provider: Arc<dyn StateProvider>) -> Result<()>
         .await?;
     let observer: durare::WorkflowHandle<i64> =
         Client::new(provider).retrieve_workflow(local.id()).await?;
-    let options = WorkflowResultOptions {
-        polling_interval: Duration::from_millis(5),
-        timeout: Some(Duration::from_millis(30)),
-    };
+    assert_eq!(
+        WorkflowResultOptions::new().polling_interval,
+        Duration::from_millis(100)
+    );
+    assert!(WorkflowResultOptions::new().timeout.is_none());
+    let options = WorkflowResultOptions::new()
+        .polling_interval(Duration::from_millis(5))
+        .timeout(Duration::from_millis(30));
     assert!(matches!(
         observer.result_with_options(options).await,
-        Err(Error::Timeout)
+        Err(Error::ObservationFailed(cause)) if matches!(cause.as_ref(), Error::Timeout)
     ));
     assert!(matches!(
         local.result_with_options(options).await,
-        Err(Error::Timeout)
+        Err(Error::ObservationFailed(cause)) if matches!(cause.as_ref(), Error::Timeout)
     ));
+    let wait_error = observer.result_with_options(options).await.unwrap_err();
+    assert_eq!(wait_error.code(), durare::ErrorCode::Timeout);
+    assert!(matches!(wait_error, Error::ObservationFailed(_)));
     assert_eq!(observer.get_status().await?.status, "PENDING");
     assert!(matches!(
         observer
-            .result_with_options(WorkflowResultOptions {
-                polling_interval: Duration::ZERO,
-                ..Default::default()
-            })
+            .result_with_options(WorkflowResultOptions::new().polling_interval(Duration::ZERO))
             .await,
         Err(Error::App { .. })
     ));
@@ -110,10 +114,7 @@ async fn result_options_contract(provider: Arc<dyn StateProvider>) -> Result<()>
     assert_eq!(local.result().await?, 42);
     assert_eq!(
         observer
-            .result_with_options(WorkflowResultOptions {
-                timeout: Some(Duration::from_secs(2)),
-                ..options
-            })
+            .result_with_options(options.timeout(Duration::from_secs(2)))
             .await?,
         42
     );
@@ -167,10 +168,9 @@ async fn observer_uses_configured_polling_interval() -> Result<()> {
         .await?;
     let observer: durare::WorkflowHandle<i64> =
         Client::new(provider).retrieve_workflow(local.id()).await?;
-    let wait = observer.result_with_options(WorkflowResultOptions {
-        polling_interval: Duration::from_secs(3600),
-        timeout: None,
-    });
+    let wait = observer.result_with_options(
+        WorkflowResultOptions::new().polling_interval(Duration::from_secs(3600)),
+    );
     tokio::pin!(wait);
     assert!(futures_util::poll!(&mut wait).is_pending());
     gate.notify_one();
