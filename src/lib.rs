@@ -236,7 +236,7 @@ pub use error::{Error, ErrorCode, RecordedError, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by
 /// `read_stream_values` (`StreamExt::next`) without depending on `futures` directly.
 pub use futures_util::{Stream, StreamExt};
-pub use handle::WorkflowHandle;
+pub use handle::{WorkflowHandle, WorkflowResultOptions};
 pub use memory::InMemoryProvider;
 #[cfg(feature = "postgres")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]

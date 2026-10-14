@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `WorkflowResultOptions` and `WorkflowHandle::result_with_options` configure
+  the database polling interval and an optional wait timeout. Cancelling a result
+  wait preserves the local task for a later wait or another handle clone.
+
 - `ScheduleUpdate` and engine/client `update_schedule` methods modify supplied
   definition fields in place while preserving schedule identity, status, and
   the last fired tick. Running schedule loops pick up definition changes on

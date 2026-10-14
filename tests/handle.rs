@@ -64,3 +64,121 @@ async fn handle_clones_and_is_send_across_spawn() -> Result<()> {
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
+
+mod common;
+use durare::{Client, StateProvider, WorkflowResultOptions};
+
+async fn result_options_contract(provider: Arc<dyn StateProvider>) -> Result<()> {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let workflow_gate = gate.clone();
+    engine.register("gated", move |_ctx: DurableContext, _: ()| {
+        let gate = workflow_gate.clone();
+        async move {
+            gate.notified().await;
+            Ok::<_, Error>(42_i64)
+        }
+    });
+    let local = engine
+        .start::<_, i64>("gated", (), WorkflowOptions::default())
+        .await?;
+    let observer: durare::WorkflowHandle<i64> =
+        Client::new(provider).retrieve_workflow(local.id()).await?;
+    let options = WorkflowResultOptions {
+        polling_interval: Duration::from_millis(5),
+        timeout: Some(Duration::from_millis(30)),
+    };
+    assert!(matches!(
+        observer.result_with_options(options).await,
+        Err(Error::Timeout)
+    ));
+    assert!(matches!(
+        local.result_with_options(options).await,
+        Err(Error::Timeout)
+    ));
+    assert_eq!(observer.get_status().await?.status, "PENDING");
+    assert!(matches!(
+        observer
+            .result_with_options(WorkflowResultOptions {
+                polling_interval: Duration::ZERO,
+                ..Default::default()
+            })
+            .await,
+        Err(Error::App { .. })
+    ));
+    gate.notify_one();
+    assert_eq!(local.result().await?, 42);
+    assert_eq!(
+        observer
+            .result_with_options(WorkflowResultOptions {
+                timeout: Some(Duration::from_secs(2)),
+                ..options
+            })
+            .await?,
+        42
+    );
+    assert_eq!(local.clone().await?, 42);
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn result_options_memory() -> Result<()> {
+    result_options_contract(Arc::new(InMemoryProvider::new())).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn result_options_sqlite() -> Result<()> {
+    let provider = durare::SqliteProvider::connect("sqlite::memory:").await?;
+    result_options_contract(Arc::new(provider)).await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn result_options_postgres() -> Result<()> {
+    let Ok(base) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let (admin, url, name) = common::hermetic_pg_db(&base, "result_options").await;
+    let provider = durare::PostgresProvider::connect(&url).await?;
+    let result = result_options_contract(Arc::new(provider)).await;
+    common::drop_hermetic_pg_db(&admin, &name).await;
+    result
+}
+
+// Poll once while pending, complete the workflow, and verify the configured
+// long interval delays the next read. A new wait still reads immediately.
+#[tokio::test]
+async fn observer_uses_configured_polling_interval() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let workflow_gate = gate.clone();
+    engine.register("gated", move |_ctx: DurableContext, _: ()| {
+        let gate = workflow_gate.clone();
+        async move {
+            gate.notified().await;
+            Ok::<_, Error>(42_i64)
+        }
+    });
+    let local = engine
+        .start::<_, i64>("gated", (), WorkflowOptions::default())
+        .await?;
+    let observer: durare::WorkflowHandle<i64> =
+        Client::new(provider).retrieve_workflow(local.id()).await?;
+    let wait = observer.result_with_options(WorkflowResultOptions {
+        polling_interval: Duration::from_secs(3600),
+        timeout: None,
+    });
+    tokio::pin!(wait);
+    assert!(futures_util::poll!(&mut wait).is_pending());
+    gate.notify_one();
+    assert_eq!(local.result().await?, 42);
+    assert!(tokio::time::timeout(Duration::from_millis(250), &mut wait)
+        .await
+        .is_err());
+    assert_eq!(observer.result().await?, 42);
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

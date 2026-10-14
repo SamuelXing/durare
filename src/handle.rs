@@ -8,9 +8,33 @@ use serde_json::Value;
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+/// Options for [`WorkflowHandle::result_with_options`].
+///
+/// Polling applies to persisted results; local handles await their task directly.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkflowResultOptions {
+    /// Time between database polls. Must be greater than zero.
+    /// Defaults to 100 milliseconds.
+    pub polling_interval: Duration,
+    /// Maximum time to wait, including waiting for a sibling handle's local task.
+    /// `None` waits indefinitely. Expiration returns [`Error::Timeout`] without
+    /// cancelling the workflow or consuming its local task.
+    pub timeout: Option<Duration>,
+}
+
+impl Default for WorkflowResultOptions {
+    fn default() -> Self {
+        Self {
+            polling_interval: Duration::from_millis(100),
+            timeout: None,
+        }
+    }
+}
 
 /// A reference to a workflow execution.
 ///
@@ -55,9 +79,9 @@ pub struct WorkflowHandle<O> {
     id: String,
     provider: Arc<dyn StateProvider>,
     // Shared so a handle stays `Clone`. The local task can be awaited only once;
-    // the first resolver `take`s it and the rest poll the persisted status.
+    // a resolver borrows it across the await and only removes it on completion.
+    // Cancelling the wait releases the lock while leaving the task available.
     join: Arc<Mutex<Option<JoinHandle<Result<Value>>>>>,
-    poll_interval: Duration,
     // `fn() -> O` keeps the handle `Send + Sync` regardless of `O` (it never
     // holds an `O` — the output is deserialized on demand).
     _marker: PhantomData<fn() -> O>,
@@ -69,7 +93,6 @@ impl<O> Clone for WorkflowHandle<O> {
             id: self.id.clone(),
             provider: self.provider.clone(),
             join: self.join.clone(),
-            poll_interval: self.poll_interval,
             _marker: PhantomData,
         }
     }
@@ -86,7 +109,6 @@ impl<O> WorkflowHandle<O> {
             id,
             provider,
             join: Arc::new(Mutex::new(Some(join))),
-            poll_interval: Duration::from_millis(100),
             _marker: PhantomData,
         }
     }
@@ -98,7 +120,6 @@ impl<O> WorkflowHandle<O> {
             id,
             provider,
             join: Arc::new(Mutex::new(None)),
-            poll_interval: Duration::from_millis(100),
             _marker: PhantomData,
         }
     }
@@ -123,7 +144,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     ///
     /// For a local handle this awaits the in-process task the first time it is
     /// called; for a polling handle (or a clone whose sibling already consumed
-    /// the task) it reads the status row every `poll_interval` until the
+    /// the task) it reads the status row every 100 milliseconds until the
     /// workflow reaches a terminal state, then deserializes the stored output.
     ///
     /// A handle can also be awaited directly (`handle.await?`), which consumes
@@ -139,16 +160,57 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
     /// returns [`Error::ObservationFailed`], which does not establish that the
     /// target stopped; retry the observation instead of recovering the target.
     pub async fn result(&self) -> Result<O> {
-        // Claim the in-process task exactly once. The guard is a temporary of
-        // this statement, so it is dropped here — never held across the await.
-        let owned = self
-            .join
-            .lock()
-            .expect("workflow handle mutex poisoned")
-            .take();
-        if let Some(join) = owned {
-            // Own the task: await it directly, surfacing panics as errors.
-            return match join.await {
+        self.result_with_options(WorkflowResultOptions::default())
+            .await
+    }
+
+    /// Wait for the typed output with a polling interval and optional timeout.
+    ///
+    /// A timeout only ends this wait; the workflow continues running. This
+    /// method and [`result`](Self::result) are cancellation-safe: dropping the
+    /// future (including through `tokio::time::timeout`) leaves a pending local
+    /// task available to this handle and its clones.
+    ///
+    /// ```no_run
+    /// # use durare::{WorkflowHandle, WorkflowResultOptions, Result};
+    /// # use std::time::Duration;
+    /// # async fn example(handle: WorkflowHandle<i64>) -> Result<()> {
+    /// let result = handle.result_with_options(WorkflowResultOptions {
+    ///     polling_interval: Duration::from_millis(20),
+    ///     timeout: Some(Duration::from_secs(5)),
+    /// }).await?;
+    /// # let _ = result;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Timeout`] when the wait expires, an application error
+    /// for a zero polling interval, or the same errors as [`result`](Self::result).
+    pub async fn result_with_options(&self, options: WorkflowResultOptions) -> Result<O> {
+        if options.polling_interval.is_zero() {
+            return Err(Error::app("polling interval must be greater than zero"));
+        }
+        let wait = self.wait_for_result(options.polling_interval);
+        match options.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, wait)
+                .await
+                .map_err(|_| Error::Timeout)?,
+            None => wait.await,
+        }
+    }
+
+    async fn wait_for_result(&self, polling_interval: Duration) -> Result<O> {
+        // Await by mutable reference: cancellation must not detach the task.
+        // Tokio's mutex permits holding this guard across the await, and a
+        // cancelled waiter releases it so another clone can finish the join.
+        let mut owned = self.join.lock().await;
+        if let Some(join) = owned.as_mut() {
+            let result = join.await;
+            owned.take();
+            drop(owned);
+            return match result {
                 Ok(res) => {
                     let value = res?;
                     Ok(serde_json::from_value(value)?)
@@ -158,6 +220,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                 )))),
             };
         }
+        drop(owned);
 
         // No task to await: poll the status row until terminal. A polling handle
         // may name a workflow that does not exist yet (e.g. a debounced run the
@@ -170,7 +233,7 @@ impl<O: DeserializeOwned> WorkflowHandle<O> {
                 Ok(_) | Err(Error::UnknownWorkflow(_)) => {}
                 Err(e) => return Err(e),
             }
-            tokio::time::sleep(self.poll_interval).await;
+            tokio::time::sleep(polling_interval).await;
         }
     }
 
@@ -208,5 +271,97 @@ impl<O: DeserializeOwned + 'static> IntoFuture for WorkflowHandle<O> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.result().await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryProvider;
+
+    // A panic leaves no persisted terminal row, so resolving it after an
+    // interrupted wait proves that the local join was retained rather than
+    // silently switching to database polling.
+    #[tokio::test]
+    async fn interrupted_wait_preserves_local_join() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let handle = WorkflowHandle::<i64>::local(
+            "panic".into(),
+            Arc::new(InMemoryProvider::new()),
+            tokio::spawn(async move {
+                gate.await.unwrap();
+                panic!("test workflow panic");
+            }),
+        );
+        let observer = handle.clone();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), handle.result())
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), observer.result())
+            .await
+            .expect("local join was lost")
+            .unwrap_err();
+        assert!(matches!(error, Error::RecoveryRequired(_)));
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_preserves_local_join() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let handle = WorkflowHandle::<i64>::local(
+            "local".into(),
+            Arc::new(InMemoryProvider::new()),
+            tokio::spawn(async move {
+                gate.await.unwrap();
+                Ok(Value::from(42))
+            }),
+        );
+        assert!(matches!(
+            handle
+                .result_with_options(WorkflowResultOptions {
+                    timeout: Some(Duration::from_millis(10)),
+                    ..Default::default()
+                })
+                .await,
+            Err(Error::Timeout)
+        ));
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), handle.clone().result())
+                .await
+                .expect("local join was lost")
+                .unwrap(),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_covers_waiting_for_another_clone() {
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let handle = WorkflowHandle::<i64>::local(
+            "local".into(),
+            Arc::new(InMemoryProvider::new()),
+            tokio::spawn(async move {
+                gate.await.unwrap();
+                Ok(Value::from(42))
+            }),
+        );
+        let owner = handle.result();
+        tokio::pin!(owner);
+        assert!(futures_util::poll!(&mut owner).is_pending());
+        assert!(matches!(
+            handle
+                .clone()
+                .result_with_options(WorkflowResultOptions {
+                    timeout: Some(Duration::from_millis(10)),
+                    ..Default::default()
+                })
+                .await,
+            Err(Error::Timeout)
+        ));
+        release.send(()).unwrap();
+        assert_eq!(owner.await.unwrap(), 42);
     }
 }
