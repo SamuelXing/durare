@@ -160,7 +160,7 @@ async fn poll_in_execution<T>(
 /// A macro rather than a function because the refusal is an early return of the
 /// caller's own `PendingStep<T>`, whose `T` the helper would have to name.
 macro_rules! claim {
-    ($self:expr, $operation:literal) => {
+    ($self:expr, $operation:expr) => {
         match $self.claim_position($operation) {
             Ok(position) => position,
             Err(e) => return PendingStep::failed(e),
@@ -946,14 +946,83 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// [`Error::UnknownWorkflow`] if `name` is not registered on this engine,
-    /// or [`Error::UnexpectedStep`] if a replay finds a different child (or
+    /// [`Error::UnknownWorkflow`] if an inline target is not registered on this
+    /// engine (queued targets need not be registered), or [`Error::UnexpectedStep`] if a replay finds a different child (or
     /// operation) recorded at this position.
     pub fn start_workflow<'a, I, O>(
         &'a self,
         name: &str,
         input: I,
+        opts: WorkflowOptions,
+    ) -> PendingStep<'a, WorkflowHandle<O>>
+    where
+        I: Serialize,
+        O: Send + 'a,
+    {
+        self.start_workflow_impl(name, input, opts, "start_workflow")
+    }
+
+    /// Enqueue a child workflow by name, including one implemented in another
+    /// process or language. No local workflow registration is required.
+    ///
+    /// The queue must be registered with the engine; use
+    /// [`DurableEngine::listen_queues`](crate::DurableEngine::listen_queues) to
+    /// exclude remote queues from this process's dispatchers. `opts.queue` is
+    /// overridden by `queue_name`. Unless explicitly supplied, the application
+    /// version is empty so a worker of any version can claim the child.
+    ///
+    /// Like [`start_workflow`](Self::start_workflow), this consumes one durable
+    /// position, records the child link, inherits identity per field, and returns
+    /// the original child on replay. An omitted or empty child ID derives from
+    /// the parent ID and position. This is an enqueue operation, not a step body
+    /// operation: call it directly from the workflow body.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Result, WorkflowOptions};
+    /// # async fn example(ctx: DurableContext) -> Result<()> {
+    /// let child = ctx.enqueue_workflow::<_, String>(
+    ///     "python-workers", "process_order", "order-123", WorkflowOptions::default(),
+    /// ).await?;
+    /// let output = child.result().await?;
+    /// # let _ = output;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// An application error for an empty queue or workflow name or invalid
+    /// deduplication options; [`Error::UnknownQueue`] for an unregistered queue;
+    /// [`Error::QueueDeduplicated`] for a conflicting deduplication key under
+    /// the reject policy; the same scope and replay errors as `start_workflow`.
+    pub fn enqueue_workflow<'a, I, O>(
+        &'a self,
+        queue_name: &str,
+        workflow_name: &str,
+        input: I,
         mut opts: WorkflowOptions,
+    ) -> PendingStep<'a, WorkflowHandle<O>>
+    where
+        I: Serialize,
+        O: Send + 'a,
+    {
+        if queue_name.is_empty() {
+            return PendingStep::failed(Error::app("queue name is required"));
+        }
+        if workflow_name.is_empty() {
+            return PendingStep::failed(Error::app("workflow name is required"));
+        }
+        opts.queue = Some(queue_name.to_owned());
+        opts.app_version.get_or_insert_with(String::new);
+        self.start_workflow_impl(workflow_name, input, opts, "enqueue_workflow")
+    }
+
+    fn start_workflow_impl<'a, I, O>(
+        &'a self,
+        name: &str,
+        input: I,
+        mut opts: WorkflowOptions,
+        operation: &'static str,
     ) -> PendingStep<'a, WorkflowHandle<O>>
     where
         I: Serialize,
@@ -966,7 +1035,7 @@ impl DurableContext {
             Err(e) => return PendingStep::failed(e.into()),
         };
         let name = name.to_owned();
-        let position = claim!(self, "start_workflow");
+        let position = claim!(self, operation);
         let seq = position.seq();
         PendingStep::new(position, async move {
             // Replay: re-attach to the child already started at this step. A
@@ -1014,7 +1083,8 @@ impl DurableContext {
                 },
             };
 
-            self.runtime
+            let child_id = self
+                .runtime
                 .spawn_child(
                     &child_id,
                     &name,

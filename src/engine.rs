@@ -3213,19 +3213,57 @@ impl Runtime {
         opts: WorkflowOptions,
         parent_id: &str,
         auth: AuthContext,
-    ) -> Result<()> {
-        let handler = self
-            .workflows
-            .get(&registry_key(name, opts.config_name.as_deref()))
-            .cloned()
-            .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
-        let (canonical, queued, created) = self
-            .insert_run(child_id, name, input_json, &opts, Some(parent_id), &auth)
-            .await?;
+    ) -> Result<String> {
+        // Only inline execution needs a local handler. Queued children may be
+        // implemented by another process or SDK.
+        let handler = if opts.queue.is_none() {
+            Some(
+                self.workflows
+                    .get(&registry_key(name, opts.config_name.as_deref()))
+                    .cloned()
+                    .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let (canonical, queued, created) = loop {
+            match self
+                .insert_run(
+                    child_id,
+                    name,
+                    input_json.clone(),
+                    &opts,
+                    Some(parent_id),
+                    &auth,
+                )
+                .await
+            {
+                Ok(run) => break run,
+                Err(error)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && error.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    if let (Some(queue), Some(key)) =
+                        (opts.queue.as_deref(), opts.dedup_id.as_deref())
+                    {
+                        if let Some(existing) = self
+                            .provider
+                            .get_deduplicated_workflow(queue, key)
+                            .await
+                            .map_err(crate::execution::observation_error)?
+                        {
+                            return Ok(existing);
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let id = canonical.id.clone();
         if created && !queued && !is_terminal(&canonical.status) {
-            self.spawn_detached(canonical, handler);
+            self.spawn_detached(canonical, handler.expect("inline child has a handler"));
         }
-        Ok(())
+        Ok(id)
     }
 }
 
