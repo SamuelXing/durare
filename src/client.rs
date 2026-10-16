@@ -7,8 +7,8 @@
 //! [`DurableEngine`]: crate::DurableEngine
 
 use crate::engine::{
-    cron_ticks_between, parse_cron, parse_timezone, DeduplicationPolicy, WorkflowOptions,
-    INTERNAL_QUEUE,
+    check_workflow_target, cron_ticks_between, find_dedup_target, parse_cron, parse_timezone,
+    retry_dedup, DeduplicationPolicy, WorkflowOptions, INTERNAL_QUEUE,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
@@ -162,30 +162,24 @@ impl Client {
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
 
-        // On a dedup collision under `ReturnExisting`, return a handle to the
-        // workflow already holding the slot; retry if it was freed in between.
-        loop {
+        let canonical = retry_dedup(|| async {
             match self.provider.insert_workflow_status(row.clone()).await {
-                Ok(_) => return Ok(WorkflowHandle::polling(id, self.provider.clone())),
-                Err(e)
-                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
-                        && e.code() == ErrorCode::QueueDeduplicated =>
-                {
-                    if let Some(existing) = self
-                        .provider
-                        .get_deduplicated_workflow(
-                            queue_name,
-                            opts.dedup_id.as_deref().unwrap_or(""),
-                        )
-                        .await
-                        .map_err(crate::execution::observation_error)?
-                    {
-                        return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
-                    }
+                Ok((canonical, _)) => {
+                    check_workflow_target(&canonical, workflow_name, &opts)?;
+                    Ok(Some(canonical))
                 }
-                Err(e) => return Err(crate::execution::observation_error(e)),
+                Err(error)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && error.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    find_dedup_target(self.provider.as_ref(), queue_name, workflow_name, &opts)
+                        .await
+                }
+                Err(error) => Err(crate::execution::observation_error(error)),
             }
-        }
+        })
+        .await?;
+        Ok(WorkflowHandle::polling(canonical.id, self.provider.clone()))
     }
 
     /// Send a message to a workflow (e.g. to nudge one waiting in
