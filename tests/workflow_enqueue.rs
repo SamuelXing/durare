@@ -13,6 +13,13 @@ use std::{
 };
 mod common;
 
+struct Unserializable;
+impl serde::Serialize for Unserializable {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("old input serialization failure"))
+    }
+}
+
 async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
     let calls = Arc::new(AtomicUsize::new(0));
     let effects = Arc::new(AtomicUsize::new(0));
@@ -117,6 +124,68 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         }
         ctx.step("after-mismatches", || async { Ok(()) }).await
     });
+    let refusal_effects = Arc::new(AtomicUsize::new(0));
+    let effect_counter = refusal_effects.clone();
+    engine.register("refusals", move |ctx: DurableContext, _: ()| {
+        let effect_counter = effect_counter.clone();
+        async move {
+            // The branch must observe the same typed error during execution,
+            // ordinary recovery, and read-only verification.
+            match ctx
+                .enqueue_workflow::<_, ()>(
+                    "missing",
+                    "external",
+                    (),
+                    WorkflowOptions::default().app_version("target-version"),
+                )
+                .await
+            {
+                Err(Error::UnknownQueue(queue)) => assert_eq!(queue, "missing"),
+                Err(error) => panic!("wrong UnknownQueue branch: {error:?}"),
+                Ok(_) => panic!("UnknownQueue enqueue unexpectedly succeeded"),
+            }
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>(
+                    "",
+                    (),
+                    WorkflowOptions::default()
+                        .queue("remote")
+                        .app_version("target-version")
+                )
+                .await,
+                Err(Error::App { .. })
+            ));
+            assert!(matches!(ctx.start_workflow::<_, ()>("typo", (),
+                WorkflowOptions::default().queue("remote")).await,
+                Err(Error::UnknownWorkflow(name)) if name == "typo"));
+            ctx.step("after-refusals", || async {
+                effect_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(42_i64)
+            })
+            .await
+        }
+    });
+    let legacy_effects = Arc::new(AtomicUsize::new(0));
+    let legacy_counter = legacy_effects.clone();
+    engine.register("legacy", move |ctx: DurableContext, _: ()| {
+        let legacy_counter = legacy_counter.clone();
+        async move {
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>(
+                    "not-started",
+                    Unserializable,
+                    WorkflowOptions::default()
+                )
+                .await,
+                Err(Error::Serde(_))
+            ));
+            ctx.step("effect", || async {
+                legacy_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(42_i64)
+            })
+            .await
+        }
+    });
     let handle = engine
         .start::<_, Vec<String>>(
             "parent",
@@ -219,9 +288,12 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         .result()
         .await?;
     let mismatch_steps = engine.get_workflow_steps("mismatched").await?;
-    assert_eq!(mismatch_steps.len(), 1);
-    assert_eq!(mismatch_steps[0].step_id, 3);
-    assert!(mismatch_steps[0].child_workflow_id.is_none());
+    assert_eq!(mismatch_steps.len(), 4);
+    assert_eq!(mismatch_steps[3].step_id, 3);
+    assert!(mismatch_steps
+        .iter()
+        .all(|step| step.child_workflow_id.is_none()));
+    assert_eq!(engine.verify_replay("mismatched").await?.divergence, None);
     // Simulate the crash window: the queued row committed, but its parent
     // relationship checkpoint did not. Retrying must observe the canonical
     // row and write only the missing relationship.
@@ -250,6 +322,56 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         Some("gap-0")
     );
     assert_eq!(engine.verify_replay("gap").await?.divergence, None);
+    let refused = engine
+        .start::<_, i64>("refusals", (), WorkflowOptions::with_id("refusals"))
+        .await?;
+    assert_eq!(refused.result().await?, 42);
+    assert_eq!(engine.verify_replay("refusals").await?.divergence, None);
+    assert!(
+        provider
+            .set_workflow_status("refusals", STATUS_PENDING, None, None)
+            .await?
+    );
+    assert_eq!(engine.recover().await?, 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), refused.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    assert_eq!(refusal_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.get_workflow_steps("refusals").await?.len(), 4);
+
+    // Released 0.5.0 wrote no position for the rejected input, so its next
+    // side effect was checkpointed at zero. Seed that exact history layout.
+    provider
+        .insert_workflow_status(durare::WorkflowStatus::new(
+            "legacy",
+            "legacy",
+            json!(null),
+            STATUS_PENDING,
+            "stopped-0.5.0",
+            engine.app_version(),
+        ))
+        .await?;
+    provider
+        .record_step_result("legacy", 0, "effect", json!(42), None, None, None)
+        .await?;
+    assert_eq!(engine.recover().await?, 1);
+    let old = engine.retrieve_workflow::<i64>("legacy").await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), old.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    assert_eq!(
+        legacy_effects.load(Ordering::SeqCst),
+        0,
+        "released side effect ran twice"
+    );
+    assert_eq!(engine.verify_replay("legacy").await?.divergence, None);
+    assert_eq!(engine.get_workflow_steps("legacy").await?[0].step_id, 0);
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
@@ -318,6 +440,7 @@ async fn worker_launch_order_contract(provider: Arc<dyn StateProvider>) -> Resul
         } else {
             parent.launch().await?;
             worker.launch().await?;
+            tokio::time::sleep(Duration::from_millis(2)).await;
             provider
                 .set_latest_application_version("worker-version")
                 .await?;
@@ -429,8 +552,9 @@ async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
         .result()
         .await?;
     let steps = engine.get_workflow_steps("invalid").await?;
-    assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].step_id, 4);
+    assert_eq!(steps.len(), 5);
+    assert_eq!(steps[4].step_id, 4);
+    assert_eq!(engine.verify_replay("invalid").await?.divergence, None);
     assert_eq!(
         provider.list_workflows(&ListFilter::default()).await?.len(),
         1
@@ -472,7 +596,11 @@ async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
                     .await
                     .err()
                     .expect("unsafe route was accepted");
-                assert!(matches!(error, Error::App { .. }));
+                if version.is_none_or(str::is_empty) {
+                    assert!(matches!(error, Error::UnknownWorkflow(_)));
+                } else {
+                    assert!(matches!(error, Error::App { .. }));
+                }
             }
             ctx.step("after-errors", || async { Ok(()) }).await
         });
@@ -488,8 +616,12 @@ async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
             1
         );
         let steps = engine.get_workflow_steps("guard").await?;
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].step_id, if producer_only { 2 } else { 3 });
+        assert_eq!(steps.len(), if producer_only { 3 } else { 4 });
+        assert_eq!(
+            steps.last().unwrap().step_id,
+            if producer_only { 2 } else { 3 }
+        );
+        assert_eq!(engine.verify_replay("guard").await?.divergence, None);
         engine.shutdown(Duration::from_secs(1)).await?;
     }
     Ok(())

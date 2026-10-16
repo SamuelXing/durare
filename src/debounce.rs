@@ -16,7 +16,7 @@
 
 use crate::client::Client;
 use crate::context::DurableContext;
-use crate::engine::{DurableEngine, WorkflowOptions, INTERNAL_QUEUE};
+use crate::engine::{retry_dedup, DurableEngine, WorkflowOptions, INTERNAL_QUEUE};
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::StateProvider;
@@ -238,7 +238,7 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
     let timeout_ms = timeout.as_millis() as i64;
     let provider = backend.provider();
 
-    loop {
+    retry_dedup(|| async {
         let target_id = uuid::Uuid::new_v4().to_string();
         let dinput = DebouncerInput {
             target_name: target.to_string(),
@@ -250,7 +250,7 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
         };
         // First call for this key wins the dedup slot and starts the collector.
         match backend.enqueue_debouncer(dinput, key).await {
-            Ok(()) => return Ok(target_id),
+            Ok(()) => Ok(Some(target_id)),
             Err(e) if e.code() == ErrorCode::QueueDeduplicated => {
                 // A collector for this key is already running: push it the new
                 // input instead of starting another.
@@ -258,10 +258,10 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
                     .get_deduplicated_workflow(INTERNAL_QUEUE, key)
                     .await?
                 else {
-                    continue; // it finished between our enqueue and lookup; retry
+                    return Ok(None); // the slot was freed; retry
                 };
                 let Some(status) = provider.get_workflow_status(&existing).await? else {
-                    continue;
+                    return Ok(None);
                 };
                 let existing_input: DebouncerInput = serde_json::from_value(status.input)?;
                 let message_id = uuid::Uuid::new_v4().to_string();
@@ -278,13 +278,14 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
                 // Wait for the collector to ACK; if it already finished, start a
                 // fresh one on the next loop.
                 if backend.get_ack(&existing, &message_id).await?.is_none() {
-                    continue;
+                    return Ok(None);
                 }
-                return Ok(existing_input.target_id);
+                Ok(Some(existing_input.target_id))
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
-    }
+    })
+    .await
 }
 
 /// Debounces a target workflow. Create one with

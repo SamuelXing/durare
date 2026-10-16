@@ -10,9 +10,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `DurableContext::enqueue_workflow` enqueues named children without a local
   workflow registration, preserving child checkpoints and identity inheritance.
-  Queued `start_workflow` children also accept remote targets. Remote targets
-  require an explicit target application version and a producer-only queue
-  excluded from local dispatch with `listen_queues`.
+  Remote targets require an explicit target application version and a
+  producer-only queue excluded from local dispatch with `listen_queues`.
 - `WorkflowResultOptions` and `WorkflowHandle::result_with_options` configure
   the database polling interval and an optional wait timeout. Cancelling a result
   wait preserves the local task for a later wait or another handle clone. Wait
@@ -36,6 +35,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   all existing descendants, including through completed ancestors. The conductor
   now honors `cancel_children`. Existing cancellation calls remain root-only.
   In-memory cancellation now matches SQL providers for parked workflows.
+
+### Changed
+
+- Queued `start_workflow` children can target workflows not registered locally
+  when an explicit target version and producer-only queue are supplied.
+  Both child APIs reject empty workflow names and empty queue names.
+- Semantic child-call rejections now persist their claimed position and typed
+  error for replay and verification. Input serialization failures retain 0.5.0's
+  no-position behavior, so existing subsequent step checkpoints stay aligned.
+- Engine/client/child enqueue and debouncer deduplication races share a bounded
+  retry budget; exhausted races report an observation failure. Returning an
+  existing enqueue verifies the workflow name, class, and configured instance.
 
 ### Fixed
 

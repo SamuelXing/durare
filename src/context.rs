@@ -980,8 +980,11 @@ impl DurableContext {
     /// the engine version by default, just like `start_workflow`.
     ///
     /// Like [`start_workflow`](Self::start_workflow), this consumes one durable
-    /// position, records the child link, inherits identity per field, and returns
-    /// the original child on replay. An omitted or empty child ID derives from
+    /// position after input serialization succeeds, records the child link,
+    /// inherits identity per field, and returns the original child on replay.
+    /// Semantic rejections at a claimed position are checkpointed with their
+    /// original error codes. Input serialization failures consume no position,
+    /// preserving released 0.5.0 histories. An omitted or empty child ID derives from
     /// the parent ID and position. This is an enqueue operation, not a step body
     /// operation: call it directly from the workflow body.
     ///
@@ -1001,9 +1004,11 @@ impl DurableContext {
     /// # Errors
     ///
     /// An application error for an empty queue or workflow name or invalid
-    /// deduplication options, a remote target without an explicit version or a
-    /// producer-only queue, or an existing ID/key belonging to a different
-    /// target; [`Error::UnknownQueue`] for an unregistered queue;
+    /// deduplication options, a remote queue still dispatched by the producer,
+    /// or an existing ID/key belonging to a different target;
+    /// [`Error::UnknownWorkflow`] when the target is not registered locally and
+    /// no explicit nonempty target version is supplied;
+    /// [`Error::UnknownQueue`] for an unregistered queue;
     /// [`Error::QueueDeduplicated`] for a conflicting deduplication key under
     /// the reject policy; the same scope and replay errors as `start_workflow`.
     pub fn enqueue_workflow<'a, I, O>(
@@ -1032,10 +1037,16 @@ impl DurableContext {
         I: Serialize,
         O: Send + 'a,
     {
-        // All child calls claim their position before argument validation;
-        // scope errors take precedence and even invalid calls keep stable IDs.
+        // Preserve released 0.5.0 positions: input serialization failures do
+        // not consume a slot. Check scope first, before invoking user serde.
+        if let Err(error) = self.refuse_inside_body(operation) {
+            return PendingStep::failed(error);
+        }
+        let input_json = match serde_json::to_value(input) {
+            Ok(value) => value,
+            Err(error) => return PendingStep::failed(error.into()),
+        };
         let position = claim!(self, operation);
-        let input_json = serde_json::to_value(input);
         let name = name.to_owned();
         let seq = position.seq();
         PendingStep::new(position, async move {
@@ -1051,61 +1062,87 @@ impl DurableContext {
                 self.check_recorded(seq, &name, &recorded)?;
                 return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
             }
-            // Starting a child is a side effect; a verification run stops here
-            // rather than launching one.
-            self.refuse_live_work(seq, &name)?;
-
-            if operation == "enqueue_workflow" {
-                if opts.queue.as_deref().is_none_or(str::is_empty) {
+            // A rejected child is an ordinary failed checkpoint at the same
+            // position. Serve it before validation or verification's live-work
+            // gate, preserving both its error code and the caller's branch.
+            if self.serve_recorded::<Value>(seq, &name).await?.is_some() {
+                return Err(Error::unexpected_step(
+                    &self.workflow_id,
+                    seq,
+                    "child workflow",
+                    "ordinary step",
+                ));
+            }
+            let outcome = async {
+                if opts.queue.as_deref() == Some("") {
                     return Err(Error::app("queue name is required"));
                 }
                 if name.is_empty() {
                     return Err(Error::app("workflow name is required"));
                 }
+                let child_id = opts
+                    .workflow_id
+                    .clone()
+                    // An explicit empty id means "assign one for me": fall through to the
+                    // deterministic `{parent}-{seq}` so an empty id is never persisted.
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
+                opts.workflow_id = Some(child_id.clone());
+
+                // The child inherits this workflow's identity **per field**: each auth
+                // field set on `opts` overrides just that field, and every unset field
+                // falls back to the parent's — so overriding only the assumed role still
+                // carries the parent's user and roles (matching the reference SDKs).
+                let child_auth = AuthContext {
+                    authenticated_user: opts
+                        .authenticated_user
+                        .clone()
+                        .or_else(|| self.auth.authenticated_user.clone()),
+                    assumed_role: opts
+                        .assumed_role
+                        .clone()
+                        .or_else(|| self.auth.assumed_role.clone()),
+                    authenticated_roles: if opts.authenticated_roles.is_empty() {
+                        self.auth.authenticated_roles.clone()
+                    } else {
+                        opts.authenticated_roles.clone()
+                    },
+                };
+
+                self.runtime
+                    .spawn_child(
+                        &child_id,
+                        &name,
+                        input_json,
+                        opts,
+                        &self.workflow_id,
+                        child_auth,
+                    )
+                    .await
             }
-            let input_json = input_json?;
-
-            let child_id = opts
-                .workflow_id
-                .clone()
-                // An explicit empty id means "assign one for me": fall through to the
-                // deterministic `{parent}-{seq}` so an empty id is never persisted.
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("{}-{}", self.workflow_id, seq));
-            opts.workflow_id = Some(child_id.clone());
-
-            // The child inherits this workflow's identity **per field**: each auth
-            // field set on `opts` overrides just that field, and every unset field
-            // falls back to the parent's — so overriding only the assumed role still
-            // carries the parent's user and roles (matching the reference SDKs).
-            let child_auth = AuthContext {
-                authenticated_user: opts
-                    .authenticated_user
-                    .clone()
-                    .or_else(|| self.auth.authenticated_user.clone()),
-                assumed_role: opts
-                    .assumed_role
-                    .clone()
-                    .or_else(|| self.auth.assumed_role.clone()),
-                authenticated_roles: if opts.authenticated_roles.is_empty() {
-                    self.auth.authenticated_roles.clone()
-                } else {
-                    opts.authenticated_roles.clone()
-                },
+            .await;
+            let child_id = match outcome {
+                Ok(id) => id,
+                Err(error) => {
+                    let error = self.execution.record(error);
+                    if matches!(
+                        error,
+                        Error::RecoveryRequired(_)
+                            | Error::ObservationFailed(_)
+                            | Error::UnexpectedStep { .. }
+                            | Error::WorkflowConflict(_)
+                            | Error::ReplayDiverged { .. }
+                    ) || error.is_cancellation_for(&self.workflow_id)
+                        || error.is_scope_violation()
+                    {
+                        return Err(error);
+                    }
+                    return self
+                        .record_failure::<String>(seq, &name, error, None)
+                        .await
+                        .map(|id| WorkflowHandle::polling(id, self.provider.clone()));
+                }
             };
-
-            let child_id = self
-                .runtime
-                .spawn_child(
-                    &child_id,
-                    &name,
-                    input_json,
-                    opts,
-                    &self.workflow_id,
-                    child_auth,
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
             self.provider
                 .record_child_workflow(&self.workflow_id, seq, &name, &child_id)
                 .await
