@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -1098,6 +1098,18 @@ impl DurableEngine {
                     provider: self.provider.clone(),
                     workflows: self.workflows.clone(),
                     queues: self.queues.clone(),
+                    producer_only_queues: self
+                        .queues
+                        .keys()
+                        .filter(|name| {
+                            name.as_str() != INTERNAL_QUEUE
+                                && self
+                                    .listen_filter
+                                    .as_ref()
+                                    .is_some_and(|listen| !listen.contains(*name))
+                        })
+                        .cloned()
+                        .collect(),
                     required_roles: self.required_roles.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
@@ -2983,6 +2995,8 @@ pub(crate) struct Runtime {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
     queues: HashMap<String, Arc<WorkflowQueue>>,
+    // Only these queues are safe for a producer with no target handler.
+    producer_only_queues: HashSet<String>,
     /// Required-roles declarations keyed by workflow name; enforced before a
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
@@ -3214,56 +3228,155 @@ impl Runtime {
         parent_id: &str,
         auth: AuthContext,
     ) -> Result<String> {
-        // Only inline execution needs a local handler. Queued children may be
-        // implemented by another process or SDK.
-        let handler = if opts.queue.is_none() {
-            Some(
-                self.workflows
-                    .get(&registry_key(name, opts.config_name.as_deref()))
-                    .cloned()
-                    .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?,
-            )
-        } else {
-            None
-        };
-        let (canonical, queued, created) = loop {
-            match self
-                .insert_run(
-                    child_id,
-                    name,
-                    input_json.clone(),
-                    &opts,
-                    Some(parent_id),
-                    &auth,
-                )
-                .await
-            {
-                Ok(run) => break run,
-                Err(error)
-                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
-                        && error.code() == ErrorCode::QueueDeduplicated =>
-                {
-                    if let (Some(queue), Some(key)) =
-                        (opts.queue.as_deref(), opts.dedup_id.as_deref())
-                    {
-                        if let Some(existing) = self
-                            .provider
-                            .get_deduplicated_workflow(queue, key)
-                            .await
-                            .map_err(crate::execution::observation_error)?
-                        {
-                            return Ok(existing);
-                        }
-                    }
-                }
-                Err(error) => return Err(error),
+        let handler = self
+            .workflows
+            .get(&registry_key(name, opts.config_name.as_deref()))
+            .cloned();
+        if let Some(queue) = opts.queue.as_deref() {
+            if !self.queues.contains_key(queue) {
+                return Err(Error::UnknownQueue(queue.to_owned()));
             }
-        };
+            if handler.is_none() {
+                if opts.app_version.as_deref().is_none_or(str::is_empty) {
+                    return Err(Error::app("remote children require an explicit nonempty app_version; unset versions only route to the latest registered version"));
+                }
+                if !self.producer_only_queues.contains(queue) {
+                    return Err(Error::app("remote child queues must be registered and excluded from local dispatch using listen_queues"));
+                }
+            }
+        } else if handler.is_none() {
+            return Err(Error::UnknownWorkflow(name.to_owned()));
+        }
+        let (canonical, queued, created) = self
+            .insert_child_run(child_id, name, input_json, &opts, parent_id, &auth)
+            .await?;
         let id = canonical.id.clone();
         if created && !queued && !is_terminal(&canonical.status) {
             self.spawn_detached(canonical, handler.expect("inline child has a handler"));
         }
         Ok(id)
+    }
+
+    /// Bound the insert/lookup race when a deduplication slot is freed between
+    /// calls. Exhaustion is an observation failure, never a business outcome.
+    async fn insert_child_run(
+        &self,
+        child_id: &str,
+        name: &str,
+        input_json: Value,
+        opts: &WorkflowOptions,
+        parent_id: &str,
+        auth: &AuthContext,
+    ) -> Result<(WorkflowStatus, bool, bool)> {
+        retry_child_insert(|| async {
+            let run = match self
+                .insert_run(
+                    child_id,
+                    name,
+                    input_json.clone(),
+                    opts,
+                    Some(parent_id),
+                    auth,
+                )
+                .await
+            {
+                Ok(run) => Some(run),
+                Err(error)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && error.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    let queue = opts
+                        .queue
+                        .as_deref()
+                        .expect("validated queued deduplication");
+                    let key = opts
+                        .dedup_id
+                        .as_deref()
+                        .expect("validated deduplication key");
+                    match self
+                        .provider
+                        .get_deduplicated_workflow(queue, key)
+                        .await
+                        .map_err(crate::execution::observation_error)?
+                    {
+                        Some(id) => self
+                            .provider
+                            .get_workflow_status(&id)
+                            .await
+                            .map_err(crate::execution::observation_error)?
+                            .filter(|row| {
+                                !is_terminal(&row.status)
+                                    && row.dedup_id.as_deref() == Some(key)
+                                    && row.queue_name.as_deref() == Some(queue)
+                            })
+                            .map(|row| (row, true, false)),
+                        None => None,
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some((row, queued, created)) = run {
+                if row.name != name
+                    || row.config_name != opts.config_name
+                    || row.class_name != opts.class_name
+                {
+                    return Err(Error::app("existing workflow ID or deduplication key belongs to a different workflow target"));
+                }
+                return Ok(Some((row, queued, created)));
+            }
+            Ok(None)
+        }).await
+    }
+}
+
+/// Retry only a raced-away deduplication slot, yielding between attempts so
+/// cancellation remains possible. Keep this budget independent of body retries.
+async fn retry_child_insert<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    const MAX_DEDUP_ATTEMPTS: usize = 8;
+    for index in 0..MAX_DEDUP_ATTEMPTS {
+        if let Some(value) = attempt().await? {
+            return Ok(value);
+        }
+        if index + 1 < MAX_DEDUP_ATTEMPTS {
+            tokio::task::yield_now().await;
+        }
+    }
+    Err(Error::ObservationFailed(Arc::new(Error::app(
+        "child enqueue deduplication race retry limit exceeded",
+    ))))
+}
+
+#[cfg(test)]
+mod child_enqueue_retry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dedup_race_budget_is_bounded() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_child_insert(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<Option<()>, Error>(None) }
+        })
+        .await;
+        assert!(matches!(result, Err(Error::ObservationFailed(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn freed_slot_can_succeed_on_retry() -> Result<()> {
+        let calls = AtomicUsize::new(0);
+        let value = retry_child_insert(|| {
+            let number = calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, Error>((number == 2).then_some(42)) }
+        })
+        .await?;
+        assert_eq!(value, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        Ok(())
     }
 }
 

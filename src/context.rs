@@ -923,6 +923,9 @@ impl DurableContext {
     /// field — each auth field set on `opts` overrides just that field — and
     /// records its `parent_workflow_id`. Pass
     /// `opts.queue` to route the child through a queue instead of running it inline.
+    /// A queued target absent from the local registry requires an explicit
+    /// nonempty `app_version` and a queue excluded with `listen_queues`, as
+    /// documented on [`enqueue_workflow`](Self::enqueue_workflow).
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, WorkflowOptions};
@@ -968,8 +971,13 @@ impl DurableContext {
     /// The queue must be registered with the engine; use
     /// [`DurableEngine::listen_queues`](crate::DurableEngine::listen_queues) to
     /// exclude remote queues from this process's dispatchers. `opts.queue` is
-    /// overridden by `queue_name`. Unless explicitly supplied, the application
-    /// version is empty so a worker of any version can claim the child.
+    /// overridden by `queue_name`. A remote target (not registered locally)
+    /// requires a nonempty [`WorkflowOptions::app_version`] naming the target
+    /// worker version and a queue excluded from local dispatch using
+    /// `listen_queues`. Invalid routing is rejected before insertion. Unset
+    /// versions do **not** mean any worker: unversioned rows route only to the
+    /// latest registered application version. Locally registered targets use
+    /// the engine version by default, just like `start_workflow`.
     ///
     /// Like [`start_workflow`](Self::start_workflow), this consumes one durable
     /// position, records the child link, inherits identity per field, and returns
@@ -981,7 +989,8 @@ impl DurableContext {
     /// # use durare::{DurableContext, Result, WorkflowOptions};
     /// # async fn example(ctx: DurableContext) -> Result<()> {
     /// let child = ctx.enqueue_workflow::<_, String>(
-    ///     "python-workers", "process_order", "order-123", WorkflowOptions::default(),
+    ///     "python-workers", "process_order", "order-123",
+    ///     WorkflowOptions::default().app_version("python-worker-v1"),
     /// ).await?;
     /// let output = child.result().await?;
     /// # let _ = output;
@@ -992,7 +1001,9 @@ impl DurableContext {
     /// # Errors
     ///
     /// An application error for an empty queue or workflow name or invalid
-    /// deduplication options; [`Error::UnknownQueue`] for an unregistered queue;
+    /// deduplication options, a remote target without an explicit version or a
+    /// producer-only queue, or an existing ID/key belonging to a different
+    /// target; [`Error::UnknownQueue`] for an unregistered queue;
     /// [`Error::QueueDeduplicated`] for a conflicting deduplication key under
     /// the reject policy; the same scope and replay errors as `start_workflow`.
     pub fn enqueue_workflow<'a, I, O>(
@@ -1006,14 +1017,7 @@ impl DurableContext {
         I: Serialize,
         O: Send + 'a,
     {
-        if queue_name.is_empty() {
-            return PendingStep::failed(Error::app("queue name is required"));
-        }
-        if workflow_name.is_empty() {
-            return PendingStep::failed(Error::app("workflow name is required"));
-        }
         opts.queue = Some(queue_name.to_owned());
-        opts.app_version.get_or_insert_with(String::new);
         self.start_workflow_impl(workflow_name, input, opts, "enqueue_workflow")
     }
 
@@ -1028,14 +1032,11 @@ impl DurableContext {
         I: Serialize,
         O: Send + 'a,
     {
-        // Encoded before the position is claimed, so an input that will not
-        // serialize fails without moving the counter.
-        let input_json = match serde_json::to_value(input) {
-            Ok(input_json) => input_json,
-            Err(e) => return PendingStep::failed(e.into()),
-        };
-        let name = name.to_owned();
+        // All child calls claim their position before argument validation;
+        // scope errors take precedence and even invalid calls keep stable IDs.
         let position = claim!(self, operation);
+        let input_json = serde_json::to_value(input);
+        let name = name.to_owned();
         let seq = position.seq();
         PendingStep::new(position, async move {
             // Replay: re-attach to the child already started at this step. A
@@ -1053,6 +1054,16 @@ impl DurableContext {
             // Starting a child is a side effect; a verification run stops here
             // rather than launching one.
             self.refuse_live_work(seq, &name)?;
+
+            if operation == "enqueue_workflow" {
+                if opts.queue.as_deref().is_none_or(str::is_empty) {
+                    return Err(Error::app("queue name is required"));
+                }
+                if name.is_empty() {
+                    return Err(Error::app("workflow name is required"));
+                }
+            }
+            let input_json = input_json?;
 
             let child_id = opts
                 .workflow_id

@@ -10,7 +10,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `DurableContext::enqueue_workflow` enqueues named children without a local
   workflow registration, preserving child checkpoints and identity inheritance.
-  Queued `start_workflow` children also accept remote targets.
+  Queued `start_workflow` children also accept remote targets. Remote targets
+  require an explicit target application version and a producer-only queue
+  excluded from local dispatch with `listen_queues`.
 - `WorkflowResultOptions` and `WorkflowHandle::result_with_options` configure
   the database polling interval and an optional wait timeout. Cancelling a result
   wait preserves the local task for a later wait or another handle clone. Wait
