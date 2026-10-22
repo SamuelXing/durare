@@ -924,8 +924,9 @@ impl DurableContext {
     /// records its `parent_workflow_id`. Pass
     /// `opts.queue` to route the child through a queue instead of running it inline.
     /// A queued target absent from the local registry requires an explicit
-    /// nonempty `app_version` and a queue excluded with `listen_queues`, as
-    /// documented on [`enqueue_workflow`](Self::enqueue_workflow).
+    /// nonempty `app_version`. If it matches this producer's version, the queue
+    /// must be excluded with `listen_queues`; see [`enqueue_workflow`](Self::enqueue_workflow).
+    /// An unregistered inline child returns [`Error::UnknownWorkflow`].
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result, WorkflowOptions};
@@ -968,23 +969,24 @@ impl DurableContext {
     /// Enqueue a child workflow by name, including one implemented in another
     /// process or language. No local workflow registration is required.
     ///
-    /// The queue must be registered with the engine; use
-    /// [`DurableEngine::listen_queues`](crate::DurableEngine::listen_queues) to
-    /// exclude remote queues from this process's dispatchers. `opts.queue` is
-    /// overridden by `queue_name`. A remote target (not registered locally)
-    /// requires a nonempty [`WorkflowOptions::app_version`] naming the target
-    /// worker version and a queue excluded from local dispatch using
-    /// `listen_queues`. Invalid routing interrupts execution for recovery before
-    /// insertion; fixing the configuration allows a later recovery to retry. Unset
-    /// versions do **not** mean any worker: unversioned rows route only to the
-    /// latest registered application version. Locally registered targets use
-    /// the engine version by default, just like `start_workflow`.
+    /// The queue must be registered with the engine. `opts.queue` is overridden
+    /// by `queue_name`. A remote target (not registered locally) requires an
+    /// explicit nonempty [`WorkflowOptions::app_version`] naming its worker version.
+    /// If that version differs from this producer's, the version gate prevents
+    /// this producer from claiming the child. If it matches, exclude the queue
+    /// from local dispatch with [`DurableEngine::listen_queues`](crate::DurableEngine::listen_queues).
+    /// Unsafe same-version routing interrupts execution for recovery before
+    /// insertion; fixing the configuration allows a later recovery to retry.
+    /// Locally registered targets use the engine version by default, just like
+    /// `start_workflow`. Unversioned client rows route only to the latest
+    /// registered application version, not to arbitrary worker versions.
     ///
     /// Like [`start_workflow`](Self::start_workflow), this consumes one durable
     /// position after input serialization succeeds, records the child link,
     /// inherits identity per field, and returns the original child on replay.
-    /// Invalid-argument rejections at a claimed position are checkpointed with their
-    /// original error codes. Input serialization failures consume no position,
+    /// Invalid arguments and `Reject` deduplication conflicts are checkpointed
+    /// with their original errors. Replay preserves a caught rejection even if
+    /// its deduplication key has since been freed. Input serialization failures consume no position,
     /// preserving released 0.5.0 histories. An omitted or empty child ID derives from
     /// the parent ID and position. This is an enqueue operation, not a step body
     /// operation: call it directly from the workflow body.
@@ -1004,14 +1006,14 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// An application error for an empty queue or workflow name, invalid
-    /// deduplication options, or an existing ID/key belonging to a different
-    /// target. [`Error::RecoveryRequired`] wraps [`Error::UnknownWorkflow`] for
-    /// an unresolved target, [`Error::UnknownQueue`] for an unregistered queue,
-    /// or an application error for unsafe remote routing. These configuration
-    /// failures interrupt execution without a permanent rejection checkpoint;
-    /// [`Error::QueueDeduplicated`] for a conflicting deduplication key under
-    /// the reject policy; the same scope and replay errors as `start_workflow`.
+    /// An application error for an empty queue or workflow name, missing/empty
+    /// remote target version, invalid deduplication options, or an existing ID/key
+    /// belonging to a different target. [`Error::RecoveryRequired`] wraps
+    /// [`Error::UnknownQueue`] for an unregistered queue or an application error
+    /// for unsafe same-version remote routing. These configuration failures
+    /// interrupt execution without a permanent rejection checkpoint.
+    /// [`Error::QueueDeduplicated`] reports a conflicting key under `Reject`;
+    /// the same scope and replay errors as `start_workflow` also apply.
     pub fn enqueue_workflow<'a, I, O>(
         &'a self,
         queue_name: &str,

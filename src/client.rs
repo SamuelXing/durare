@@ -60,8 +60,8 @@ impl Client {
     /// [`PostgresProvider`](crate::PostgresProvider) connected to the system
     /// database). The database must already be initialized by the application.
     ///
-    /// Enqueued work is left version-agnostic (empty application version), so any
-    /// executor claims it regardless of its version. Use
+    /// Enqueued work has an empty application version by default, so only
+    /// workers on the latest registered application version can claim it. Use
     /// [`with_app_version`](Self::with_app_version) to gate it to one version.
     pub fn new(provider: Arc<dyn StateProvider>) -> Self {
         Self {
@@ -132,8 +132,8 @@ impl Client {
         } else {
             STATUS_ENQUEUED
         };
-        // A per-enqueue version override, else the client default (empty ⇒ any
-        // executor claims it).
+        // A per-enqueue version override, else the client default (empty ⇒
+        // workers on the latest registered version may claim it).
         let app_version = opts.app_version.as_deref().unwrap_or(&self.app_version);
 
         // Unowned (empty executor) until a dispatcher claims it.

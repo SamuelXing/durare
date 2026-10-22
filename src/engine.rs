@@ -3269,18 +3269,22 @@ impl Runtime {
             }
             if handler.is_none() {
                 if opts.app_version.as_deref().is_none_or(str::is_empty) {
-                    return Err(crate::execution::recovery_error(Error::UnknownWorkflow(
-                        name.to_owned(),
-                    )));
+                    return Err(Error::app(
+                        "remote child requires an explicit nonempty app_version naming its worker version",
+                    ));
                 }
-                if !self.is_producer_only(queue) {
-                    return Err(crate::execution::recovery_error(Error::app("remote child queues must be registered and excluded from local dispatch using listen_queues")));
+                // A foreign version cannot be claimed by this producer. A
+                // same-version remote target still needs a producer-only queue.
+                if opts.app_version.as_deref() == Some(self.app_version.as_str())
+                    && !self.is_producer_only(queue)
+                {
+                    return Err(crate::execution::recovery_error(Error::app(
+                        "same-version remote child queues must be excluded from local dispatch using listen_queues",
+                    )));
                 }
             }
         } else if handler.is_none() {
-            return Err(crate::execution::recovery_error(Error::UnknownWorkflow(
-                name.to_owned(),
-            )));
+            return Err(Error::UnknownWorkflow(name.to_owned()));
         }
         let (row, queued) =
             self.build_run(child_id, name, input_json, &opts, Some(parent_id), &auth)?;
@@ -3343,7 +3347,10 @@ impl Runtime {
                 .insert_run(child_id, name, input_json.clone(), opts, parent_id, auth)
                 .await
             {
-                Ok(run) => Some(run),
+                Ok(run) => {
+                    check_workflow_target(&run.0, name, opts)?;
+                    Some(run)
+                }
                 Err(error)
                     if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
                         && error.code() == ErrorCode::QueueDeduplicated =>
@@ -3355,11 +3362,7 @@ impl Runtime {
                 }
                 Err(error) => return Err(error),
             };
-            if let Some((row, queued, created)) = run {
-                check_workflow_target(&row, name, opts)?;
-                return Ok(Some((row, queued, created)));
-            }
-            Ok(None)
+            Ok(run)
         })
         .await
     }
@@ -3370,13 +3373,12 @@ pub(crate) fn check_workflow_target(
     name: &str,
     opts: &WorkflowOptions,
 ) -> Result<()> {
-    if row.name != name || row.config_name != opts.config_name || row.class_name != opts.class_name
-    {
-        return Err(Error::app(
-            "existing workflow ID or deduplication key belongs to a different workflow target",
-        ));
-    }
-    Ok(())
+    crate::provider::check_target(
+        row,
+        name,
+        opts.class_name.as_deref(),
+        opts.config_name.as_deref(),
+    )
 }
 
 pub(crate) async fn find_dedup_target(

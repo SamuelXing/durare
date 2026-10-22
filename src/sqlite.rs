@@ -1666,34 +1666,23 @@ impl StateProvider for SqliteProvider {
         if parent.get::<String, _>("status") == STATUS_CANCELLED {
             return Err(Error::Cancelled(parent_id.to_owned()));
         }
-        let mut attempts = 0;
-        let (canonical, created) = loop {
-            attempts += 1;
-            if let Some(run) = self
-                .insert_status_on(&mut tx, &child, return_existing)
-                .await?
-            {
-                break run;
-            }
-            // An INSERT conflict can disappear before this read on Postgres.
-            // Retry inside this transaction; no decision is exposed until the
-            // parent checkpoint commits alongside it.
-            if let Some(row) = sqlx::query(&format!(
-                "SELECT {SELECT_COLS} FROM workflow_status WHERE queue_name = ? AND deduplication_id = ?"
-            ))
-            .bind(&child.queue_name)
-            .bind(&child.dedup_id)
-            .fetch_optional(&mut *tx)
+        let (canonical, created) = match self
+            .insert_status_on(&mut tx, &child, return_existing)
             .await?
         {
-                break (row_to_status(&self.serializer, &row), false);
+            Some(run) => run,
+            None => {
+                // BEGIN IMMEDIATE owns SQLite's writer lock. A conflicting
+                // dedup slot cannot disappear between the insert and this read.
+                let row = sqlx::query(&format!(
+                    "SELECT {SELECT_COLS} FROM workflow_status WHERE queue_name = ? AND deduplication_id = ?"
+                ))
+                .bind(&child.queue_name)
+                .bind(&child.dedup_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                (row_to_status(&self.serializer, &row), false)
             }
-            if attempts == 8 {
-                return Err(crate::execution::recovery_error(Error::app(
-                    "child deduplication race retry limit exceeded",
-                )));
-            }
-            tokio::task::yield_now().await;
         };
         crate::provider::check_child_target(&canonical, &child)?;
         let recorded = sqlx::query(

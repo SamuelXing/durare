@@ -25,9 +25,23 @@ pub(crate) fn dedup_or(e: sqlx::Error, s: &WorkflowStatus) -> Error {
 
 /// A deduplication key must not silently adopt another workflow's output.
 pub(crate) fn check_child_target(row: &WorkflowStatus, requested: &WorkflowStatus) -> Result<()> {
-    if row.name != requested.name
-        || row.class_name != requested.class_name
-        || row.config_name != requested.config_name
+    check_target(
+        row,
+        &requested.name,
+        requested.class_name.as_deref(),
+        requested.config_name.as_deref(),
+    )
+}
+
+pub(crate) fn check_target(
+    row: &WorkflowStatus,
+    name: &str,
+    class_name: Option<&str>,
+    config_name: Option<&str>,
+) -> Result<()> {
+    if row.name != name
+        || row.class_name.as_deref() != class_name
+        || row.config_name.as_deref() != config_name
     {
         return Err(Error::app(
             "existing workflow ID or deduplication key belongs to a different workflow target",

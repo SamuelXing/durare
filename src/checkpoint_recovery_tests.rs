@@ -818,8 +818,8 @@ async fn child_arguments_are_recorded_but_configuration_faults_interrupt() -> Re
                 Ok(_) => panic!("invalid child start must fail"),
             };
             ctx.step("handled", || async {
-                assert_eq!(
-                    kind, "delay",
+                assert_ne!(
+                    kind, "queue",
                     "caught configuration fault allowed fresh work"
                 );
                 Ok(error.code())
@@ -831,19 +831,21 @@ async fn child_arguments_are_recorded_but_configuration_faults_interrupt() -> Re
             .await?
             .result()
             .await;
-        if kind == "delay" {
-            assert_eq!(result?, ErrorCode::Application);
+        if kind != "queue" {
+            assert_eq!(
+                result?,
+                if kind == "workflow" {
+                    ErrorCode::WorkflowNotRegistered
+                } else {
+                    ErrorCode::Application
+                }
+            );
             assert_eq!(engine.verify_replay(kind).await?.divergence, None);
         } else {
             match result {
-                Err(Error::RecoveryRequired(cause)) => assert_eq!(
-                    cause.code(),
-                    if kind == "workflow" {
-                        ErrorCode::WorkflowNotRegistered
-                    } else {
-                        ErrorCode::QueueNotRegistered
-                    }
-                ),
+                Err(Error::RecoveryRequired(cause)) => {
+                    assert_eq!(cause.code(), ErrorCode::QueueNotRegistered)
+                }
                 other => panic!("configuration error must interrupt: {other:?}"),
             }
             assert!(provider.get_workflow_steps(kind).await?.is_empty());

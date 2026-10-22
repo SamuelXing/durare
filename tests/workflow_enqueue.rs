@@ -86,6 +86,23 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
             .await?;
         Ok::<_, Error>(child.id().to_string())
     });
+    engine.register("reject", |ctx: DurableContext, _: ()| async move {
+        match ctx
+            .enqueue_workflow::<_, ()>(
+                "remote",
+                "external",
+                (),
+                WorkflowOptions::default()
+                    .app_version("target-version")
+                    .dedup_id("reject-key"),
+            )
+            .await
+        {
+            Err(Error::QueueDeduplicated { .. }) => Ok("rejected".to_owned()),
+            Err(error) => Err(error),
+            Ok(_) => Ok("enqueued".to_owned()),
+        }
+    });
     engine.register("gap", |ctx: DurableContext, _: ()| async move {
         let child = ctx
             .enqueue_workflow::<_, ()>(
@@ -148,9 +165,9 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
                 Err(Error::App { .. })
             ));
             assert!(matches!(
-                ctx.start_workflow::<_, ()>("", (), WorkflowOptions::default())
+                ctx.start_workflow::<_, ()>("typo", (), WorkflowOptions::default())
                     .await,
-                Err(Error::App { .. })
+                Err(Error::UnknownWorkflow(name)) if name == "typo"
             ));
             ctx.step("after-refusals", || async {
                 effect_counter.fetch_add(1, Ordering::SeqCst);
@@ -336,6 +353,43 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
     assert_eq!(refusal_effects.load(Ordering::SeqCst), 1);
     assert_eq!(engine.get_workflow_steps("refusals").await?.len(), 4);
 
+    let mut holder = durare::WorkflowStatus::new(
+        "reject-holder",
+        "external",
+        json!(null),
+        STATUS_PENDING,
+        "worker",
+        "target-version",
+    );
+    holder.queue_name = Some("remote".into());
+    holder.dedup_id = Some("reject-key".into());
+    provider.insert_workflow_status(holder).await?;
+    let rejected = engine
+        .start::<_, String>("reject", (), WorkflowOptions::with_id("reject-parent"))
+        .await?;
+    assert_eq!(rejected.result().await?, "rejected");
+    provider
+        .set_workflow_status("reject-holder", durare::STATUS_SUCCESS, None, None)
+        .await?;
+    provider
+        .set_workflow_status("reject-parent", STATUS_PENDING, None, None)
+        .await?;
+    assert_eq!(engine.recover().await?, 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), rejected.result())
+            .await
+            .unwrap()?,
+        "rejected"
+    );
+    assert_eq!(
+        engine.verify_replay("reject-parent").await?.divergence,
+        None
+    );
+    assert!(provider
+        .get_workflow_status("reject-parent-0")
+        .await?
+        .is_none());
+
     // Released 0.5.0 wrote no position for the rejected input, so its next
     // side effect was checkpointed at zero. Seed that exact history layout.
     provider
@@ -402,7 +456,8 @@ async fn worker_launch_order_contract(provider: Arc<dyn StateProvider>) -> Resul
         parent_builder.app_version("parent-version");
         let mut parent = parent_builder.build().await?;
         parent.register_queue(WorkflowQueue::new("remote"));
-        parent.listen_queues(Vec::<String>::new());
+        // Both processes dispatch this queue. The explicit foreign version
+        // must prevent the producer from claiming its own remote child.
         parent.register("parent", |ctx: DurableContext, n: i64| async move {
             ctx.enqueue_workflow::<_, i64>(
                 "remote",
@@ -547,20 +602,26 @@ async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
 }
 
 #[tokio::test]
-async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
+async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Result<()> {
     for producer_only in [false, true] {
-        for version in [None, Some(""), Some("producer-version")] {
-            if producer_only && version == Some("producer-version") {
-                continue;
-            }
+        for version in [
+            None,
+            Some(""),
+            Some("producer-version"),
+            Some("worker-version"),
+        ] {
             let provider = Arc::new(InMemoryProvider::new());
-            let mut engine = DurableEngine::new(provider.clone()).await?;
+            let mut builder = DurableEngine::builder(provider.clone());
+            builder.app_version("producer-version");
+            let mut engine = builder.build().await?;
             engine.register_queue(WorkflowQueue::new("remote"));
-            if producer_only {
+            if !producer_only {
                 engine.listen_queues(Vec::<String>::new());
             }
+            let missing = version.is_none_or(str::is_empty);
+            let unsafe_route = !producer_only && version == Some("producer-version");
             engine.register("parent", move |ctx: DurableContext, _: ()| async move {
-                let error = ctx
+                let result = ctx
                     .enqueue_workflow::<_, ()>(
                         "remote",
                         "external",
@@ -570,36 +631,55 @@ async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
                             ..Default::default()
                         },
                     )
-                    .await
-                    .err()
-                    .expect("unsafe route accepted");
-                assert!(matches!(error, Error::RecoveryRequired(_)));
-                // Catching an infrastructure error cannot authorize fresh work.
-                assert!(matches!(
-                    ctx.step("after", || async {
-                        panic!("must not run");
-                        #[allow(unreachable_code)]
-                        Ok(())
-                    })
-                    .await,
-                    Err(Error::RecoveryRequired(_))
-                ));
-                Ok(())
+                    .await;
+                if missing {
+                    let error = result.err().expect("missing target version accepted");
+                    assert!(matches!(error, Error::App { .. }));
+                    assert!(error.to_string().contains("explicit nonempty app_version"));
+                } else if unsafe_route {
+                    assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+                    assert!(matches!(
+                        ctx.step("forbidden", || async {
+                            panic!("must not run");
+                            #[allow(unreachable_code)]
+                            Ok(())
+                        })
+                        .await,
+                        Err(Error::RecoveryRequired(_))
+                    ));
+                    return Ok(());
+                } else {
+                    assert_eq!(result?.id(), "guard-0");
+                }
+                ctx.step("after", || async { Ok(()) }).await
+            });
+            engine.register("warmup", |_: DurableContext, _: ()| async { Ok(()) });
+            engine
+                .start::<_, ()>("warmup", (), WorkflowOptions::with_id("warmup"))
+                .await?
+                .result()
+                .await?;
+            // Change the filter after Runtime initialization, in both directions.
+            engine.listen_queues(if producer_only {
+                vec![]
+            } else {
+                vec!["remote"]
             });
             let result = engine
                 .start::<_, ()>("parent", (), WorkflowOptions::with_id("guard"))
                 .await?
                 .result()
                 .await;
-            assert!(matches!(result, Err(Error::RecoveryRequired(_))));
-            assert!(provider.get_workflow_steps("guard").await?.is_empty());
+            if unsafe_route {
+                assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+                assert!(provider.get_workflow_steps("guard").await?.is_empty());
+            } else {
+                result?;
+                assert_eq!(engine.verify_replay("guard").await?.divergence, None);
+            }
             assert_eq!(
-                provider.get_workflow_status("guard").await?.unwrap().status,
-                STATUS_PENDING
-            );
-            assert_eq!(
-                provider.list_workflows(&ListFilter::default()).await?.len(),
-                1
+                provider.get_workflow_status("guard-0").await?.is_some(),
+                !missing && !unsafe_route
             );
             engine.shutdown(Duration::from_secs(1)).await?;
         }

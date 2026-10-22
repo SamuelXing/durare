@@ -10,8 +10,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `DurableContext::enqueue_workflow` enqueues named children without a local
   workflow registration, preserving child checkpoints and identity inheritance.
-  Remote targets require an explicit target application version and a
-  producer-only queue excluded from local dispatch with `listen_queues`.
+  Remote targets require an explicit target application version. Same-version
+  targets also require a queue excluded from local dispatch with `listen_queues`;
+  different-version targets are isolated by the dequeue version gate.
 - `WorkflowResultOptions` and `WorkflowHandle::result_with_options` configure
   the database polling interval and an optional wait timeout. Cancelling a result
   wait preserves the local task for a later wait or another handle clone. Wait
@@ -39,11 +40,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Queued `start_workflow` children can target workflows not registered locally
-  when an explicit target version and producer-only queue are supplied.
+  when an explicit target version and safe queue routing are supplied.
   Both child APIs reject empty workflow names and empty queue names.
-- Invalid child-call arguments now persist their claimed position and typed
-  error for replay and verification. Missing registrations and unsafe routing
-  interrupt execution for recovery without saving a permanent rejection. Input serialization failures retain 0.5.0's
+- Invalid child-call arguments, unknown inline workflow names, and `Reject`
+  deduplication conflicts persist their typed errors for replay and verification.
+  Missing queues and unsafe same-version routing interrupt execution for recovery
+  without saving a permanent rejection. Missing/empty remote target versions
+  report a specific argument error. Input serialization failures retain 0.5.0's
   no-position behavior, so existing subsequent step checkpoints stay aligned.
 - Engine/client enqueue deduplication races use a bounded retry budget;
   exhausted races report an observation failure. Debouncer collector/ACK
