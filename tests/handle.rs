@@ -131,8 +131,17 @@ async fn result_options_memory() -> Result<()> {
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn result_options_sqlite() -> Result<()> {
-    let provider = durare::SqliteProvider::connect("sqlite::memory:").await?;
-    result_options_contract(Arc::new(provider)).await
+    // A timeout can cancel SQLx pool acquisition and discard its connection.
+    // If it was the last connection, an in-memory SQLite database disappears.
+    // Keep this observer-timeout test independent of connection lifetime.
+    let path =
+        std::env::temp_dir().join(format!("durare-result-options-{}.db", uuid::Uuid::new_v4()));
+    let provider = durare::SqliteProvider::connect(&format!("sqlite://{}", path.display())).await?;
+    let result = result_options_contract(Arc::new(provider)).await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    result
 }
 
 #[cfg(feature = "postgres")]
