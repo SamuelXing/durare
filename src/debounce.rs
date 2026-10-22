@@ -16,7 +16,7 @@
 
 use crate::client::Client;
 use crate::context::DurableContext;
-use crate::engine::{retry_dedup, DurableEngine, WorkflowOptions, INTERNAL_QUEUE};
+use crate::engine::{DurableEngine, WorkflowOptions, INTERNAL_QUEUE};
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::StateProvider;
@@ -238,7 +238,8 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
     let timeout_ms = timeout.as_millis() as i64;
     let provider = backend.provider();
 
-    retry_dedup(|| async {
+    loop {
+        tokio::task::yield_now().await;
         let target_id = uuid::Uuid::new_v4().to_string();
         let dinput = DebouncerInput {
             target_name: target.to_string(),
@@ -250,7 +251,7 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
         };
         // First call for this key wins the dedup slot and starts the collector.
         match backend.enqueue_debouncer(dinput, key).await {
-            Ok(()) => Ok(Some(target_id)),
+            Ok(()) => return Ok(target_id),
             Err(e) if e.code() == ErrorCode::QueueDeduplicated => {
                 // A collector for this key is already running: push it the new
                 // input instead of starting another.
@@ -258,10 +259,10 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
                     .get_deduplicated_workflow(INTERNAL_QUEUE, key)
                     .await?
                 else {
-                    return Ok(None); // the slot was freed; retry
+                    continue; // it finished between our enqueue and lookup; retry
                 };
                 let Some(status) = provider.get_workflow_status(&existing).await? else {
-                    return Ok(None);
+                    continue;
                 };
                 let existing_input: DebouncerInput = serde_json::from_value(status.input)?;
                 let message_id = uuid::Uuid::new_v4().to_string();
@@ -278,14 +279,13 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
                 // Wait for the collector to ACK; if it already finished, start a
                 // fresh one on the next loop.
                 if backend.get_ack(&existing, &message_id).await?.is_none() {
-                    return Ok(None);
+                    continue;
                 }
-                Ok(Some(existing_input.target_id))
+                return Ok(existing_input.target_id);
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
         }
-    })
-    .await
+    }
 }
 
 /// Debounces a target workflow. Create one with
@@ -424,5 +424,54 @@ impl<'c> DebouncerClient<'c> {
             target_id,
             self.client.provider().clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RacingBackend {
+        provider: Arc<dyn StateProvider>,
+        attempts: AtomicUsize,
+    }
+    impl DebounceBackend for RacingBackend {
+        fn provider(&self) -> &Arc<dyn StateProvider> {
+            &self.provider
+        }
+        async fn enqueue_debouncer(&self, _: DebouncerInput, key: &str) -> Result<()> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < 12 {
+                Err(Error::queue_deduplicated(INTERNAL_QUEUE, key))
+            } else {
+                Ok(())
+            }
+        }
+        async fn send_debounce(&self, _: &str, _: DebounceMessage) -> Result<()> {
+            unreachable!()
+        }
+        async fn get_ack(&self, _: &str, _: &str) -> Result<Option<bool>> {
+            unreachable!()
+        }
+    }
+    #[tokio::test]
+    async fn collector_turnover_has_no_eight_attempt_budget() -> Result<()> {
+        let backend = RacingBackend {
+            provider: Arc::new(crate::InMemoryProvider::new()),
+            attempts: AtomicUsize::new(0),
+        };
+        let id = run_debounce(
+            &backend,
+            "target",
+            Duration::ZERO,
+            &TargetOptions::default(),
+            "key",
+            Duration::ZERO,
+            Value::Null,
+        )
+        .await?;
+        assert!(!id.is_empty());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 13);
+        Ok(())
     }
 }
