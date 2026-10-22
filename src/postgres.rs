@@ -305,6 +305,75 @@ pub struct PostgresProvider {
 }
 
 impl PostgresProvider {
+    async fn insert_status_on(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        s: &WorkflowStatus,
+        adopt: bool,
+    ) -> Result<Option<(WorkflowStatus, bool)>> {
+        let conflict = if adopt {
+            "ON CONFLICT DO NOTHING"
+        } else {
+            "ON CONFLICT (workflow_uuid) DO NOTHING"
+        };
+        // Idempotent create: an existing id is left untouched.
+        //
+        // `owner_xid` is a write-once creation token (the DBOS SDKs mint one
+        // per insert and never update it); it is stamped for cross-SDK schema
+        // parity but plays no part in this SDK's arbitration — the returned
+        // `created` flag is the equivalent "did this call create the row" test.
+        let created = sqlx::query(&format!(
+            "INSERT INTO {workflow_status}
+                 (workflow_uuid, name, inputs, status, executor_id, application_version,
+                  queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
+                  workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
+                  authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
+                  serialization, created_at, updated_at, attributes, owner_xid)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                     $17, $18, $19, $20, $21, $22, $23, gen_random_uuid()::TEXT)
+             {conflict}",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(&s.id)
+        .bind(&s.name)
+        .bind(serialize::encode_input(&self.serializer, &s.input)?)
+        .bind(&s.status)
+        .bind(&s.executor_id)
+        .bind(s.app_version_opt())
+        .bind(&s.queue_name)
+        .bind(&s.queue_partition_key)
+        .bind(s.priority)
+        .bind(&s.dedup_id)
+        .bind(&s.parent_workflow_id)
+        .bind(s.timeout_ms)
+        .bind(s.deadline_ms)
+        .bind(s.delay_until_ms)
+        .bind(&s.authenticated_user)
+        .bind(&s.assumed_role)
+        .bind(encode_roles(&s.authenticated_roles))
+        .bind(&s.class_name)
+        .bind(&s.config_name)
+        .bind(self.serializer.name())
+        .bind(s.created_at.timestamp_millis())
+        .bind(s.updated_at.timestamp_millis())
+        .bind(&s.attributes)
+        .execute(&mut *connection)
+        .await
+        .map_err(|e| dedup_or(e, s))?
+        // `ON CONFLICT DO NOTHING`: 1 row iff this call created it.
+        .rows_affected()
+            == 1;
+
+        let row = sqlx::query(&format!(
+            "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(&s.id)
+        .fetch_optional(&mut *connection)
+        .await?;
+        Ok(row.map(|row| (row_to_status(&self.serializer, &row), created)))
+    }
+
     /// Connect to Postgres using a standard connection URL, e.g.
     /// `postgres://user:pass@localhost:5432/durare`.
     ///
@@ -867,62 +936,12 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<(WorkflowStatus, bool)> {
-        // Idempotent create: an existing id is left untouched.
-        //
-        // `owner_xid` is a write-once creation token (the DBOS SDKs mint one
-        // per insert and never update it); it is stamped for cross-SDK schema
-        // parity but plays no part in this SDK's arbitration — the returned
-        // `created` flag is the equivalent "did this call create the row" test.
-        let created = sqlx::query(&format!(
-            "INSERT INTO {workflow_status}
-                 (workflow_uuid, name, inputs, status, executor_id, application_version,
-                  queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
-                  workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
-                  authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at, attributes, owner_xid)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22, $23, gen_random_uuid()::TEXT)
-             ON CONFLICT (workflow_uuid) DO NOTHING",
-            workflow_status = self.tables.workflow_status
-        ))
-        .bind(&s.id)
-        .bind(&s.name)
-        .bind(serialize::encode_input(&self.serializer, &s.input)?)
-        .bind(&s.status)
-        .bind(&s.executor_id)
-        .bind(s.app_version_opt())
-        .bind(&s.queue_name)
-        .bind(&s.queue_partition_key)
-        .bind(s.priority)
-        .bind(&s.dedup_id)
-        .bind(&s.parent_workflow_id)
-        .bind(s.timeout_ms)
-        .bind(s.deadline_ms)
-        .bind(s.delay_until_ms)
-        .bind(&s.authenticated_user)
-        .bind(&s.assumed_role)
-        .bind(encode_roles(&s.authenticated_roles))
-        .bind(&s.class_name)
-        .bind(&s.config_name)
-        .bind(self.serializer.name())
-        .bind(s.created_at.timestamp_millis())
-        .bind(s.updated_at.timestamp_millis())
-        .bind(&s.attributes)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| dedup_or(e, &s))?
-        // `ON CONFLICT DO NOTHING`: 1 row iff this call created it.
-        .rows_affected()
-            == 1;
-
-        let row = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
-            workflow_status = self.tables.workflow_status
-        ))
-        .bind(&s.id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok((row_to_status(&self.serializer, &row), created))
+        let mut connection = self.pool.acquire().await?;
+        self.insert_status_on(&mut connection, &s, false)
+            .await?
+            .ok_or_else(|| {
+                crate::execution::recovery_error(Error::app("inserted workflow is missing"))
+            })
     }
 
     async fn get_deduplicated_workflow(
@@ -2285,6 +2304,101 @@ impl StateProvider for PostgresProvider {
         } else {
             RecoveryClaim::Claimed { attempts }
         })
+    }
+
+    async fn insert_child_workflow(
+        &self,
+        child: WorkflowStatus,
+        parent_id: &str,
+        seq: i32,
+        return_existing: bool,
+    ) -> Result<Option<(WorkflowStatus, bool)>> {
+        let mut tx = self.pool.begin().await?;
+        let parent = sqlx::query(&format!(
+            "SELECT status FROM {workflow_status} WHERE workflow_uuid = $1 FOR UPDATE",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(parent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| Error::nonexistent_workflow(parent_id))?;
+        if let Some(step) = sqlx::query(&format!(
+            "SELECT function_name, child_workflow_id FROM {operation_outputs}
+             WHERE workflow_uuid = $1 AND function_id = $2",
+            operation_outputs = self.tables.operation_outputs,
+        ))
+        .bind(parent_id)
+        .bind(seq)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let id: Option<String> = step.get("child_workflow_id");
+            if step.get::<String, _>("function_name") != child.name || id.is_none() {
+                return Err(Error::WorkflowConflict(parent_id.to_owned()));
+            }
+            let row = sqlx::query(&format!(
+                "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
+                workflow_status = self.tables.workflow_status,
+            ))
+            .bind(id.unwrap())
+            .fetch_one(&mut *tx)
+            .await?;
+            let canonical = row_to_status(&self.serializer, &row);
+            tx.commit().await?;
+            return Ok(Some((canonical, false)));
+        }
+        if parent.get::<String, _>("status") == STATUS_CANCELLED {
+            return Err(Error::Cancelled(parent_id.to_owned()));
+        }
+        let mut attempts = 0;
+        let (canonical, created) = loop {
+            attempts += 1;
+            if let Some(run) = self
+                .insert_status_on(&mut tx, &child, return_existing)
+                .await?
+            {
+                break run;
+            }
+            // An INSERT conflict can disappear before this read on Postgres.
+            // Retry inside this transaction; no decision is exposed until the
+            // parent checkpoint commits alongside it.
+            if let Some(row) = sqlx::query(&format!(
+                "SELECT {SELECT_COLS} FROM {workflow_status}
+                 WHERE queue_name = $1 AND deduplication_id = $2 FOR UPDATE",
+                workflow_status = self.tables.workflow_status,
+            ))
+            .bind(&child.queue_name)
+            .bind(&child.dedup_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                break (row_to_status(&self.serializer, &row), false);
+            }
+            if attempts == 8 {
+                return Err(crate::execution::recovery_error(Error::app(
+                    "child deduplication race retry limit exceeded",
+                )));
+            }
+            tokio::task::yield_now().await;
+        };
+        crate::provider::check_child_target(&canonical, &child)?;
+        let recorded = sqlx::query(&format!(
+            "INSERT INTO {operation_outputs} (workflow_uuid, function_id, function_name, child_workflow_id)
+             VALUES ($1, $2, $3, $4) ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+            operation_outputs = self.tables.operation_outputs,
+        ))
+            .bind(parent_id)
+            .bind(seq)
+            .bind(&child.name)
+            .bind(&canonical.id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if recorded != 1 {
+            return Err(Error::WorkflowConflict(parent_id.to_owned()));
+        }
+        tx.commit().await?;
+        Ok(Some((canonical, created)))
     }
 
     async fn record_child_workflow(

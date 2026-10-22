@@ -3083,12 +3083,10 @@ impl Runtime {
         )
     }
 
-    /// Build a new run's status row from `opts` and persist it idempotently,
-    /// returning the canonical row, whether it was routed to a queue, and whether
-    /// **this call** created the row (the arbiter when executors race a
-    /// deterministic id). Shared by top-level runs and child workflows;
-    /// `parent_id`/`auth` are stamped on the row.
-    async fn insert_run(
+    /// Build a new run's status row from `opts`, including parent and identity.
+    /// Top-level runs persist it directly; child runs atomically persist it
+    /// alongside their parent's checkpoint.
+    fn build_run(
         &self,
         id: &str,
         name: &str,
@@ -3096,7 +3094,7 @@ impl Runtime {
         opts: &WorkflowOptions,
         parent_id: Option<&str>,
         auth: &AuthContext,
-    ) -> Result<(WorkflowStatus, bool, bool)> {
+    ) -> Result<(WorkflowStatus, bool)> {
         opts.validate_deduplication(opts.queue.as_deref())?;
         let queued = opts.queue.is_some();
         if let Some(q) = &opts.queue {
@@ -3154,6 +3152,19 @@ impl Runtime {
             row.deadline_ms = row.timeout_ms.map(|t| created_ms + t);
         }
 
+        Ok((row, queued))
+    }
+
+    async fn insert_run(
+        &self,
+        id: &str,
+        name: &str,
+        input_json: Value,
+        opts: &WorkflowOptions,
+        parent_id: Option<&str>,
+        auth: &AuthContext,
+    ) -> Result<(WorkflowStatus, bool, bool)> {
+        let (row, queued) = self.build_run(id, name, input_json, opts, parent_id, auth)?;
         let (canonical, created) = self
             .provider
             .insert_workflow_status(row)
@@ -3242,9 +3253,10 @@ impl Runtime {
         name: &str,
         input_json: Value,
         opts: WorkflowOptions,
-        parent_id: &str,
+        parent: (&str, i32),
         auth: AuthContext,
     ) -> Result<String> {
+        let (parent_id, seq) = parent;
         let handler = self
             .workflows
             .get(&registry_key(name, opts.config_name.as_deref()))
@@ -3270,12 +3282,47 @@ impl Runtime {
                 name.to_owned(),
             )));
         }
-        let (canonical, queued, created) = self
-            .insert_run_with_dedup(child_id, name, input_json, &opts, Some(parent_id), &auth)
-            .await?;
+        let (row, queued) =
+            self.build_run(child_id, name, input_json, &opts, Some(parent_id), &auth)?;
+        let atomic = self
+            .provider
+            .insert_child_workflow(
+                row.clone(),
+                parent_id,
+                seq,
+                opts.dedup_policy == DeduplicationPolicy::ReturnExisting,
+            )
+            .await
+            .map_err(crate::execution::observation_error)?;
+        let needs_checkpoint = atomic.is_none();
+        let (canonical, created) = match atomic {
+            Some(run) => run,
+            None => {
+                // Custom providers may retain the legacy deterministic-ID
+                // path, but never fall back for a dedup adoption decision.
+                if opts.dedup_policy == DeduplicationPolicy::ReturnExisting {
+                    return Err(crate::execution::recovery_error(Error::app(
+                        "provider must implement atomic child deduplication",
+                    )));
+                }
+                let run = self
+                    .provider
+                    .insert_workflow_status(row)
+                    .await
+                    .map_err(crate::execution::observation_error)?;
+                check_workflow_target(&run.0, name, &opts)?;
+                run
+            }
+        };
         let id = canonical.id.clone();
         if created && !queued && !is_terminal(&canonical.status) {
             self.spawn_detached(canonical, handler.expect("inline child has a handler"));
+        }
+        if needs_checkpoint {
+            self.provider
+                .record_child_workflow(parent_id, seq, name, &id)
+                .await
+                .map_err(crate::execution::observation_error)?;
         }
         Ok(id)
     }

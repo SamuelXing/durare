@@ -23,6 +23,19 @@ pub(crate) fn dedup_or(e: sqlx::Error, s: &WorkflowStatus) -> Error {
     err
 }
 
+/// A deduplication key must not silently adopt another workflow's output.
+pub(crate) fn check_child_target(row: &WorkflowStatus, requested: &WorkflowStatus) -> Result<()> {
+    if row.name != requested.name
+        || row.class_name != requested.class_name
+        || row.config_name != requested.config_name
+    {
+        return Err(Error::app(
+            "existing workflow ID or deduplication key belongs to a different workflow target",
+        ));
+    }
+    Ok(())
+}
+
 /// Map a notification insert failure to a typed "no such workflow" error when
 /// the destination foreign key is violated.
 pub(crate) fn nonexistent_or(e: sqlx::Error, destination_id: &str) -> Error {
@@ -1936,6 +1949,37 @@ pub trait StateProvider: Send + Sync {
     /// [`max_attempts`](RecoveryClaimRequest::max_attempts) instead parks the
     /// row in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` ([`RecoveryClaim::Parked`]).
     async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim>;
+
+    /// Create or adopt a child and checkpoint its canonical ID at the parent's
+    /// position. Built-in providers commit the deduplication decision, child
+    /// insert, and parent checkpoint atomically; replay returns the original
+    /// child even after its deduplication slot has been released.
+    ///
+    /// `return_existing` adopts an active matching queue/deduplication target.
+    /// A different name, class, or configured instance is rejected. The returned
+    /// boolean identifies the insert winner, which alone may dispatch inline.
+    /// `Some` means the checkpoint committed atomically. `None` means unsupported
+    /// and MUST leave storage untouched: the engine falls back to its existing
+    /// deterministic-ID insert, dispatch, then checkpoint sequence. Implementations
+    /// must return an error rather than `None` when `return_existing` is true.
+    ///
+    /// Custom providers retain the deterministic-ID path by default, but must
+    /// override this method to support atomic `return_existing`. The default
+    /// refuses that mode before any writes with a recoverable interruption.
+    async fn insert_child_workflow(
+        &self,
+        _child: WorkflowStatus,
+        _parent_id: &str,
+        _seq: i32,
+        return_existing: bool,
+    ) -> Result<Option<(WorkflowStatus, bool)>> {
+        if return_existing {
+            return Err(crate::execution::recovery_error(Error::app(
+                "provider must implement atomic child deduplication",
+            )));
+        }
+        Ok(None)
+    }
 
     /// Idempotently record that `parent_id`'s step `seq` started child workflow
     /// `child_id`. Stored as an `operation_outputs` checkpoint carrying the child

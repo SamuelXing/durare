@@ -1004,12 +1004,12 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// An application error for an empty queue or workflow name or invalid
-    /// deduplication options, a remote queue still dispatched by the producer,
-    /// or an existing ID/key belonging to a different target;
-    /// [`Error::UnknownWorkflow`] when the target is not registered locally and
-    /// no explicit nonempty target version is supplied;
-    /// [`Error::UnknownQueue`] for an unregistered queue;
+    /// An application error for an empty queue or workflow name, invalid
+    /// deduplication options, or an existing ID/key belonging to a different
+    /// target. [`Error::RecoveryRequired`] wraps [`Error::UnknownWorkflow`] for
+    /// an unresolved target, [`Error::UnknownQueue`] for an unregistered queue,
+    /// or an application error for unsafe remote routing. These configuration
+    /// failures interrupt execution without a permanent rejection checkpoint;
     /// [`Error::QueueDeduplicated`] for a conflicting deduplication key under
     /// the reject policy; the same scope and replay errors as `start_workflow`.
     pub fn enqueue_workflow<'a, I, O>(
@@ -1116,7 +1116,7 @@ impl DurableContext {
                         &name,
                         input_json,
                         opts,
-                        &self.workflow_id,
+                        (&self.workflow_id, seq),
                         child_auth,
                     )
                     .await
@@ -1144,11 +1144,6 @@ impl DurableContext {
                         .map(|id| WorkflowHandle::polling(id, self.provider.clone()));
                 }
             };
-            self.provider
-                .record_child_workflow(&self.workflow_id, seq, &name, &child_id)
-                .await
-                .map_err(|error| self.execution.record(error))?;
-
             Ok(WorkflowHandle::polling(child_id, self.provider.clone()))
         })
     }

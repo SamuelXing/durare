@@ -795,9 +795,10 @@ async fn postgres_provider_business_errors_remain_catchable() -> Result<()> {
 }
 
 #[tokio::test]
-async fn child_validation_errors_remain_catchable() -> Result<()> {
+async fn child_arguments_are_recorded_but_configuration_faults_interrupt() -> Result<()> {
     for kind in ["workflow", "queue", "delay"] {
-        let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+        let provider = Arc::new(InMemoryProvider::new());
+        let mut engine = DurableEngine::new(provider.clone()).await?;
         engine.register("child", |_: DurableContext, _: ()| async { Ok(()) });
         engine.register("parent", move |ctx: DurableContext, _: ()| async move {
             let (name, opts) = match kind {
@@ -816,21 +817,38 @@ async fn child_validation_errors_remain_catchable() -> Result<()> {
                 Err(error) => error,
                 Ok(_) => panic!("invalid child start must fail"),
             };
-            ctx.step("handled", || async { Ok(error.code()) }).await
+            ctx.step("handled", || async {
+                assert_eq!(
+                    kind, "delay",
+                    "caught configuration fault allowed fresh work"
+                );
+                Ok(error.code())
+            })
+            .await
         });
-        let code = engine
-            .start::<_, ErrorCode>("parent", (), WorkflowOptions::default())
+        let result = engine
+            .start::<_, ErrorCode>("parent", (), WorkflowOptions::with_id(kind))
             .await?
             .result()
-            .await?;
-        assert_eq!(
-            code,
-            match kind {
-                "workflow" => ErrorCode::WorkflowNotRegistered,
-                "queue" => ErrorCode::QueueNotRegistered,
-                _ => ErrorCode::Application,
+            .await;
+        if kind == "delay" {
+            assert_eq!(result?, ErrorCode::Application);
+            assert_eq!(engine.verify_replay(kind).await?.divergence, None);
+        } else {
+            match result {
+                Err(Error::RecoveryRequired(cause)) => assert_eq!(
+                    cause.code(),
+                    if kind == "workflow" {
+                        ErrorCode::WorkflowNotRegistered
+                    } else {
+                        ErrorCode::QueueNotRegistered
+                    }
+                ),
+                other => panic!("configuration error must interrupt: {other:?}"),
             }
-        );
+            assert!(provider.get_workflow_steps(kind).await?.is_empty());
+        }
+        engine.shutdown(Duration::from_secs(1)).await?;
     }
     Ok(())
 }

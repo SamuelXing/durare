@@ -41,15 +41,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Queued `start_workflow` children can target workflows not registered locally
   when an explicit target version and producer-only queue are supplied.
   Both child APIs reject empty workflow names and empty queue names.
-- Semantic child-call rejections now persist their claimed position and typed
-  error for replay and verification. Input serialization failures retain 0.5.0's
+- Invalid child-call arguments now persist their claimed position and typed
+  error for replay and verification. Missing registrations and unsafe routing
+  interrupt execution for recovery without saving a permanent rejection. Input serialization failures retain 0.5.0's
   no-position behavior, so existing subsequent step checkpoints stay aligned.
-- Engine/client/child enqueue and debouncer deduplication races share a bounded
-  retry budget; exhausted races report an observation failure. Returning an
-  existing enqueue verifies the workflow name, class, and configured instance.
+- Engine/client enqueue deduplication races use a bounded retry budget;
+  exhausted races report an observation failure. Debouncer collector/ACK
+  turnover retains its unbounded retry behavior. Returning an existing enqueue
+  verifies the workflow name, class, and configured instance.
 
 ### Fixed
 
+- Child creation checks parent cancellation before starting fresh work. Built-in
+  providers atomically commit child creation/deduplication and its parent
+  checkpoint, preventing duplicate children after a deduplication slot is freed.
+  Custom providers must implement atomic child insertion for `ReturnExisting`;
+  the default refuses that mode before writing.
+- Updating `listen_queues` before launch also updates an initialized runtime;
+  child routing and queue dispatch use the same consumption set.
 - Forked workflows retain their source's searchable attributes on all backends.
 - Admin queue rate limits use lowercase `limit`/`period` keys and seconds,
   including fractional seconds, matching the reference SDK wire format.
