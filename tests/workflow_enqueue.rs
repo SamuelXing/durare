@@ -626,3 +626,40 @@ async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn cancelled_parent_cannot_enqueue_new_children() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register_queue(WorkflowQueue::new("remote"));
+    engine.listen_queues(Vec::<String>::new());
+    let db = provider.clone();
+    engine.register("parent", move |ctx: DurableContext, _: ()| {
+        let db = db.clone();
+        async move {
+            db.set_workflow_status("cancelled-parent", durare::STATUS_CANCELLED, None, None)
+                .await?;
+            assert!(
+                matches!(ctx.enqueue_workflow::<_, ()>("remote", "external", (),
+                WorkflowOptions::default().app_version("worker")).await,
+                Err(Error::Cancelled(id)) if id == "cancelled-parent")
+            );
+            Ok(())
+        }
+    });
+    let result = engine
+        .start::<_, ()>("parent", (), WorkflowOptions::with_id("cancelled-parent"))
+        .await?
+        .result()
+        .await;
+    assert!(matches!(result, Err(Error::Cancelled(_))));
+    assert!(provider
+        .get_workflow_status("cancelled-parent-0")
+        .await?
+        .is_none());
+    assert!(provider
+        .get_workflow_steps("cancelled-parent")
+        .await?
+        .is_empty());
+    Ok(())
+}

@@ -1065,7 +1065,7 @@ impl DurableContext {
             // A rejected child is an ordinary failed checkpoint at the same
             // position. Serve it before validation or verification's live-work
             // gate, preserving both its error code and the caller's branch.
-            if self.serve_recorded::<Value>(seq, &name).await?.is_some() {
+            if self.replay_or_guard::<Value>(seq, &name).await?.is_some() {
                 return Err(Error::unexpected_step(
                     &self.workflow_id,
                     seq,
