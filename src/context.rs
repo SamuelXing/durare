@@ -974,7 +974,8 @@ impl DurableContext {
     /// overridden by `queue_name`. A remote target (not registered locally)
     /// requires a nonempty [`WorkflowOptions::app_version`] naming the target
     /// worker version and a queue excluded from local dispatch using
-    /// `listen_queues`. Invalid routing is rejected before insertion. Unset
+    /// `listen_queues`. Invalid routing interrupts execution for recovery before
+    /// insertion; fixing the configuration allows a later recovery to retry. Unset
     /// versions do **not** mean any worker: unversioned rows route only to the
     /// latest registered application version. Locally registered targets use
     /// the engine version by default, just like `start_workflow`.
@@ -982,7 +983,7 @@ impl DurableContext {
     /// Like [`start_workflow`](Self::start_workflow), this consumes one durable
     /// position after input serialization succeeds, records the child link,
     /// inherits identity per field, and returns the original child on replay.
-    /// Semantic rejections at a claimed position are checkpointed with their
+    /// Invalid-argument rejections at a claimed position are checkpointed with their
     /// original error codes. Input serialization failures consume no position,
     /// preserving released 0.5.0 histories. An omitted or empty child ID derives from
     /// the parent ID and position. This is an enqueue operation, not a step body

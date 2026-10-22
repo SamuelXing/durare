@@ -1098,18 +1098,19 @@ impl DurableEngine {
                     provider: self.provider.clone(),
                     workflows: self.workflows.clone(),
                     queues: self.queues.clone(),
-                    producer_only_queues: self
-                        .queues
-                        .keys()
-                        .filter(|name| {
-                            name.as_str() != INTERNAL_QUEUE
-                                && self
-                                    .listen_filter
-                                    .as_ref()
-                                    .is_some_and(|listen| !listen.contains(*name))
-                        })
-                        .cloned()
-                        .collect(),
+                    producer_only_queues: std::sync::RwLock::new(
+                        self.queues
+                            .keys()
+                            .filter(|name| {
+                                name.as_str() != INTERNAL_QUEUE
+                                    && self
+                                        .listen_filter
+                                        .as_ref()
+                                        .is_some_and(|listen| !listen.contains(*name))
+                            })
+                            .cloned()
+                            .collect(),
+                    ),
                     required_roles: self.required_roles.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
@@ -1218,6 +1219,18 @@ impl DurableEngine {
         S: Into<String>,
     {
         self.listen_filter = Some(names.into_iter().map(Into::into).collect());
+        // The dispatcher set is fixed while launched. Before launch, keep an
+        // already-created runtime in sync with the public configuration.
+        if self
+            .dispatchers
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .is_empty()
+        {
+            if let Some(runtime) = self.runtime.get() {
+                runtime.set_listen_filter(self.listen_filter.as_ref());
+            }
+        }
     }
 
     /// All queues registered on this engine, sorted by name. Includes queues this
@@ -1518,6 +1531,14 @@ impl DurableEngine {
         };
         self.tasks.reopen();
         let rt = self.runtime();
+        if self
+            .dispatchers
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .is_empty()
+        {
+            rt.set_listen_filter(self.listen_filter.as_ref());
+        }
 
         // Register this process's application version.
         if let Err(e) = self
@@ -1577,10 +1598,8 @@ impl DurableEngine {
         for queue in self.queues.values() {
             // Skip queues this process is configured not to listen to. The
             // internal queue is always dispatched (re-execution depends on it).
-            if let Some(listen) = &self.listen_filter {
-                if queue.name != INTERNAL_QUEUE && !listen.contains(&queue.name) {
-                    continue;
-                }
+            if rt.is_producer_only(&queue.name) {
+                continue;
             }
             tasks.push(tokio::spawn(queue_dispatch_loop(
                 queue.clone(),
@@ -2973,7 +2992,7 @@ pub(crate) struct Runtime {
     workflows: HashMap<String, WorkflowFn>,
     queues: HashMap<String, Arc<WorkflowQueue>>,
     // Only these queues are safe for a producer with no target handler.
-    producer_only_queues: HashSet<String>,
+    producer_only_queues: std::sync::RwLock<HashSet<String>>,
     /// Required-roles declarations keyed by workflow name; enforced before a
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
@@ -2998,6 +3017,27 @@ pub(crate) struct EngineCounters {
 }
 
 impl Runtime {
+    fn set_listen_filter(&self, listen: Option<&HashSet<String>>) {
+        *self
+            .producer_only_queues
+            .write()
+            .expect("queue routing lock poisoned") = self
+            .queues
+            .keys()
+            .filter(|name| {
+                name.as_str() != INTERNAL_QUEUE && listen.is_some_and(|set| !set.contains(*name))
+            })
+            .cloned()
+            .collect();
+    }
+
+    fn is_producer_only(&self, queue: &str) -> bool {
+        self.producer_only_queues
+            .read()
+            .expect("queue routing lock poisoned")
+            .contains(queue)
+    }
+
     pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
         &self.provider
     }
@@ -3211,18 +3251,24 @@ impl Runtime {
             .cloned();
         if let Some(queue) = opts.queue.as_deref() {
             if !self.queues.contains_key(queue) {
-                return Err(Error::UnknownQueue(queue.to_owned()));
+                return Err(crate::execution::recovery_error(Error::UnknownQueue(
+                    queue.to_owned(),
+                )));
             }
             if handler.is_none() {
                 if opts.app_version.as_deref().is_none_or(str::is_empty) {
-                    return Err(Error::UnknownWorkflow(name.to_owned()));
+                    return Err(crate::execution::recovery_error(Error::UnknownWorkflow(
+                        name.to_owned(),
+                    )));
                 }
-                if !self.producer_only_queues.contains(queue) {
-                    return Err(Error::app("remote child queues must be registered and excluded from local dispatch using listen_queues"));
+                if !self.is_producer_only(queue) {
+                    return Err(crate::execution::recovery_error(Error::app("remote child queues must be registered and excluded from local dispatch using listen_queues")));
                 }
             }
         } else if handler.is_none() {
-            return Err(Error::UnknownWorkflow(name.to_owned()));
+            return Err(crate::execution::recovery_error(Error::UnknownWorkflow(
+                name.to_owned(),
+            )));
         }
         let (canonical, queued, created) = self
             .insert_run_with_dedup(child_id, name, input_json, &opts, Some(parent_id), &auth)

@@ -131,19 +131,11 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         async move {
             // The branch must observe the same typed error during execution,
             // ordinary recovery, and read-only verification.
-            match ctx
-                .enqueue_workflow::<_, ()>(
-                    "missing",
-                    "external",
-                    (),
-                    WorkflowOptions::default().app_version("target-version"),
-                )
-                .await
-            {
-                Err(Error::UnknownQueue(queue)) => assert_eq!(queue, "missing"),
-                Err(error) => panic!("wrong UnknownQueue branch: {error:?}"),
-                Ok(_) => panic!("UnknownQueue enqueue unexpectedly succeeded"),
-            }
+            assert!(matches!(
+                ctx.enqueue_workflow::<_, ()>("", "external", (), WorkflowOptions::default())
+                    .await,
+                Err(Error::App { .. })
+            ));
             assert!(matches!(
                 ctx.start_workflow::<_, ()>(
                     "",
@@ -155,9 +147,11 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
                 .await,
                 Err(Error::App { .. })
             ));
-            assert!(matches!(ctx.start_workflow::<_, ()>("typo", (),
-                WorkflowOptions::default().queue("remote")).await,
-                Err(Error::UnknownWorkflow(name)) if name == "typo"));
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>("", (), WorkflowOptions::default())
+                    .await,
+                Err(Error::App { .. })
+            ));
             ctx.step("after-refusals", || async {
                 effect_counter.fetch_add(1, Ordering::SeqCst);
                 Ok(42_i64)
@@ -373,7 +367,7 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
     assert_eq!(engine.verify_replay("legacy").await?.divergence, None);
     assert_eq!(engine.get_workflow_steps("legacy").await?[0].step_id, 0);
     engine.shutdown(Duration::from_secs(1)).await?;
-    Ok(())
+    configuration_recovery_contract(provider).await
 }
 
 #[tokio::test]
@@ -523,16 +517,6 @@ async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
             .enqueue_workflow::<_, ()>("remote", "", (), WorkflowOptions::default())
             .await
             .is_err());
-        assert!(matches!(
-            ctx.start_workflow::<_, ()>("external", (), WorkflowOptions::default())
-                .await,
-            Err(Error::UnknownWorkflow(_))
-        ));
-        assert!(matches!(
-            ctx.enqueue_workflow::<_, ()>("missing", "external", (), WorkflowOptions::default())
-                .await,
-            Err(Error::UnknownQueue(_))
-        ));
         let nested = ctx.clone();
         ctx.step("nested", || async move {
             assert!(matches!(
@@ -552,8 +536,8 @@ async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
         .result()
         .await?;
     let steps = engine.get_workflow_steps("invalid").await?;
-    assert_eq!(steps.len(), 5);
-    assert_eq!(steps[4].step_id, 4);
+    assert_eq!(steps.len(), 3);
+    assert_eq!(steps[2].step_id, 2);
     assert_eq!(engine.verify_replay("invalid").await?.divergence, None);
     assert_eq!(
         provider.list_workflows(&ListFilter::default()).await?.len(),
@@ -565,24 +549,17 @@ async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
 #[tokio::test]
 async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
     for producer_only in [false, true] {
-        let provider = Arc::new(InMemoryProvider::new());
-        let mut builder = DurableEngine::builder(provider.clone());
-        builder.app_version("producer-version");
-        let mut engine = builder.build().await?;
-        engine.register_queue(
-            WorkflowQueue::new("remote").base_polling_interval(Duration::from_millis(5)),
-        );
-        if producer_only {
-            engine.listen_queues(Vec::<String>::new());
-        }
-        engine.register("parent", move |ctx: DurableContext, _: ()| async move {
-            for version in [None, Some(""), Some("producer-version")] {
-                // A version matching the producer would make the default
-                // dispatcher claim and damage the child in the old design.
-                // Only an explicit version AND a producer-only queue is valid.
-                if producer_only && version == Some("producer-version") {
-                    continue;
-                }
+        for version in [None, Some(""), Some("producer-version")] {
+            if producer_only && version == Some("producer-version") {
+                continue;
+            }
+            let provider = Arc::new(InMemoryProvider::new());
+            let mut engine = DurableEngine::new(provider.clone()).await?;
+            engine.register_queue(WorkflowQueue::new("remote"));
+            if producer_only {
+                engine.listen_queues(Vec::<String>::new());
+            }
+            engine.register("parent", move |ctx: DurableContext, _: ()| async move {
                 let error = ctx
                     .enqueue_workflow::<_, ()>(
                         "remote",
@@ -595,34 +572,37 @@ async fn remote_routing_is_rejected_before_insertion() -> Result<()> {
                     )
                     .await
                     .err()
-                    .expect("unsafe route was accepted");
-                if version.is_none_or(str::is_empty) {
-                    assert!(matches!(error, Error::UnknownWorkflow(_)));
-                } else {
-                    assert!(matches!(error, Error::App { .. }));
-                }
-            }
-            ctx.step("after-errors", || async { Ok(()) }).await
-        });
-        engine.launch().await?;
-        engine
-            .start::<_, ()>("parent", (), WorkflowOptions::with_id("guard"))
-            .await?
-            .result()
-            .await?;
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        assert_eq!(
-            provider.list_workflows(&ListFilter::default()).await?.len(),
-            1
-        );
-        let steps = engine.get_workflow_steps("guard").await?;
-        assert_eq!(steps.len(), if producer_only { 3 } else { 4 });
-        assert_eq!(
-            steps.last().unwrap().step_id,
-            if producer_only { 2 } else { 3 }
-        );
-        assert_eq!(engine.verify_replay("guard").await?.divergence, None);
-        engine.shutdown(Duration::from_secs(1)).await?;
+                    .expect("unsafe route accepted");
+                assert!(matches!(error, Error::RecoveryRequired(_)));
+                // Catching an infrastructure error cannot authorize fresh work.
+                assert!(matches!(
+                    ctx.step("after", || async {
+                        panic!("must not run");
+                        #[allow(unreachable_code)]
+                        Ok(())
+                    })
+                    .await,
+                    Err(Error::RecoveryRequired(_))
+                ));
+                Ok(())
+            });
+            let result = engine
+                .start::<_, ()>("parent", (), WorkflowOptions::with_id("guard"))
+                .await?
+                .result()
+                .await;
+            assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+            assert!(provider.get_workflow_steps("guard").await?.is_empty());
+            assert_eq!(
+                provider.get_workflow_status("guard").await?.unwrap().status,
+                STATUS_PENDING
+            );
+            assert_eq!(
+                provider.list_workflows(&ListFilter::default()).await?.len(),
+                1
+            );
+            engine.shutdown(Duration::from_secs(1)).await?;
+        }
     }
     Ok(())
 }
@@ -661,5 +641,93 @@ async fn cancelled_parent_cannot_enqueue_new_children() -> Result<()> {
         .get_workflow_steps("cancelled-parent")
         .await?
         .is_empty());
+    Ok(())
+}
+
+async fn configuration_recovery_contract(provider: Arc<dyn StateProvider>) -> Result<()> {
+    let effects = Arc::new(AtomicUsize::new(0));
+    for fixed in [false, true] {
+        let mut builder = DurableEngine::builder(provider.clone());
+        builder.app_version("configuration-recovery");
+        let mut engine = builder.build().await?;
+        if fixed {
+            engine.register_queue(WorkflowQueue::new("late-queue"));
+        }
+        let effects = effects.clone();
+        engine.register("configuration-parent", move |ctx: DurableContext, _: ()| {
+            let effects = effects.clone();
+            async move {
+                let child = ctx
+                    .enqueue_workflow::<_, ()>(
+                        "late-queue",
+                        "external",
+                        (),
+                        WorkflowOptions::default().app_version("worker"),
+                    )
+                    .await;
+                // Deliberately catch the error. The execution latch must still
+                // prohibit both this step and a successful terminal result.
+                if child.is_err() {
+                    let _ = ctx
+                        .step("must-not-run", || async {
+                            effects.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .await;
+                    return Ok(String::new());
+                }
+                Ok(child?.id().to_owned())
+            }
+        });
+        engine.register("warmup", |_: DurableContext, _: ()| async { Ok(()) });
+        // Initialize Runtime before configuring the listen filter: permitted
+        // by listen_queues' before-launch contract.
+        engine
+            .start::<_, ()>(
+                "warmup",
+                (),
+                WorkflowOptions::with_id(format!("warmup-{fixed}")),
+            )
+            .await?
+            .result()
+            .await?;
+        engine.listen_queues(Vec::<String>::new());
+        if fixed {
+            engine.recover_pending_for(&[]).await?;
+            let recovered = engine
+                .retrieve_workflow::<String>("configuration-parent")
+                .await?;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), recovered.result())
+                    .await
+                    .unwrap()?,
+                "configuration-parent-0"
+            );
+            assert_eq!(
+                engine
+                    .verify_replay("configuration-parent")
+                    .await?
+                    .divergence,
+                None
+            );
+        } else {
+            let result = engine
+                .start::<_, String>(
+                    "configuration-parent",
+                    (),
+                    WorkflowOptions::with_id("configuration-parent"),
+                )
+                .await?
+                .result()
+                .await;
+            assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+            assert!(provider
+                .get_workflow_steps("configuration-parent")
+                .await?
+                .is_empty());
+        }
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
     Ok(())
 }
