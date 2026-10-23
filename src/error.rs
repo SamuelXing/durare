@@ -29,6 +29,8 @@ pub enum ErrorCode {
     /// An enqueue was rejected because its deduplication key is already in use
     /// on the queue.
     QueueDeduplicated,
+    /// An existing workflow ID or deduplication key names a different workflow target.
+    WorkflowTargetConflict,
     /// The caller's authentication context does not satisfy the workflow's
     /// required roles.
     NotAuthorized,
@@ -313,6 +315,15 @@ impl Error {
         )
     }
 
+    pub(crate) fn workflow_target_conflict(id: &str) -> Self {
+        Self::Portable(Box::new(PortableWorkflowError {
+            name: "durare.WorkflowTargetConflict".into(),
+            message: format!("workflow `{id}` already belongs to a different workflow target"),
+            code: Some(serde_json::json!("workflow_target_conflict")),
+            data: Some(serde_json::json!({"workflow_id": id})),
+        }))
+    }
+
     /// Construct an application-level error from anything string-like.
     pub fn app(msg: impl Into<String>) -> Self {
         Error::App {
@@ -417,6 +428,13 @@ impl Error {
             Error::DurableCallOutsideExecution { .. } => ErrorCode::DurableCallOutsideExecution,
             Error::WorkflowConflict(_) => ErrorCode::WorkflowConflict,
             Error::ReplayDiverged { .. } => ErrorCode::ReplayDiverged,
+            Error::Portable(info)
+                if info.name == "durare.WorkflowTargetConflict"
+                    && info.code.as_ref().and_then(serde_json::Value::as_str)
+                        == Some("workflow_target_conflict") =>
+            {
+                ErrorCode::WorkflowTargetConflict
+            }
             Error::App { .. } | Error::Portable(_) => ErrorCode::Application,
         }
     }

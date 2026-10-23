@@ -88,7 +88,7 @@ async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
     wrong.name = "different".into();
     assert!(matches!(
         db.insert_child_workflow(wrong, "mismatch", 0, true).await,
-        Err(Error::App { .. })
+        Err(error) if error.code() == durare::ErrorCode::WorkflowTargetConflict
     ));
     assert!(db.check_child_workflow("mismatch", 0).await?.is_none());
     assert!(db.get_workflow_status("mismatch-0").await?.is_none());

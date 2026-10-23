@@ -43,9 +43,7 @@ pub(crate) fn check_target(
         || row.class_name.as_deref() != class_name
         || row.config_name.as_deref() != config_name
     {
-        return Err(Error::app(
-            "existing workflow ID or deduplication key belongs to a different workflow target",
-        ));
+        return Err(Error::workflow_target_conflict(&row.id));
     }
     Ok(())
 }

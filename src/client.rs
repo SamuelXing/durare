@@ -104,6 +104,10 @@ impl Client {
     /// application error for an empty queue or workflow name, a partition key
     /// combined with a deduplication id, or a deduplication policy without a
     /// deduplication id.
+    ///
+    /// Reusing an ID or adopting a deduplication key belonging to a different
+    /// workflow name, class, or configured instance returns
+    /// [`crate::ErrorCode::WorkflowTargetConflict`] through [`Error::Portable`].
     pub async fn enqueue<I, O>(
         &self,
         queue_name: &str,

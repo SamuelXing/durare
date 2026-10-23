@@ -656,3 +656,55 @@ async fn futures_count_enqueued(handles: &mut [durare::WorkflowHandle<()>]) -> R
     }
     Ok(n)
 }
+
+#[tokio::test]
+async fn late_queue_registration_obeys_existing_listen_filter() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("echo", |_: DurableContext, n: i64| async move { Ok(n) });
+    engine
+        .start::<_, i64>("echo", 0, WorkflowOptions::with_id("warmup"))
+        .await?
+        .result()
+        .await?;
+    // Runtime is already initialized. Neither queue is in its registry snapshot.
+    engine.listen_queues(["included"]);
+    engine.register_queue(test_queue("excluded"));
+    engine.register_queue(test_queue("included"));
+    for queue in ["excluded", "included"] {
+        let mut row = durare::WorkflowStatus::new(
+            queue,
+            "echo",
+            serde_json::json!(7),
+            STATUS_ENQUEUED,
+            "",
+            engine.app_version(),
+        );
+        row.queue_name = Some(queue.into());
+        provider.insert_workflow_status(row).await?;
+    }
+    engine.launch().await?;
+    let included = engine.retrieve_workflow::<i64>("included").await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), included.result())
+            .await
+            .unwrap()?,
+        7
+    );
+    let excluded = engine.retrieve_workflow::<i64>("excluded").await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), excluded.result())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        provider
+            .get_workflow_status("excluded")
+            .await?
+            .unwrap()
+            .status,
+        STATUS_ENQUEUED
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

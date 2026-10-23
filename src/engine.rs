@@ -1098,19 +1098,7 @@ impl DurableEngine {
                     provider: self.provider.clone(),
                     workflows: self.workflows.clone(),
                     queues: self.queues.clone(),
-                    producer_only_queues: std::sync::RwLock::new(
-                        self.queues
-                            .keys()
-                            .filter(|name| {
-                                name.as_str() != INTERNAL_QUEUE
-                                    && self
-                                        .listen_filter
-                                        .as_ref()
-                                        .is_some_and(|listen| !listen.contains(*name))
-                            })
-                            .cloned()
-                            .collect(),
-                    ),
+                    listen_filter: std::sync::RwLock::new(self.listen_filter.clone()),
                     required_roles: self.required_roles.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
@@ -1924,8 +1912,10 @@ impl DurableEngine {
     /// `opts.queue` set, the row is persisted `ENQUEUED` (or `DELAYED` when
     /// `opts.delay` is set) and a polling handle is returned — a dispatcher on
     /// any executor claims and runs it. If the id already exists in a terminal
-    /// state, a polling handle over the stored result is returned instead of
-    /// re-running.
+    /// state and names the same workflow, class, and configured instance, a
+    /// polling handle over the stored result is returned instead of re-running.
+    /// A different target returns [`ErrorCode::WorkflowTargetConflict`], carried
+    /// by [`Error::Portable`], rather than exposing the other workflow's result.
     ///
     /// ```
     /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
@@ -2991,8 +2981,8 @@ pub(crate) struct Runtime {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
     queues: HashMap<String, Arc<WorkflowQueue>>,
-    // Only these queues are safe for a producer with no target handler.
-    producer_only_queues: std::sync::RwLock<HashSet<String>>,
+    // Store the filter itself so queues registered after initialization obey it too.
+    listen_filter: std::sync::RwLock<Option<HashSet<String>>>,
     /// Required-roles declarations keyed by workflow name; enforced before a
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
@@ -3019,23 +3009,19 @@ pub(crate) struct EngineCounters {
 impl Runtime {
     fn set_listen_filter(&self, listen: Option<&HashSet<String>>) {
         *self
-            .producer_only_queues
+            .listen_filter
             .write()
-            .expect("queue routing lock poisoned") = self
-            .queues
-            .keys()
-            .filter(|name| {
-                name.as_str() != INTERNAL_QUEUE && listen.is_some_and(|set| !set.contains(*name))
-            })
-            .cloned()
-            .collect();
+            .expect("queue routing lock poisoned") = listen.cloned();
     }
 
     fn is_producer_only(&self, queue: &str) -> bool {
-        self.producer_only_queues
-            .read()
-            .expect("queue routing lock poisoned")
-            .contains(queue)
+        queue != INTERNAL_QUEUE
+            && self
+                .listen_filter
+                .read()
+                .expect("queue routing lock poisoned")
+                .as_ref()
+                .is_some_and(|listen| !listen.contains(queue))
     }
 
     pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
@@ -3243,6 +3229,49 @@ impl Runtime {
         }
     }
 
+    /// Validate fresh child calls without writing history or doing live work.
+    pub(crate) fn validate_child(&self, name: &str, opts: &WorkflowOptions) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::app("workflow name is required"));
+        }
+        if opts.queue.as_deref() == Some("") {
+            return Err(Error::app("queue name is required"));
+        }
+        opts.validate_deduplication(opts.queue.as_deref())?;
+        if opts.delay.is_some() && opts.queue.is_none() {
+            return Err(Error::app(
+                "WorkflowOptions.delay requires a queue; direct runs start immediately",
+            ));
+        }
+        let handler = self
+            .workflows
+            .get(&registry_key(name, opts.config_name.as_deref()));
+        if let Some(queue) = opts.queue.as_deref() {
+            if !self.queues.contains_key(queue) {
+                return Err(Error::UnknownQueue(queue.to_owned()));
+            }
+            if handler.is_none() {
+                if opts.app_version.as_deref().is_none_or(str::is_empty) {
+                    return Err(Error::app(
+                        "remote child requires an explicit nonempty app_version naming its worker version",
+                    ));
+                }
+                // A foreign version cannot be claimed by this producer. A
+                // same-version remote target still needs a producer-only queue.
+                if opts.app_version.as_deref() == Some(self.app_version.as_str())
+                    && !self.is_producer_only(queue)
+                {
+                    return Err(Error::app(
+                        "same-version remote child queues must be excluded from local dispatch using listen_queues",
+                    ));
+                }
+            }
+        } else if handler.is_none() {
+            return Err(Error::UnknownWorkflow(name.to_owned()));
+        }
+        Ok(())
+    }
+
     /// Start a child workflow under the deterministic `child_id`, stamping the
     /// parent link and the inherited identity. Only the insert winner may
     /// dispatch a direct child. Existing children are observed, including PENDING
@@ -3261,31 +3290,6 @@ impl Runtime {
             .workflows
             .get(&registry_key(name, opts.config_name.as_deref()))
             .cloned();
-        if let Some(queue) = opts.queue.as_deref() {
-            if !self.queues.contains_key(queue) {
-                return Err(crate::execution::recovery_error(Error::UnknownQueue(
-                    queue.to_owned(),
-                )));
-            }
-            if handler.is_none() {
-                if opts.app_version.as_deref().is_none_or(str::is_empty) {
-                    return Err(Error::app(
-                        "remote child requires an explicit nonempty app_version naming its worker version",
-                    ));
-                }
-                // A foreign version cannot be claimed by this producer. A
-                // same-version remote target still needs a producer-only queue.
-                if opts.app_version.as_deref() == Some(self.app_version.as_str())
-                    && !self.is_producer_only(queue)
-                {
-                    return Err(crate::execution::recovery_error(Error::app(
-                        "same-version remote child queues must be excluded from local dispatch using listen_queues",
-                    )));
-                }
-            }
-        } else if handler.is_none() {
-            return Err(Error::UnknownWorkflow(name.to_owned()));
-        }
         let (row, queued) =
             self.build_run(child_id, name, input_json, &opts, Some(parent_id), &auth)?;
         let atomic = self

@@ -1,5 +1,5 @@
 use crate::engine::{Runtime, WorkflowOptions};
-use crate::error::{panic_message, Error, Result};
+use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
 use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
 use crate::replay::{Divergence, Verification};
@@ -975,8 +975,7 @@ impl DurableContext {
     /// If that version differs from this producer's, the version gate prevents
     /// this producer from claiming the child. If it matches, exclude the queue
     /// from local dispatch with [`DurableEngine::listen_queues`](crate::DurableEngine::listen_queues).
-    /// Unsafe same-version routing interrupts execution for recovery before
-    /// insertion; fixing the configuration allows a later recovery to retry.
+    /// Unsafe same-version routing returns an application error before insertion.
     /// Locally registered targets use the engine version by default, just like
     /// `start_workflow`. Unversioned client rows route only to the latest
     /// registered application version, not to arbitrary worker versions.
@@ -984,9 +983,11 @@ impl DurableContext {
     /// Like [`start_workflow`](Self::start_workflow), this consumes one durable
     /// position after input serialization succeeds, records the child link,
     /// inherits identity per field, and returns the original child on replay.
-    /// Invalid arguments and `Reject` deduplication conflicts are checkpointed
-    /// with their original errors. Replay preserves a caught rejection even if
-    /// its deduplication key has since been freed. Input serialization failures consume no position,
+    /// Argument and registration errors return without a checkpoint. They still
+    /// consume a position, matching 0.5.0; verification repeats these read-only
+    /// checks. `Reject` deduplication and target conflicts are checkpointed:
+    /// replay preserves a caught rejection even after its key is freed.
+    /// Input serialization failures consume no position,
     /// preserving released 0.5.0 histories. An omitted or empty child ID derives from
     /// the parent ID and position. This is an enqueue operation, not a step body
     /// operation: call it directly from the workflow body.
@@ -1007,11 +1008,12 @@ impl DurableContext {
     /// # Errors
     ///
     /// An application error for an empty queue or workflow name, missing/empty
-    /// remote target version, invalid deduplication options, or an existing ID/key
-    /// belonging to a different target. [`Error::RecoveryRequired`] wraps
-    /// [`Error::UnknownQueue`] for an unregistered queue or an application error
-    /// for unsafe same-version remote routing. These configuration failures
-    /// interrupt execution without a permanent rejection checkpoint.
+    /// remote target version, invalid deduplication options, or unsafe same-version
+    /// routing; [`Error::UnknownQueue`] for an unregistered queue. These errors
+    /// are not checkpointed. An uncaught error fails the parent; deploying a fix
+    /// does not automatically retry a terminal workflow.
+    /// [`ErrorCode::WorkflowTargetConflict`] identifies an existing ID/key that
+    /// belongs to a different workflow name, class, or configured instance.
     /// [`Error::QueueDeduplicated`] reports a conflicting key under `Reject`;
     /// the same scope and replay errors as `start_workflow` also apply.
     pub fn enqueue_workflow<'a, I, O>(
@@ -1065,10 +1067,15 @@ impl DurableContext {
                 self.check_recorded(seq, &name, &recorded)?;
                 return Ok(WorkflowHandle::polling(child_id, self.provider.clone()));
             }
-            // A rejected child is an ordinary failed checkpoint at the same
-            // position. Serve it before validation or verification's live-work
-            // gate, preserving both its error code and the caller's branch.
-            if self.replay_or_guard::<Value>(seq, &name).await?.is_some() {
+            // Replay insert rejections before consulting today's configuration.
+            if let Some(recorded) = self
+                .provider
+                .get_step_result(&self.workflow_id, seq)
+                .await
+                .map_err(|error| self.execution.record(error))?
+            {
+                self.check_recorded(seq, &name, &recorded.name)?;
+                self.recorded_value::<Value>(recorded.outcome)?;
                 return Err(Error::unexpected_step(
                     &self.workflow_id,
                     seq,
@@ -1076,13 +1083,21 @@ impl DurableContext {
                     "ordinary step",
                 ));
             }
+            // Keep 0.5.0 positions: serialization fails before claiming a slot;
+            // registration/argument rejections consume a slot but write nothing.
+            // Validate before the verification gate so caught errors take the
+            // same branch during verification, without permitting any insertion.
+            self.runtime.validate_child(&name, &opts)?;
+            self.refuse_live_work(seq, &name)?;
+            if let Some(status) = self
+                .execution
+                .storage(self.provider.get_workflow_status(&self.workflow_id).await)?
+            {
+                if status.status == STATUS_CANCELLED {
+                    return Err(Error::Cancelled(self.workflow_id.clone()));
+                }
+            }
             let outcome = async {
-                if opts.queue.as_deref() == Some("") {
-                    return Err(Error::app("queue name is required"));
-                }
-                if name.is_empty() {
-                    return Err(Error::app("workflow name is required"));
-                }
                 let child_id = opts
                     .workflow_id
                     .clone()
@@ -1128,15 +1143,13 @@ impl DurableContext {
                 Ok(id) => id,
                 Err(error) => {
                     let error = self.execution.record(error);
-                    if matches!(
-                        error,
-                        Error::RecoveryRequired(_)
-                            | Error::ObservationFailed(_)
-                            | Error::UnexpectedStep { .. }
-                            | Error::WorkflowConflict(_)
-                            | Error::ReplayDiverged { .. }
-                    ) || error.is_cancellation_for(&self.workflow_id)
-                        || error.is_scope_violation()
+                    // Only semantic insert rejections are durable outcomes.
+                    // Storage faults and execution-control errors pass through.
+                    if !matches!(error, Error::QueueDeduplicated { .. } | Error::Portable(_))
+                        || !matches!(
+                            error.code(),
+                            ErrorCode::QueueDeduplicated | ErrorCode::WorkflowTargetConflict
+                        )
                     {
                         return Err(error);
                     }

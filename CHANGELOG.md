@@ -42,12 +42,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Queued `start_workflow` children can target workflows not registered locally
   when an explicit target version and safe queue routing are supplied.
   Both child APIs reject empty workflow names and empty queue names.
-- Invalid child-call arguments, unknown inline workflow names, and `Reject`
-  deduplication conflicts persist their typed errors for replay and verification.
-  Missing queues and unsafe same-version routing interrupt execution for recovery
-  without saving a permanent rejection. Missing/empty remote target versions
-  report a specific argument error. Input serialization failures retain 0.5.0's
-  no-position behavior, so existing subsequent step checkpoints stay aligned.
+- Child argument and registration errors return ordinary errors without a
+  checkpoint. Uncaught errors fail the parent; fixing configuration does not
+  automatically retry terminal workflows. `Reject` deduplication and target
+  conflicts remain checkpointed. Serialization failures consume no position;
+  other refusals retain 0.5.0's consumed position, keeping old histories aligned.
+- Reusing a workflow ID or adopting a deduplication key for a different workflow
+  name, class, or configured instance now returns `WorkflowTargetConflict` from
+  `Error::code()` (carried by the existing `Error::Portable` variant), instead
+  of returning a handle to another target. This tightens engine/client ID reuse.
 - Engine/client enqueue deduplication races use a bounded retry budget;
   exhausted races report an observation failure. Debouncer collector/ACK
   turnover retains its unbounded retry behavior. Returning an existing enqueue
@@ -61,7 +64,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Custom providers must implement atomic child insertion for `ReturnExisting`;
   the default refuses that mode before writing.
 - Updating `listen_queues` before launch also updates an initialized runtime;
-  child routing and queue dispatch use the same consumption set.
+  child routing and queue dispatch use the same filter, including queues
+  registered after runtime initialization.
 - Forked workflows retain their source's searchable attributes on all backends.
 - Admin queue rate limits use lowercase `limit`/`period` keys and seconds,
   including fractional seconds, matching the reference SDK wire format.
