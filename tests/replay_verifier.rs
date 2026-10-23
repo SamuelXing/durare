@@ -834,7 +834,14 @@ async fn every_kind_of_unrecorded_call_is_refused() -> Result<()> {
     for (operation, body) in rows {
         let provider = provider();
         record(&provider, steps(&["a"])).await?;
-        let verifier = engine(&provider, body).await?;
+        let mut verifier = engine(&provider, body).await?;
+        // Exercise the live-work gate with a valid target. An unregistered
+        // target now returns its preflight error before reaching that gate.
+        verifier.register("child", |_: DurableContext, _: ()| async {
+            panic!("verification executed a child");
+            #[allow(unreachable_code)]
+            Ok::<i64, Error>(0)
+        });
 
         let report = verifier.verify_replay(ID).await?;
 

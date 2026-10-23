@@ -7,8 +7,8 @@
 //! [`DurableEngine`]: crate::DurableEngine
 
 use crate::engine::{
-    cron_ticks_between, parse_cron, parse_timezone, DeduplicationPolicy, WorkflowOptions,
-    INTERNAL_QUEUE,
+    check_workflow_target, cron_ticks_between, find_dedup_target, parse_cron, parse_timezone,
+    retry_dedup, DeduplicationPolicy, WorkflowOptions, INTERNAL_QUEUE,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
@@ -60,8 +60,8 @@ impl Client {
     /// [`PostgresProvider`](crate::PostgresProvider) connected to the system
     /// database). The database must already be initialized by the application.
     ///
-    /// Enqueued work is left version-agnostic (empty application version), so any
-    /// executor claims it regardless of its version. Use
+    /// Enqueued work has an empty application version by default, so only
+    /// workers on the latest registered application version can claim it. Use
     /// [`with_app_version`](Self::with_app_version) to gate it to one version.
     pub fn new(provider: Arc<dyn StateProvider>) -> Self {
         Self {
@@ -104,6 +104,10 @@ impl Client {
     /// application error for an empty queue or workflow name, a partition key
     /// combined with a deduplication id, or a deduplication policy without a
     /// deduplication id.
+    ///
+    /// Reusing an ID or adopting a deduplication key belonging to a different
+    /// workflow name, class, or configured instance returns
+    /// [`crate::ErrorCode::WorkflowTargetConflict`] through [`Error::Portable`].
     pub async fn enqueue<I, O>(
         &self,
         queue_name: &str,
@@ -132,8 +136,8 @@ impl Client {
         } else {
             STATUS_ENQUEUED
         };
-        // A per-enqueue version override, else the client default (empty ⇒ any
-        // executor claims it).
+        // A per-enqueue version override, else the client default (empty ⇒
+        // workers on the latest registered version may claim it).
         let app_version = opts.app_version.as_deref().unwrap_or(&self.app_version);
 
         // Unowned (empty executor) until a dispatcher claims it.
@@ -162,30 +166,24 @@ impl Client {
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
 
-        // On a dedup collision under `ReturnExisting`, return a handle to the
-        // workflow already holding the slot; retry if it was freed in between.
-        loop {
+        let canonical = retry_dedup(|| async {
             match self.provider.insert_workflow_status(row.clone()).await {
-                Ok(_) => return Ok(WorkflowHandle::polling(id, self.provider.clone())),
-                Err(e)
-                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
-                        && e.code() == ErrorCode::QueueDeduplicated =>
-                {
-                    if let Some(existing) = self
-                        .provider
-                        .get_deduplicated_workflow(
-                            queue_name,
-                            opts.dedup_id.as_deref().unwrap_or(""),
-                        )
-                        .await
-                        .map_err(crate::execution::observation_error)?
-                    {
-                        return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
-                    }
+                Ok((canonical, _)) => {
+                    check_workflow_target(&canonical, workflow_name, &opts)?;
+                    Ok(Some(canonical))
                 }
-                Err(e) => return Err(crate::execution::observation_error(e)),
+                Err(error)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && error.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    find_dedup_target(self.provider.as_ref(), queue_name, workflow_name, &opts)
+                        .await
+                }
+                Err(error) => Err(crate::execution::observation_error(error)),
             }
-        }
+        })
+        .await?;
+        Ok(WorkflowHandle::polling(canonical.id, self.provider.clone()))
     }
 
     /// Send a message to a workflow (e.g. to nudge one waiting in

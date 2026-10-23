@@ -904,3 +904,45 @@ async fn stop_or_cancel_after_a_committed_claim_never_dispatches_its_body() -> R
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn custom_provider_refuses_nonatomic_child_adoption_before_writes() -> Result<()> {
+    let inner = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::Read));
+    provider.arm([]);
+    let mut engine = DurableEngine::new(provider).await?;
+    engine.register_queue(WorkflowQueue::new("children"));
+    engine.register("child", |_: DurableContext, _: ()| async { Ok(()) });
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        ctx.enqueue_workflow::<_, ()>(
+            "children",
+            "child",
+            (),
+            WorkflowOptions::default()
+                .dedup_id("key")
+                .dedup_policy(DeduplicationPolicy::ReturnExisting),
+        )
+        .await?;
+        Ok(())
+    });
+    let result = engine
+        .start::<_, ()>(
+            "parent",
+            (),
+            WorkflowOptions::with_id("unsupported-child-adoption"),
+        )
+        .await?
+        .result()
+        .await;
+    assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+    assert!(inner
+        .get_workflow_steps("unsupported-child-adoption")
+        .await?
+        .is_empty());
+    assert!(inner
+        .get_workflow_status("unsupported-child-adoption-0")
+        .await?
+        .is_none());
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}

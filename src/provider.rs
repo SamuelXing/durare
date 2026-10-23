@@ -23,6 +23,33 @@ pub(crate) fn dedup_or(e: sqlx::Error, s: &WorkflowStatus) -> Error {
     err
 }
 
+/// A deduplication key must not silently adopt another workflow's output.
+pub(crate) fn check_child_target(row: &WorkflowStatus, requested: &WorkflowStatus) -> Result<()> {
+    check_target(
+        row,
+        &requested.name,
+        requested.class_name.as_deref(),
+        requested.config_name.as_deref(),
+    )
+}
+
+pub(crate) fn check_target(
+    row: &WorkflowStatus,
+    name: &str,
+    class_name: Option<&str>,
+    config_name: Option<&str>,
+) -> Result<()> {
+    if row.name != name
+        || row.class_name.as_deref().filter(|s| !s.is_empty())
+            != class_name.filter(|s| !s.is_empty())
+        || row.config_name.as_deref().filter(|s| !s.is_empty())
+            != config_name.filter(|s| !s.is_empty())
+    {
+        return Err(Error::workflow_target_conflict(&row.id));
+    }
+    Ok(())
+}
+
 /// Map a notification insert failure to a typed "no such workflow" error when
 /// the destination foreign key is violated.
 pub(crate) fn nonexistent_or(e: sqlx::Error, destination_id: &str) -> Error {
@@ -1937,6 +1964,37 @@ pub trait StateProvider: Send + Sync {
     /// row in `MAX_RECOVERY_ATTEMPTS_EXCEEDED` ([`RecoveryClaim::Parked`]).
     async fn claim_for_recovery(&self, req: &RecoveryClaimRequest<'_>) -> Result<RecoveryClaim>;
 
+    /// Create or adopt a child and checkpoint its canonical ID at the parent's
+    /// position. Built-in providers commit the deduplication decision, child
+    /// insert, and parent checkpoint atomically; replay returns the original
+    /// child even after its deduplication slot has been released.
+    ///
+    /// `return_existing` adopts an active matching queue/deduplication target.
+    /// A different name, class, or configured instance is rejected. The returned
+    /// boolean identifies the insert winner, which alone may dispatch inline.
+    /// `Some` means the checkpoint committed atomically. `None` means unsupported
+    /// and MUST leave storage untouched: the engine falls back to its existing
+    /// deterministic-ID insert, dispatch, then checkpoint sequence. Implementations
+    /// must return an error rather than `None` when `return_existing` is true.
+    ///
+    /// Custom providers retain the deterministic-ID path by default, but must
+    /// override this method to support atomic `return_existing`. The default
+    /// refuses that mode before any writes with a recoverable interruption.
+    async fn insert_child_workflow(
+        &self,
+        _child: WorkflowStatus,
+        _parent_id: &str,
+        _seq: i32,
+        return_existing: bool,
+    ) -> Result<Option<(WorkflowStatus, bool)>> {
+        if return_existing {
+            return Err(crate::execution::recovery_error(Error::app(
+                "provider must implement atomic child deduplication",
+            )));
+        }
+        Ok(None)
+    }
+
     /// Idempotently record that `parent_id`'s step `seq` started child workflow
     /// `child_id`. Stored as an `operation_outputs` checkpoint carrying the child
     /// id, so a replay of the parent re-attaches to the same child instead of
@@ -2127,7 +2185,10 @@ pub trait StateProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_roles, drain_stream_from, encode_roles, StreamBackend, STATUS_SUCCESS};
+    use super::{
+        check_target, decode_roles, drain_stream_from, encode_roles, StreamBackend, WorkflowStatus,
+        STATUS_PENDING, STATUS_SUCCESS,
+    };
     use crate::error::Result;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -2184,6 +2245,35 @@ mod tests {
             vec!["final".to_string()],
             "the value committed just before the producer went inactive must not be dropped",
         );
+    }
+
+    #[test]
+    fn target_identity_normalizes_only_absent_fields() {
+        for class in [None, Some("")] {
+            for config in [None, Some("")] {
+                let mut row = WorkflowStatus::new(
+                    "id",
+                    "name",
+                    serde_json::json!(null),
+                    STATUS_PENDING,
+                    "",
+                    "",
+                );
+                row.class_name = class.map(str::to_owned);
+                row.config_name = config.map(str::to_owned);
+                for requested_class in [None, Some("")] {
+                    for requested_config in [None, Some("")] {
+                        assert!(
+                            check_target(&row, "name", requested_class, requested_config).is_ok()
+                        );
+                    }
+                }
+                assert!(check_target(&row, "other", None, None).is_err());
+                assert!(check_target(&row, "name", Some("Orders"), None).is_err());
+                assert!(check_target(&row, "name", None, Some("instance")).is_err());
+                assert!(check_target(&row, "name", Some(" "), None).is_err());
+            }
+        }
     }
 
     #[test]

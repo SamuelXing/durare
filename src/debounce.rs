@@ -239,6 +239,7 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
     let provider = backend.provider();
 
     loop {
+        tokio::task::yield_now().await;
         let target_id = uuid::Uuid::new_v4().to_string();
         let dinput = DebouncerInput {
             target_name: target.to_string(),
@@ -423,5 +424,54 @@ impl<'c> DebouncerClient<'c> {
             target_id,
             self.client.provider().clone(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RacingBackend {
+        provider: Arc<dyn StateProvider>,
+        attempts: AtomicUsize,
+    }
+    impl DebounceBackend for RacingBackend {
+        fn provider(&self) -> &Arc<dyn StateProvider> {
+            &self.provider
+        }
+        async fn enqueue_debouncer(&self, _: DebouncerInput, key: &str) -> Result<()> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < 12 {
+                Err(Error::queue_deduplicated(INTERNAL_QUEUE, key))
+            } else {
+                Ok(())
+            }
+        }
+        async fn send_debounce(&self, _: &str, _: DebounceMessage) -> Result<()> {
+            unreachable!()
+        }
+        async fn get_ack(&self, _: &str, _: &str) -> Result<Option<bool>> {
+            unreachable!()
+        }
+    }
+    #[tokio::test]
+    async fn collector_turnover_has_no_eight_attempt_budget() -> Result<()> {
+        let backend = RacingBackend {
+            provider: Arc::new(crate::InMemoryProvider::new()),
+            attempts: AtomicUsize::new(0),
+        };
+        let id = run_debounce(
+            &backend,
+            "target",
+            Duration::ZERO,
+            &TargetOptions::default(),
+            "key",
+            Duration::ZERO,
+            Value::Null,
+        )
+        .await?;
+        assert!(!id.is_empty());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 13);
+        Ok(())
     }
 }

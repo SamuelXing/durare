@@ -1,0 +1,863 @@
+//! Named queued children share start_workflow's durable relationship protocol.
+use durare::{
+    Client, DeduplicationPolicy, DurableContext, DurableEngine, Error, InMemoryProvider,
+    ListFilter, Result, StateProvider, WorkflowOptions, WorkflowQueue, STATUS_PENDING,
+};
+use serde_json::json;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+mod common;
+
+struct Unserializable;
+impl serde::Serialize for Unserializable {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> std::result::Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("old input serialization failure"))
+    }
+}
+
+async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register_queue(WorkflowQueue::new("remote"));
+    engine.listen_queues(Vec::<String>::new());
+    let invoked = calls.clone();
+    let ran = effects.clone();
+    engine.register("parent", move |ctx: DurableContext, _: ()| {
+        let attempt = invoked.fetch_add(1, Ordering::SeqCst);
+        let ran = ran.clone();
+        async move {
+            let a = ctx
+                .enqueue_workflow::<_, ()>(
+                    "remote",
+                    "external",
+                    attempt,
+                    WorkflowOptions {
+                        // The argument overrides this queue; empty IDs are derived.
+                        workflow_id: Some(String::new()),
+                        app_version: Some("target-version".into()),
+                        queue: Some("ignored".into()),
+                        delay: Some(Duration::from_secs(3600)),
+                        timeout: Some(Duration::from_secs(5)),
+                        priority: 7,
+                        config_name: Some("instance".into()),
+                        class_name: Some("Orders".into()),
+                        assumed_role: Some("worker".into()),
+                        attributes: Some(serde_json::from_value(json!({"tag":"remote"}))?),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            // Existing queued start_workflow also accepts a remote target and
+            // retains its established parent-version default.
+            let b = ctx
+                .start_workflow::<_, ()>(
+                    "external",
+                    (),
+                    WorkflowOptions::default()
+                        .queue("remote")
+                        .app_version("target-version"),
+                )
+                .await?;
+            ctx.step("after", || async {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await?;
+            Ok(vec![a.id().to_owned(), b.id().to_owned()])
+        }
+    });
+    engine.register("dedup", |ctx: DurableContext, _: ()| async move {
+        let child = ctx
+            .enqueue_workflow::<_, ()>(
+                "remote",
+                "external",
+                (),
+                WorkflowOptions::default()
+                    .dedup_id("key")
+                    .dedup_policy(DeduplicationPolicy::ReturnExisting)
+                    .app_version("target-version"),
+            )
+            .await?;
+        Ok::<_, Error>(child.id().to_string())
+    });
+    engine.register("reject", |ctx: DurableContext, _: ()| async move {
+        match ctx
+            .enqueue_workflow::<_, ()>(
+                "remote",
+                "external",
+                (),
+                WorkflowOptions::default()
+                    .app_version("target-version")
+                    .dedup_id("reject-key"),
+            )
+            .await
+        {
+            Err(Error::QueueDeduplicated { .. }) => Ok("rejected".to_owned()),
+            Err(error) => Err(error),
+            Ok(_) => Ok("enqueued".to_owned()),
+        }
+    });
+    engine.register("gap", |ctx: DurableContext, _: ()| async move {
+        let child = ctx
+            .enqueue_workflow::<_, ()>(
+                "remote",
+                "external",
+                "retry-input",
+                WorkflowOptions::default().app_version("target-version"),
+            )
+            .await?;
+        Ok::<_, Error>(child.id().to_owned())
+    });
+    engine.register("mismatched", |ctx: DurableContext, _: ()| async move {
+        for (name, class, config) in [
+            ("different", None, None),
+            ("external", Some("other"), None),
+            ("external", None, Some("other")),
+        ] {
+            let error = ctx
+                .enqueue_workflow::<_, ()>(
+                    "remote",
+                    name,
+                    (),
+                    WorkflowOptions {
+                        app_version: Some("target-version".into()),
+                        dedup_id: Some("key".into()),
+                        dedup_policy: DeduplicationPolicy::ReturnExisting,
+                        class_name: class.map(str::to_owned),
+                        config_name: config.map(str::to_owned),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .err()
+                .expect("mismatched target was adopted");
+            assert_eq!(error.code(), durare::ErrorCode::WorkflowTargetConflict);
+        }
+        ctx.step("after-mismatches", || async { Ok(()) }).await
+    });
+    let refusal_effects = Arc::new(AtomicUsize::new(0));
+    let effect_counter = refusal_effects.clone();
+    engine.register("refusals", move |ctx: DurableContext, _: ()| {
+        let effect_counter = effect_counter.clone();
+        async move {
+            // The branch must observe the same typed error during execution,
+            // ordinary recovery, and read-only verification.
+            assert!(matches!(
+                ctx.enqueue_workflow::<_, ()>("", "external", (), WorkflowOptions::default())
+                    .await,
+                Err(Error::App { .. })
+            ));
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>(
+                    "",
+                    (),
+                    WorkflowOptions::default()
+                        .queue("remote")
+                        .app_version("target-version")
+                )
+                .await,
+                Err(Error::App { .. })
+            ));
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>("typo", (), WorkflowOptions::default())
+                    .await,
+                Err(Error::UnknownWorkflow(name)) if name == "typo"
+            ));
+            ctx.step("after-refusals", || async {
+                effect_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(42_i64)
+            })
+            .await
+        }
+    });
+    let legacy_effects = Arc::new(AtomicUsize::new(0));
+    let legacy_counter = legacy_effects.clone();
+    engine.register("legacy", move |ctx: DurableContext, _: ()| {
+        let legacy_counter = legacy_counter.clone();
+        async move {
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>(
+                    "not-started",
+                    Unserializable,
+                    WorkflowOptions::default()
+                )
+                .await,
+                Err(Error::Serde(_))
+            ));
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>("absent", (), WorkflowOptions::default())
+                    .await,
+                Err(Error::UnknownWorkflow(_))
+            ));
+            // 0.5.0 resolves the local handler before checking the queue.
+            assert!(matches!(
+                ctx.start_workflow::<_, ()>(
+                    "parent",
+                    (),
+                    WorkflowOptions::default().queue("absent")
+                )
+                .await,
+                Err(Error::UnknownQueue(_))
+            ));
+            ctx.step("effect", || async {
+                legacy_counter.fetch_add(1, Ordering::SeqCst);
+                Ok(42_i64)
+            })
+            .await
+        }
+    });
+    engine.register("identity-a", |_: DurableContext, _: ()| async { Ok(1_i64) });
+    engine.register("identity-b", |_: DurableContext, _: ()| async { Ok(2_i64) });
+    assert_eq!(
+        engine
+            .start::<_, i64>("identity-a", (), WorkflowOptions::with_id("reused-id"))
+            .await?
+            .result()
+            .await?,
+        1
+    );
+    let conflict = engine
+        .start::<_, i64>("identity-b", (), WorkflowOptions::with_id("reused-id"))
+        .await
+        .err()
+        .expect("different target accepted");
+    assert_eq!(conflict.code(), durare::ErrorCode::WorkflowTargetConflict);
+    assert_eq!(
+        engine
+            .start::<_, i64>("identity-a", (), WorkflowOptions::with_id("reused-id"))
+            .await?
+            .result()
+            .await?,
+        1
+    );
+    let handle = engine
+        .start::<_, Vec<String>>(
+            "parent",
+            (),
+            WorkflowOptions::with_id("parent")
+                .authenticated_user("alice")
+                .assumed_role("caller")
+                .authenticated_roles(["reader", "writer"]),
+        )
+        .await?;
+    let expected = vec!["parent-0".to_string(), "parent-1".to_string()];
+    assert_eq!(handle.result().await?, expected);
+    let a = provider.get_workflow_status("parent-0").await?.unwrap();
+    assert_eq!(a.name, "external");
+    assert_eq!(a.input, json!(0));
+    assert_eq!(a.status, "DELAYED");
+    assert_eq!(a.parent_workflow_id.as_deref(), Some("parent"));
+    assert_eq!(a.queue_name.as_deref(), Some("remote"));
+    assert_eq!(a.app_version, "target-version");
+    assert!(a.executor_id.is_empty());
+    assert_eq!(a.timeout_ms, Some(5000));
+    assert!(a.deadline_ms.is_none());
+    assert_eq!(a.priority, 7);
+    assert_eq!(a.config_name.as_deref(), Some("instance"));
+    assert_eq!(a.class_name.as_deref(), Some("Orders"));
+    assert_eq!(a.authenticated_user.as_deref(), Some("alice"));
+    assert_eq!(a.assumed_role.as_deref(), Some("worker"));
+    assert_eq!(a.authenticated_roles, vec!["reader", "writer"]);
+    assert_eq!(a.attributes, Some(json!({"tag":"remote"})));
+    let b = provider.get_workflow_status("parent-1").await?.unwrap();
+    assert_eq!(b.status, "ENQUEUED");
+    assert_eq!(b.app_version, "target-version");
+    let steps = engine.get_workflow_steps("parent").await?;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|s| (s.step_id, s.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(0, "external"), (1, "external"), (2, "after")]
+    );
+    assert_eq!(steps[0].child_workflow_id.as_deref(), Some("parent-0"));
+
+    // The original owner finished before recovery. Force a recovery fixture to
+    // exercise normal execution replay, then also the read-only verifier.
+    assert!(
+        provider
+            .set_workflow_status("parent", STATUS_PENDING, None, None)
+            .await?
+    );
+    assert_eq!(engine.recover().await?, 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), handle.result())
+            .await
+            .unwrap()?,
+        expected
+    );
+    assert_eq!(engine.verify_replay("parent").await?.divergence, None);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let after = provider.get_workflow_status("parent-0").await?.unwrap();
+    assert_eq!(after.input, a.input);
+    assert_eq!(after.delay_until_ms, a.delay_until_ms);
+    assert_eq!(after.created_at, a.created_at);
+    assert_eq!(
+        provider
+            .list_workflows(&ListFilter {
+                parent_workflow_ids: vec!["parent".into()],
+                ..Default::default()
+            })
+            .await?
+            .len(),
+        2
+    );
+
+    // A repeated enqueue may explicitly resolve the existing deduplication
+    // slot. Checkpoint the actual returned ID, including across recovery.
+    let existing = Client::new(provider.clone())
+        .enqueue::<_, ()>(
+            "remote",
+            "external",
+            (),
+            WorkflowOptions::with_id("existing").dedup_id("key"),
+        )
+        .await?;
+    let conflict = Client::new(provider.clone())
+        .enqueue::<_, ()>(
+            "remote",
+            "different",
+            (),
+            WorkflowOptions::with_id("existing"),
+        )
+        .await
+        .err()
+        .expect("client adopted a different target");
+    assert_eq!(conflict.code(), durare::ErrorCode::WorkflowTargetConflict);
+    let dedup = engine
+        .start::<_, String>("dedup", (), WorkflowOptions::with_id("dedup"))
+        .await?;
+    assert_eq!(dedup.result().await?, existing.id());
+    assert_eq!(
+        engine.get_workflow_steps("dedup").await?[0]
+            .child_workflow_id
+            .as_deref(),
+        Some("existing")
+    );
+    assert!(provider.get_workflow_status("dedup-0").await?.is_none());
+    assert_eq!(engine.verify_replay("dedup").await?.divergence, None);
+    engine
+        .start::<_, ()>("mismatched", (), WorkflowOptions::with_id("mismatched"))
+        .await?
+        .result()
+        .await?;
+    let mismatch_steps = engine.get_workflow_steps("mismatched").await?;
+    assert_eq!(mismatch_steps.len(), 4);
+    assert_eq!(mismatch_steps[3].step_id, 3);
+    assert!(mismatch_steps
+        .iter()
+        .all(|step| step.child_workflow_id.is_none()));
+    assert_eq!(engine.verify_replay("mismatched").await?.divergence, None);
+    // Simulate the crash window: the queued row committed, but its parent
+    // relationship checkpoint did not. Retrying must observe the canonical
+    // row and write only the missing relationship.
+    let mut inserted = durare::WorkflowStatus::new(
+        "gap-0",
+        "external",
+        json!("original-input"),
+        "ENQUEUED",
+        "",
+        "target-version",
+    );
+    inserted.queue_name = Some("remote".into());
+    inserted.parent_workflow_id = Some("gap".into());
+    provider.insert_workflow_status(inserted).await?;
+    let gap = engine
+        .start::<_, String>("gap", (), WorkflowOptions::with_id("gap"))
+        .await?;
+    assert_eq!(gap.result().await?, "gap-0");
+    let original = provider.get_workflow_status("gap-0").await?.unwrap();
+    assert_eq!(original.input, json!("original-input"));
+    assert_eq!(original.app_version, "target-version");
+    assert_eq!(
+        engine.get_workflow_steps("gap").await?[0]
+            .child_workflow_id
+            .as_deref(),
+        Some("gap-0")
+    );
+    assert_eq!(engine.verify_replay("gap").await?.divergence, None);
+    let refused = engine
+        .start::<_, i64>("refusals", (), WorkflowOptions::with_id("refusals"))
+        .await?;
+    assert_eq!(refused.result().await?, 42);
+    assert_eq!(engine.verify_replay("refusals").await?.divergence, None);
+    assert!(
+        provider
+            .set_workflow_status("refusals", STATUS_PENDING, None, None)
+            .await?
+    );
+    assert_eq!(engine.recover().await?, 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), refused.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    assert_eq!(refusal_effects.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.get_workflow_steps("refusals").await?.len(), 1);
+
+    let mut holder = durare::WorkflowStatus::new(
+        "reject-holder",
+        "external",
+        json!(null),
+        STATUS_PENDING,
+        "worker",
+        "target-version",
+    );
+    holder.queue_name = Some("remote".into());
+    holder.dedup_id = Some("reject-key".into());
+    provider.insert_workflow_status(holder).await?;
+    let rejected = engine
+        .start::<_, String>("reject", (), WorkflowOptions::with_id("reject-parent"))
+        .await?;
+    assert_eq!(rejected.result().await?, "rejected");
+    provider
+        .set_workflow_status("reject-holder", durare::STATUS_SUCCESS, None, None)
+        .await?;
+    provider
+        .set_workflow_status("reject-parent", STATUS_PENDING, None, None)
+        .await?;
+    assert_eq!(engine.recover().await?, 1);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), rejected.result())
+            .await
+            .unwrap()?,
+        "rejected"
+    );
+    assert_eq!(
+        engine.verify_replay("reject-parent").await?.divergence,
+        None
+    );
+    assert!(provider
+        .get_workflow_status("reject-parent-0")
+        .await?
+        .is_none());
+
+    // Released 0.5.0 consumes no slot for serialization failure, then one
+    // each for UnknownWorkflow and UnknownQueue. Its effect is at position 2.
+    provider
+        .insert_workflow_status(durare::WorkflowStatus::new(
+            "legacy",
+            "legacy",
+            json!(null),
+            STATUS_PENDING,
+            "stopped-0.5.0",
+            engine.app_version(),
+        ))
+        .await?;
+    provider
+        .record_step_result("legacy", 2, "effect", json!(42), None, None, None)
+        .await?;
+    assert_eq!(engine.recover().await?, 1);
+    let old = engine.retrieve_workflow::<i64>("legacy").await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), old.result())
+            .await
+            .unwrap()?,
+        42
+    );
+    assert_eq!(
+        legacy_effects.load(Ordering::SeqCst),
+        0,
+        "released side effect ran twice"
+    );
+    assert_eq!(engine.verify_replay("legacy").await?.divergence, None);
+    assert_eq!(engine.get_workflow_steps("legacy").await?[0].step_id, 2);
+    engine.shutdown(Duration::from_secs(1)).await?;
+    configuration_recovery_contract(provider).await
+}
+
+#[tokio::test]
+async fn named_enqueue_memory() -> Result<()> {
+    contract(Arc::new(InMemoryProvider::new())).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn named_enqueue_sqlite() -> Result<()> {
+    contract(Arc::new(
+        durare::SqliteProvider::connect("sqlite::memory:").await?,
+    ))
+    .await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn named_enqueue_postgres() -> Result<()> {
+    let Ok(base) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let (admin, url, name) = common::hermetic_pg_db(&base, "named_enqueue").await;
+    let result = contract(Arc::new(durare::PostgresProvider::connect(&url).await?)).await;
+    common::drop_hermetic_pg_db(&admin, &name).await;
+    result
+}
+
+async fn worker_launch_order_contract(provider: Arc<dyn StateProvider>) -> Result<()> {
+    for worker_first in [true, false] {
+        let mut parent_builder = DurableEngine::builder(provider.clone());
+        parent_builder.app_version("parent-version");
+        let mut parent = parent_builder.build().await?;
+        parent.register_queue(WorkflowQueue::new("remote"));
+        // Both processes dispatch this queue. The explicit foreign version
+        // must prevent the producer from claiming its own remote child.
+        parent.register("parent", |ctx: DurableContext, n: i64| async move {
+            ctx.enqueue_workflow::<_, i64>(
+                "remote",
+                "external",
+                n,
+                WorkflowOptions::default().app_version("worker-version"),
+            )
+            .await?
+            .result()
+            .await
+        });
+        let mut worker_builder = DurableEngine::builder(provider.clone());
+        worker_builder.app_version("worker-version");
+        let mut worker = worker_builder.build().await?;
+        worker.register_queue(
+            WorkflowQueue::new("remote").base_polling_interval(Duration::from_millis(10)),
+        );
+        worker.register("external", |_ctx: DurableContext, n: i64| async move {
+            Ok::<_, Error>(n * 3)
+        });
+        if worker_first {
+            worker.launch().await?;
+            parent.launch().await?;
+            // Ensure the producer really is latest, including coarse clocks.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            provider
+                .set_latest_application_version("parent-version")
+                .await?;
+        } else {
+            parent.launch().await?;
+            worker.launch().await?;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            provider
+                .set_latest_application_version("worker-version")
+                .await?;
+        }
+        assert_eq!(
+            provider
+                .get_latest_application_version()
+                .await?
+                .unwrap()
+                .version_name,
+            if worker_first {
+                "parent-version"
+            } else {
+                "worker-version"
+            }
+        );
+        let id = format!("launch-order-{worker_first}");
+        let output = tokio::time::timeout(Duration::from_secs(5), async {
+            parent
+                .start::<_, i64>("parent", 7, WorkflowOptions::with_id(&id))
+                .await?
+                .result()
+                .await
+        })
+        .await
+        .unwrap()?;
+        assert_eq!(output, 21);
+        let row = provider
+            .get_workflow_status(&format!("{id}-0"))
+            .await?
+            .unwrap();
+        assert_eq!(row.app_version, "worker-version");
+        assert_eq!(row.executor_id, worker.executor_id());
+        parent.shutdown(Duration::from_secs(1)).await?;
+        worker.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_launch_order_memory() -> Result<()> {
+    worker_launch_order_contract(Arc::new(InMemoryProvider::new())).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn worker_launch_order_sqlite() -> Result<()> {
+    worker_launch_order_contract(Arc::new(
+        durare::SqliteProvider::connect("sqlite::memory:").await?,
+    ))
+    .await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn worker_launch_order_postgres() -> Result<()> {
+    let Ok(base) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let (admin, url, name) = common::hermetic_pg_db(&base, "enqueue_launch_order").await;
+    let result =
+        worker_launch_order_contract(Arc::new(durare::PostgresProvider::connect(&url).await?))
+            .await;
+    common::drop_hermetic_pg_db(&admin, &name).await;
+    result
+}
+
+#[tokio::test]
+async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register_queue(WorkflowQueue::new("remote"));
+    engine.listen_queues(Vec::<String>::new());
+    engine.register("parent", |ctx: DurableContext, _: ()| async move {
+        assert!(ctx
+            .enqueue_workflow::<_, ()>("", "external", (), WorkflowOptions::default())
+            .await
+            .is_err());
+        assert!(ctx
+            .enqueue_workflow::<_, ()>("remote", "", (), WorkflowOptions::default())
+            .await
+            .is_err());
+        let nested = ctx.clone();
+        ctx.step("nested", || async move {
+            assert!(matches!(
+                nested
+                    .enqueue_workflow::<_, ()>("remote", "external", (), WorkflowOptions::default())
+                    .await,
+                Err(Error::NestedDurableCall { .. })
+            ));
+            Ok(())
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+    engine
+        .start::<_, ()>("parent", (), WorkflowOptions::with_id("invalid"))
+        .await?
+        .result()
+        .await?;
+    let steps = engine.get_workflow_steps("invalid").await?;
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step_id, 2);
+    assert_eq!(engine.verify_replay("invalid").await?.divergence, None);
+    assert_eq!(
+        provider.list_workflows(&ListFilter::default()).await?.len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Result<()> {
+    for producer_only in [false, true] {
+        for version in [
+            None,
+            Some(""),
+            Some("producer-version"),
+            Some("worker-version"),
+        ] {
+            let provider = Arc::new(InMemoryProvider::new());
+            let mut builder = DurableEngine::builder(provider.clone());
+            builder.app_version("producer-version");
+            let mut engine = builder.build().await?;
+            engine.register_queue(WorkflowQueue::new("remote"));
+            if !producer_only {
+                engine.listen_queues(Vec::<String>::new());
+            }
+            let missing = version.is_none_or(str::is_empty);
+            let unsafe_route = !producer_only && version == Some("producer-version");
+            engine.register("parent", move |ctx: DurableContext, _: ()| async move {
+                let result = ctx
+                    .enqueue_workflow::<_, ()>(
+                        "remote",
+                        "external",
+                        (),
+                        WorkflowOptions {
+                            app_version: version.map(str::to_owned),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if missing {
+                    let error = result.err().expect("missing target version accepted");
+                    assert!(matches!(error, Error::App { .. }));
+                    assert!(error.to_string().contains("explicit nonempty app_version"));
+                } else if unsafe_route {
+                    let error = result.err().expect("unsafe routing accepted");
+                    assert!(matches!(error, Error::App { .. }));
+                    assert!(error.to_string().contains("excluded from local dispatch"));
+                } else {
+                    assert_eq!(result?.id(), "guard-0");
+                }
+                ctx.step("after", || async { Ok(()) }).await
+            });
+            engine.register("warmup", |_: DurableContext, _: ()| async { Ok(()) });
+            engine
+                .start::<_, ()>("warmup", (), WorkflowOptions::with_id("warmup"))
+                .await?
+                .result()
+                .await?;
+            // Change the filter after Runtime initialization, in both directions.
+            engine.listen_queues(if producer_only {
+                vec![]
+            } else {
+                vec!["remote"]
+            });
+            let result = engine
+                .start::<_, ()>("parent", (), WorkflowOptions::with_id("guard"))
+                .await?
+                .result()
+                .await;
+            result?;
+            assert_eq!(engine.verify_replay("guard").await?.divergence, None);
+            assert_eq!(
+                provider.get_workflow_status("guard-0").await?.is_some(),
+                !missing && !unsafe_route
+            );
+            engine.shutdown(Duration::from_secs(1)).await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_parent_cannot_enqueue_new_children() -> Result<()> {
+    let provider = Arc::new(InMemoryProvider::new());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register_queue(WorkflowQueue::new("remote"));
+    engine.listen_queues(Vec::<String>::new());
+    let db = provider.clone();
+    engine.register("parent", move |ctx: DurableContext, _: ()| {
+        let db = db.clone();
+        async move {
+            db.set_workflow_status("cancelled-parent", durare::STATUS_CANCELLED, None, None)
+                .await?;
+            assert!(
+                matches!(ctx.enqueue_workflow::<_, ()>("remote", "external", (),
+                WorkflowOptions::default().app_version("worker")).await,
+                Err(Error::Cancelled(id)) if id == "cancelled-parent")
+            );
+            Ok(())
+        }
+    });
+    let result = engine
+        .start::<_, ()>("parent", (), WorkflowOptions::with_id("cancelled-parent"))
+        .await?
+        .result()
+        .await;
+    assert!(matches!(result, Err(Error::Cancelled(_))));
+    assert!(provider
+        .get_workflow_status("cancelled-parent-0")
+        .await?
+        .is_none());
+    assert!(provider
+        .get_workflow_steps("cancelled-parent")
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+async fn configuration_recovery_contract(provider: Arc<dyn StateProvider>) -> Result<()> {
+    // Reject, explicitly re-execute after fixing config, then replay the saved
+    // child with that queue absent again. History takes precedence over config.
+    for phase in 0..3 {
+        let fixed = phase != 0;
+        let mut builder = DurableEngine::builder(provider.clone());
+        builder.app_version("configuration-recovery");
+        let mut engine = builder.build().await?;
+        if phase == 1 {
+            engine.register_queue(WorkflowQueue::new("late-queue"));
+        }
+        engine.register(
+            "configuration-parent",
+            move |ctx: DurableContext, _: ()| async move {
+                let child = ctx
+                    .enqueue_workflow::<_, ()>(
+                        "late-queue",
+                        "external",
+                        (),
+                        WorkflowOptions::default().app_version("worker"),
+                    )
+                    .await;
+                Ok(child?.id().to_owned())
+            },
+        );
+        engine.register("warmup", |_: DurableContext, _: ()| async { Ok(()) });
+        // Initialize Runtime before configuring the listen filter: permitted
+        // by listen_queues' before-launch contract.
+        engine
+            .start::<_, ()>(
+                "warmup",
+                (),
+                WorkflowOptions::with_id(format!("warmup-{fixed}")),
+            )
+            .await?
+            .result()
+            .await?;
+        engine.listen_queues(Vec::<String>::new());
+        if fixed {
+            // Deployment alone does not retry a terminal ERROR. Explicitly
+            // reset this fixture to model an operator-requested re-execution.
+            assert_eq!(
+                provider
+                    .get_workflow_status("configuration-parent")
+                    .await?
+                    .unwrap()
+                    .status,
+                if phase == 1 {
+                    durare::STATUS_ERROR
+                } else {
+                    durare::STATUS_SUCCESS
+                }
+            );
+            provider
+                .set_workflow_status("configuration-parent", STATUS_PENDING, None, None)
+                .await?;
+            engine.recover_pending_for(&[]).await?;
+            let recovered = engine
+                .retrieve_workflow::<String>("configuration-parent")
+                .await?;
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), recovered.result())
+                    .await
+                    .unwrap()?,
+                "configuration-parent-0"
+            );
+            assert_eq!(
+                engine
+                    .verify_replay("configuration-parent")
+                    .await?
+                    .divergence,
+                None
+            );
+        } else {
+            let result = engine
+                .start::<_, String>(
+                    "configuration-parent",
+                    (),
+                    WorkflowOptions::with_id("configuration-parent"),
+                )
+                .await?
+                .result()
+                .await;
+            assert!(matches!(result, Err(Error::UnknownQueue(_))));
+            assert_eq!(
+                engine
+                    .verify_replay("configuration-parent")
+                    .await?
+                    .divergence,
+                None
+            );
+            assert!(provider
+                .get_workflow_steps("configuration-parent")
+                .await?
+                .is_empty());
+        }
+        engine.shutdown(Duration::from_secs(1)).await?;
+    }
+    Ok(())
+}

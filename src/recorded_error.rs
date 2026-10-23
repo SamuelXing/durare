@@ -272,6 +272,7 @@ mod tests {
                 operation: "step".into(),
             },
             Error::WorkflowConflict("wf".into()),
+            Error::workflow_target_conflict("wf"),
             Error::ReplayDiverged {
                 workflow_id: "wf".into(),
                 divergence: Divergence::Missing {

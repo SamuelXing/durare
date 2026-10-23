@@ -8,6 +8,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `DurableContext::enqueue_workflow` enqueues named children without a local
+  workflow registration, preserving child checkpoints and identity inheritance.
+  Remote targets require an explicit target application version. Same-version
+  targets also require a queue excluded from local dispatch with `listen_queues`;
+  different-version targets are isolated by the dequeue version gate.
 - `WorkflowResultOptions` and `WorkflowHandle::result_with_options` configure
   the database polling interval and an optional wait timeout. Cancelling a result
   wait preserves the local task for a later wait or another handle clone. Wait
@@ -32,8 +37,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now honors `cancel_children`. Existing cancellation calls remain root-only.
   In-memory cancellation now matches SQL providers for parked workflows.
 
+### Changed
+
+- Queued `start_workflow` children can target workflows not registered locally
+  when an explicit target version and safe queue routing are supplied.
+  Both child APIs reject empty workflow names and empty queue names.
+- Child argument and registration errors return ordinary errors without a
+  checkpoint. Uncaught errors fail the parent; fixing configuration does not
+  automatically retry terminal workflows. `Reject` deduplication and target
+  conflicts remain checkpointed. Serialization failures consume no position;
+  other refusals retain 0.5.0's consumed position, keeping old histories aligned.
+- Reusing a workflow ID or adopting a deduplication key for a different workflow
+  name, class, or configured instance now returns `WorkflowTargetConflict` from
+  `Error::code()` (carried by the existing `Error::Portable` variant), instead
+  of returning a handle to another target. This tightens engine/client ID reuse.
+- Engine/client enqueue deduplication races use a bounded retry budget;
+  exhausted races report an observation failure. Debouncer collector/ACK
+  turnover retains its unbounded retry behavior. Returning an existing enqueue
+  verifies the workflow name, class, and configured instance.
+
 ### Fixed
 
+- Child creation checks parent cancellation before starting fresh work. Built-in
+  providers atomically commit child creation/deduplication and its parent
+  checkpoint, preventing duplicate children after a deduplication slot is freed.
+  Custom providers must implement atomic child insertion for `ReturnExisting`;
+  the default refuses that mode before writing.
+- Queue registration and `listen_queues` share a locked configuration between
+  the engine and runtime. Queues added after the first workflow starts are
+  available to both enqueue APIs and dispatch at launch.
+- Workflow target comparison treats empty class/config names like absent values,
+  matching rows written by other SDKs without accepting different named targets.
 - Forked workflows retain their source's searchable attributes on all backends.
 - Admin queue rate limits use lowercase `limit`/`period` keys and seconds,
   including fractional seconds, matching the reference SDK wire format.

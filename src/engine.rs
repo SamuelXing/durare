@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -691,7 +691,7 @@ pub struct EngineMetrics {
 pub struct DurableEngine {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
-    queues: HashMap<String, Arc<WorkflowQueue>>,
+    queue_config: Arc<std::sync::RwLock<QueueConfig>>,
     /// If set, only these registered queues get a dispatcher at
     /// [`launch`](Self::launch); `None` dispatches every registered queue. Set
     /// by [`listen_queues`](Self::listen_queues).
@@ -913,7 +913,10 @@ impl DurableEngineBuilder {
         Ok(DurableEngine {
             provider: self.provider,
             workflows,
-            queues,
+            queue_config: Arc::new(std::sync::RwLock::new(QueueConfig {
+                queues,
+                listen_filter: self.listen_filter.clone(),
+            })),
             listen_filter: self.listen_filter,
             scheduled,
             executor_id,
@@ -990,7 +993,10 @@ impl DurableEngine {
         Ok(Self {
             provider,
             workflows,
-            queues,
+            queue_config: Arc::new(std::sync::RwLock::new(QueueConfig {
+                queues,
+                listen_filter: None,
+            })),
             listen_filter: None,
             scheduled,
             executor_id,
@@ -1088,16 +1094,15 @@ impl DurableEngine {
 
     /// The shared execution core, built once from the current registrations.
     ///
-    /// Built lazily on the first run so all `register`/`register_queue` calls are
-    /// captured; registering after the first workflow starts is not reflected
-    /// (register before running, as you would before `launch`).
+    /// Workflow handlers are captured on the first run. Queue registrations
+    /// remain shared with the engine and may be added until `launch`.
     fn runtime(&self) -> Arc<Runtime> {
         self.runtime
             .get_or_init(|| {
                 Arc::new(Runtime {
                     provider: self.provider.clone(),
                     workflows: self.workflows.clone(),
-                    queues: self.queues.clone(),
+                    queue_config: self.queue_config.clone(),
                     required_roles: self.required_roles.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
@@ -1171,7 +1176,11 @@ impl DurableEngine {
     /// Register a durable queue. Must be called before [`launch`](Self::launch);
     /// enqueueing to an unregistered queue is an error.
     pub fn register_queue(&mut self, queue: WorkflowQueue) {
-        self.queues.insert(queue.name.clone(), Arc::new(queue));
+        self.queue_config
+            .write()
+            .expect("queue configuration lock poisoned")
+            .queues
+            .insert(queue.name.clone(), Arc::new(queue));
     }
 
     /// Declare the roles required to invoke workflow `name`: before the body
@@ -1206,12 +1215,28 @@ impl DurableEngine {
         S: Into<String>,
     {
         self.listen_filter = Some(names.into_iter().map(Into::into).collect());
+        // The dispatcher set is fixed while launched. Before launch, keep an
+        // already-created runtime in sync with the public configuration.
+        if self
+            .dispatchers
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .is_empty()
+        {
+            self.queue_config
+                .write()
+                .expect("queue configuration lock poisoned")
+                .listen_filter = self.listen_filter.clone();
+        }
     }
 
     /// All queues registered on this engine, sorted by name. Includes queues this
     /// process does not dispatch (see [`listen_queues`](Self::listen_queues)).
     pub fn list_registered_queues(&self) -> Vec<WorkflowQueue> {
         let mut queues: Vec<WorkflowQueue> = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
             .queues
             .values()
             .filter(|q| q.name != INTERNAL_QUEUE)
@@ -1506,6 +1531,21 @@ impl DurableEngine {
         };
         self.tasks.reopen();
         let rt = self.runtime();
+        if self
+            .dispatchers
+            .lock()
+            .expect("dispatcher lock poisoned")
+            .is_empty()
+        {
+            rt.set_listen_filter(self.listen_filter.as_ref());
+        }
+
+        let queues = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
+            .queues
+            .clone();
 
         // Register this process's application version.
         if let Err(e) = self
@@ -1540,7 +1580,7 @@ impl DurableEngine {
         // (and a foreign SDK's control plane) can see this executor's queues
         // fleet-wide. The internal queue is an implementation detail and stays
         // unsurfaced, matching `list_registered_queues`.
-        for queue in self.queues.values() {
+        for queue in queues.values() {
             if queue.name == INTERNAL_QUEUE {
                 continue;
             }
@@ -1562,13 +1602,11 @@ impl DurableEngine {
         };
 
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
-        for queue in self.queues.values() {
+        for queue in queues.values() {
             // Skip queues this process is configured not to listen to. The
             // internal queue is always dispatched (re-execution depends on it).
-            if let Some(listen) = &self.listen_filter {
-                if queue.name != INTERNAL_QUEUE && !listen.contains(&queue.name) {
-                    continue;
-                }
+            if rt.is_producer_only(&queue.name) {
+                continue;
             }
             tasks.push(tokio::spawn(queue_dispatch_loop(
                 queue.clone(),
@@ -1725,8 +1763,14 @@ impl DurableEngine {
         // Every registered queue gets an entry (0 when idle), so exporters
         // see stable series; rows for unregistered queues (another process's
         // registrations against the shared database) are included as-is.
-        let mut queue_depth: HashMap<String, i64> =
-            self.queues.keys().map(|q| (q.clone(), 0)).collect();
+        let mut queue_depth: HashMap<String, i64> = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
+            .queues
+            .keys()
+            .map(|q| (q.clone(), 0))
+            .collect();
         for row in rows {
             if let (Some(Some(queue)), Some(count)) =
                 (row.group.get("queue_name").cloned(), row.count)
@@ -1893,8 +1937,10 @@ impl DurableEngine {
     /// `opts.queue` set, the row is persisted `ENQUEUED` (or `DELAYED` when
     /// `opts.delay` is set) and a polling handle is returned — a dispatcher on
     /// any executor claims and runs it. If the id already exists in a terminal
-    /// state, a polling handle over the stored result is returned instead of
-    /// re-running.
+    /// state and names the same workflow, class, and configured instance, a
+    /// polling handle over the stored result is returned instead of re-running.
+    /// A different target returns [`ErrorCode::WorkflowTargetConflict`], carried
+    /// by [`Error::Portable`], rather than exposing the other workflow's result.
     ///
     /// ```
     /// # use durare::{DurableContext, DurableEngine, InMemoryProvider, Result, WorkflowOptions};
@@ -1957,33 +2003,10 @@ impl DurableEngine {
             assumed_role: opts.assumed_role.clone(),
             authenticated_roles: opts.authenticated_roles.clone(),
         };
-        // On a dedup collision under `ReturnExisting`, hand back the workflow
-        // already holding the slot; retry if it was freed between insert and
-        // lookup (the slot's owner just completed).
-        let (canonical, queued, created) = loop {
-            match rt
-                .insert_run(&id, name, input_json.clone(), &opts, None, &auth)
-                .await
-            {
-                Ok(v) => break v,
-                Err(e)
-                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
-                        && e.code() == ErrorCode::QueueDeduplicated =>
-                {
-                    if let (Some(q), Some(d)) = (opts.queue.as_deref(), opts.dedup_id.as_deref()) {
-                        if let Some(existing) = self
-                            .provider
-                            .get_deduplicated_workflow(q, d)
-                            .await
-                            .map_err(crate::execution::observation_error)?
-                        {
-                            return Ok(WorkflowHandle::polling(existing, self.provider.clone()));
-                        }
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        };
+        let (canonical, queued, created) = rt
+            .insert_run_with_dedup(&id, name, input_json, &opts, None, &auth)
+            .await?;
+        let id = canonical.id.clone();
 
         // Terminal already, owned by a queue, or created by an earlier call
         // (`created == false`): observe via polling. A live `PENDING` run is
@@ -2973,6 +2996,23 @@ async fn recover_interrupted_run(
     }
 }
 
+/// Shared queue registry and active consumption policy. No registry snapshot
+/// is taken when the first workflow initializes Runtime.
+struct QueueConfig {
+    queues: HashMap<String, Arc<WorkflowQueue>>,
+    listen_filter: Option<HashSet<String>>,
+}
+
+impl QueueConfig {
+    fn is_producer_only(&self, queue: &str) -> bool {
+        queue != INTERNAL_QUEUE
+            && self
+                .listen_filter
+                .as_ref()
+                .is_some_and(|listen| !listen.contains(queue))
+    }
+}
+
 /// The shared execution core: everything needed to create and run a workflow.
 ///
 /// Reachable both from [`DurableEngine`] methods and from inside a running
@@ -2982,7 +3022,7 @@ async fn recover_interrupted_run(
 pub(crate) struct Runtime {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
-    queues: HashMap<String, Arc<WorkflowQueue>>,
+    queue_config: Arc<std::sync::RwLock<QueueConfig>>,
     /// Required-roles declarations keyed by workflow name; enforced before a
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
@@ -3007,6 +3047,20 @@ pub(crate) struct EngineCounters {
 }
 
 impl Runtime {
+    fn set_listen_filter(&self, listen: Option<&HashSet<String>>) {
+        self.queue_config
+            .write()
+            .expect("queue configuration lock poisoned")
+            .listen_filter = listen.cloned();
+    }
+
+    fn is_producer_only(&self, queue: &str) -> bool {
+        self.queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
+            .is_producer_only(queue)
+    }
+
     pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
         &self.provider
     }
@@ -3052,12 +3106,10 @@ impl Runtime {
         )
     }
 
-    /// Build a new run's status row from `opts` and persist it idempotently,
-    /// returning the canonical row, whether it was routed to a queue, and whether
-    /// **this call** created the row (the arbiter when executors race a
-    /// deterministic id). Shared by top-level runs and child workflows;
-    /// `parent_id`/`auth` are stamped on the row.
-    async fn insert_run(
+    /// Build a new run's status row from `opts`, including parent and identity.
+    /// Top-level runs persist it directly; child runs atomically persist it
+    /// alongside their parent's checkpoint.
+    fn build_run(
         &self,
         id: &str,
         name: &str,
@@ -3065,11 +3117,17 @@ impl Runtime {
         opts: &WorkflowOptions,
         parent_id: Option<&str>,
         auth: &AuthContext,
-    ) -> Result<(WorkflowStatus, bool, bool)> {
+    ) -> Result<(WorkflowStatus, bool)> {
         opts.validate_deduplication(opts.queue.as_deref())?;
         let queued = opts.queue.is_some();
         if let Some(q) = &opts.queue {
-            if !self.queues.contains_key(q) {
+            if !self
+                .queue_config
+                .read()
+                .expect("queue configuration lock poisoned")
+                .queues
+                .contains_key(q)
+            {
                 return Err(Error::UnknownQueue(q.clone()));
             }
         }
@@ -3123,6 +3181,19 @@ impl Runtime {
             row.deadline_ms = row.timeout_ms.map(|t| created_ms + t);
         }
 
+        Ok((row, queued))
+    }
+
+    async fn insert_run(
+        &self,
+        id: &str,
+        name: &str,
+        input_json: Value,
+        opts: &WorkflowOptions,
+        parent_id: Option<&str>,
+        auth: &AuthContext,
+    ) -> Result<(WorkflowStatus, bool, bool)> {
+        let (row, queued) = self.build_run(id, name, input_json, opts, parent_id, auth)?;
         let (canonical, created) = self
             .provider
             .insert_workflow_status(row)
@@ -3201,6 +3272,53 @@ impl Runtime {
         }
     }
 
+    /// Validate fresh child calls without writing history or doing live work.
+    pub(crate) fn validate_child(&self, name: &str, opts: &WorkflowOptions) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::app("workflow name is required"));
+        }
+        if opts.queue.as_deref() == Some("") {
+            return Err(Error::app("queue name is required"));
+        }
+        opts.validate_deduplication(opts.queue.as_deref())?;
+        if opts.delay.is_some() && opts.queue.is_none() {
+            return Err(Error::app(
+                "WorkflowOptions.delay requires a queue; direct runs start immediately",
+            ));
+        }
+        let handler = self
+            .workflows
+            .get(&registry_key(name, opts.config_name.as_deref()));
+        let config = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned");
+        if let Some(queue) = opts.queue.as_deref() {
+            if !config.queues.contains_key(queue) {
+                return Err(Error::UnknownQueue(queue.to_owned()));
+            }
+            if handler.is_none() {
+                if opts.app_version.as_deref().is_none_or(str::is_empty) {
+                    return Err(Error::app(
+                        "remote child requires an explicit nonempty app_version naming its worker version",
+                    ));
+                }
+                // A foreign version cannot be claimed by this producer. A
+                // same-version remote target still needs a producer-only queue.
+                if opts.app_version.as_deref() == Some(self.app_version.as_str())
+                    && !config.is_producer_only(queue)
+                {
+                    return Err(Error::app(
+                        "same-version remote child queues must be excluded from local dispatch using listen_queues",
+                    ));
+                }
+            }
+        } else if handler.is_none() {
+            return Err(Error::UnknownWorkflow(name.to_owned()));
+        }
+        Ok(())
+    }
+
     /// Start a child workflow under the deterministic `child_id`, stamping the
     /// parent link and the inherited identity. Only the insert winner may
     /// dispatch a direct child. Existing children are observed, including PENDING
@@ -3211,20 +3329,190 @@ impl Runtime {
         name: &str,
         input_json: Value,
         opts: WorkflowOptions,
-        parent_id: &str,
+        parent: (&str, i32),
         auth: AuthContext,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let (parent_id, seq) = parent;
         let handler = self
             .workflows
             .get(&registry_key(name, opts.config_name.as_deref()))
-            .cloned()
-            .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
-        let (canonical, queued, created) = self
-            .insert_run(child_id, name, input_json, &opts, Some(parent_id), &auth)
-            .await?;
+            .cloned();
+        let (row, queued) =
+            self.build_run(child_id, name, input_json, &opts, Some(parent_id), &auth)?;
+        let atomic = self
+            .provider
+            .insert_child_workflow(
+                row.clone(),
+                parent_id,
+                seq,
+                opts.dedup_policy == DeduplicationPolicy::ReturnExisting,
+            )
+            .await
+            .map_err(crate::execution::observation_error)?;
+        let needs_checkpoint = atomic.is_none();
+        let (canonical, created) = match atomic {
+            Some(run) => run,
+            None => {
+                // Custom providers may retain the legacy deterministic-ID
+                // path, but never fall back for a dedup adoption decision.
+                if opts.dedup_policy == DeduplicationPolicy::ReturnExisting {
+                    return Err(crate::execution::recovery_error(Error::app(
+                        "provider must implement atomic child deduplication",
+                    )));
+                }
+                let run = self
+                    .provider
+                    .insert_workflow_status(row)
+                    .await
+                    .map_err(crate::execution::observation_error)?;
+                check_workflow_target(&run.0, name, &opts)?;
+                run
+            }
+        };
+        let id = canonical.id.clone();
         if created && !queued && !is_terminal(&canonical.status) {
-            self.spawn_detached(canonical, handler);
+            self.spawn_detached(canonical, handler.expect("inline child has a handler"));
         }
+        if needs_checkpoint {
+            self.provider
+                .record_child_workflow(parent_id, seq, name, &id)
+                .await
+                .map_err(crate::execution::observation_error)?;
+        }
+        Ok(id)
+    }
+
+    /// Bound the insert/lookup race when a deduplication slot is freed between
+    /// calls. Exhaustion is an observation failure, never a business outcome.
+    async fn insert_run_with_dedup(
+        &self,
+        child_id: &str,
+        name: &str,
+        input_json: Value,
+        opts: &WorkflowOptions,
+        parent_id: Option<&str>,
+        auth: &AuthContext,
+    ) -> Result<(WorkflowStatus, bool, bool)> {
+        retry_dedup(|| async {
+            let run = match self
+                .insert_run(child_id, name, input_json.clone(), opts, parent_id, auth)
+                .await
+            {
+                Ok(run) => {
+                    check_workflow_target(&run.0, name, opts)?;
+                    Some(run)
+                }
+                Err(error)
+                    if opts.dedup_policy == DeduplicationPolicy::ReturnExisting
+                        && error.code() == ErrorCode::QueueDeduplicated =>
+                {
+                    let queue = opts.queue.as_deref().expect("validated queue");
+                    find_dedup_target(self.provider.as_ref(), queue, name, opts)
+                        .await?
+                        .map(|row| (row, true, false))
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(run)
+        })
+        .await
+    }
+}
+
+pub(crate) fn check_workflow_target(
+    row: &WorkflowStatus,
+    name: &str,
+    opts: &WorkflowOptions,
+) -> Result<()> {
+    crate::provider::check_target(
+        row,
+        name,
+        opts.class_name.as_deref(),
+        opts.config_name.as_deref(),
+    )
+}
+
+pub(crate) async fn find_dedup_target(
+    provider: &dyn StateProvider,
+    queue: &str,
+    name: &str,
+    opts: &WorkflowOptions,
+) -> Result<Option<WorkflowStatus>> {
+    let key = opts
+        .dedup_id
+        .as_deref()
+        .expect("validated deduplication key");
+    let Some(id) = provider
+        .get_deduplicated_workflow(queue, key)
+        .await
+        .map_err(crate::execution::observation_error)?
+    else {
+        return Ok(None);
+    };
+    let Some(row) = provider
+        .get_workflow_status(&id)
+        .await
+        .map_err(crate::execution::observation_error)?
+    else {
+        return Ok(None);
+    };
+    if is_terminal(&row.status)
+        || row.dedup_id.as_deref() != Some(key)
+        || row.queue_name.as_deref() != Some(queue)
+    {
+        return Ok(None);
+    }
+    check_workflow_target(&row, name, opts)?;
+    Ok(Some(row))
+}
+
+/// Retry only a raced-away deduplication slot, yielding between attempts so
+/// cancellation remains possible. Keep this budget independent of body retries.
+pub(crate) async fn retry_dedup<T, F, Fut>(mut attempt: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<T>>>,
+{
+    const MAX_DEDUP_ATTEMPTS: usize = 8;
+    for index in 0..MAX_DEDUP_ATTEMPTS {
+        if let Some(value) = attempt().await? {
+            return Ok(value);
+        }
+        if index + 1 < MAX_DEDUP_ATTEMPTS {
+            tokio::task::yield_now().await;
+        }
+    }
+    Err(Error::ObservationFailed(Arc::new(Error::app(
+        "enqueue deduplication race retry limit exceeded",
+    ))))
+}
+
+#[cfg(test)]
+mod child_enqueue_retry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dedup_race_budget_is_bounded() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_dedup(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<Option<()>, Error>(None) }
+        })
+        .await;
+        assert!(matches!(result, Err(Error::ObservationFailed(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn freed_slot_can_succeed_on_retry() -> Result<()> {
+        let calls = AtomicUsize::new(0);
+        let value = retry_dedup(|| {
+            let number = calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, Error>((number == 2).then_some(42)) }
+        })
+        .await?;
+        assert_eq!(value, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         Ok(())
     }
 }

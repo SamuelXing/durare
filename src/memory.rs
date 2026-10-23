@@ -1073,6 +1073,64 @@ impl StateProvider for InMemoryProvider {
         })
     }
 
+    async fn insert_child_workflow(
+        &self,
+        child: WorkflowStatus,
+        parent_id: &str,
+        seq: i32,
+        return_existing: bool,
+    ) -> Result<Option<(WorkflowStatus, bool)>> {
+        let mut g = self.inner.lock().await;
+        let key = (parent_id.to_owned(), seq);
+        if let Some(step) = g.steps.get(&key) {
+            if step.name != child.name || step.child_workflow_id.is_none() {
+                return Err(Error::WorkflowConflict(parent_id.to_owned()));
+            }
+            let row = g
+                .workflows
+                .get(step.child_workflow_id.as_ref().unwrap())
+                .ok_or_else(|| {
+                    crate::execution::recovery_error(Error::app("recorded child is missing"))
+                })?;
+            return Ok(Some((row.clone(), false)));
+        }
+        let parent = g
+            .workflows
+            .get(parent_id)
+            .ok_or_else(|| Error::nonexistent_workflow(parent_id))?;
+        if parent.status == STATUS_CANCELLED {
+            return Err(Error::Cancelled(parent_id.to_owned()));
+        }
+        let mut chosen = g.workflows.get(&child.id).cloned();
+        if chosen.is_none() {
+            if let (Some(queue), Some(dedup)) = (&child.queue_name, &child.dedup_id) {
+                if let Some(row) = g.workflows.values().find(|row| {
+                    row.queue_name.as_ref() == Some(queue) && row.dedup_id.as_ref() == Some(dedup)
+                }) {
+                    if !return_existing {
+                        return Err(Error::queue_deduplicated(queue, dedup));
+                    }
+                    chosen = Some(row.clone());
+                }
+            }
+        }
+        let created = chosen.is_none();
+        let row = chosen.unwrap_or_else(|| child.clone());
+        crate::provider::check_child_target(&row, &child)?;
+        if created {
+            g.workflows.insert(row.id.clone(), row.clone());
+        }
+        g.steps.insert(
+            key,
+            StepRow {
+                name: child.name,
+                child_workflow_id: Some(row.id.clone()),
+                ..Default::default()
+            },
+        );
+        Ok(Some((row, created)))
+    }
+
     async fn record_child_workflow(
         &self,
         parent_id: &str,
