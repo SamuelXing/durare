@@ -691,7 +691,7 @@ pub struct EngineMetrics {
 pub struct DurableEngine {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
-    queues: HashMap<String, Arc<WorkflowQueue>>,
+    queue_config: Arc<std::sync::RwLock<QueueConfig>>,
     /// If set, only these registered queues get a dispatcher at
     /// [`launch`](Self::launch); `None` dispatches every registered queue. Set
     /// by [`listen_queues`](Self::listen_queues).
@@ -913,7 +913,10 @@ impl DurableEngineBuilder {
         Ok(DurableEngine {
             provider: self.provider,
             workflows,
-            queues,
+            queue_config: Arc::new(std::sync::RwLock::new(QueueConfig {
+                queues,
+                listen_filter: self.listen_filter.clone(),
+            })),
             listen_filter: self.listen_filter,
             scheduled,
             executor_id,
@@ -990,7 +993,10 @@ impl DurableEngine {
         Ok(Self {
             provider,
             workflows,
-            queues,
+            queue_config: Arc::new(std::sync::RwLock::new(QueueConfig {
+                queues,
+                listen_filter: None,
+            })),
             listen_filter: None,
             scheduled,
             executor_id,
@@ -1088,17 +1094,15 @@ impl DurableEngine {
 
     /// The shared execution core, built once from the current registrations.
     ///
-    /// Built lazily on the first run so all `register`/`register_queue` calls are
-    /// captured; registering after the first workflow starts is not reflected
-    /// (register before running, as you would before `launch`).
+    /// Workflow handlers are captured on the first run. Queue registrations
+    /// remain shared with the engine and may be added until `launch`.
     fn runtime(&self) -> Arc<Runtime> {
         self.runtime
             .get_or_init(|| {
                 Arc::new(Runtime {
                     provider: self.provider.clone(),
                     workflows: self.workflows.clone(),
-                    queues: self.queues.clone(),
-                    listen_filter: std::sync::RwLock::new(self.listen_filter.clone()),
+                    queue_config: self.queue_config.clone(),
                     required_roles: self.required_roles.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
@@ -1172,7 +1176,11 @@ impl DurableEngine {
     /// Register a durable queue. Must be called before [`launch`](Self::launch);
     /// enqueueing to an unregistered queue is an error.
     pub fn register_queue(&mut self, queue: WorkflowQueue) {
-        self.queues.insert(queue.name.clone(), Arc::new(queue));
+        self.queue_config
+            .write()
+            .expect("queue configuration lock poisoned")
+            .queues
+            .insert(queue.name.clone(), Arc::new(queue));
     }
 
     /// Declare the roles required to invoke workflow `name`: before the body
@@ -1215,9 +1223,10 @@ impl DurableEngine {
             .expect("dispatcher lock poisoned")
             .is_empty()
         {
-            if let Some(runtime) = self.runtime.get() {
-                runtime.set_listen_filter(self.listen_filter.as_ref());
-            }
+            self.queue_config
+                .write()
+                .expect("queue configuration lock poisoned")
+                .listen_filter = self.listen_filter.clone();
         }
     }
 
@@ -1225,6 +1234,9 @@ impl DurableEngine {
     /// process does not dispatch (see [`listen_queues`](Self::listen_queues)).
     pub fn list_registered_queues(&self) -> Vec<WorkflowQueue> {
         let mut queues: Vec<WorkflowQueue> = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
             .queues
             .values()
             .filter(|q| q.name != INTERNAL_QUEUE)
@@ -1528,6 +1540,13 @@ impl DurableEngine {
             rt.set_listen_filter(self.listen_filter.as_ref());
         }
 
+        let queues = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
+            .queues
+            .clone();
+
         // Register this process's application version.
         if let Err(e) = self
             .provider
@@ -1561,7 +1580,7 @@ impl DurableEngine {
         // (and a foreign SDK's control plane) can see this executor's queues
         // fleet-wide. The internal queue is an implementation detail and stays
         // unsurfaced, matching `list_registered_queues`.
-        for queue in self.queues.values() {
+        for queue in queues.values() {
             if queue.name == INTERNAL_QUEUE {
                 continue;
             }
@@ -1583,7 +1602,7 @@ impl DurableEngine {
         };
 
         let mut tasks = self.dispatchers.lock().expect("dispatcher lock poisoned");
-        for queue in self.queues.values() {
+        for queue in queues.values() {
             // Skip queues this process is configured not to listen to. The
             // internal queue is always dispatched (re-execution depends on it).
             if rt.is_producer_only(&queue.name) {
@@ -1744,8 +1763,14 @@ impl DurableEngine {
         // Every registered queue gets an entry (0 when idle), so exporters
         // see stable series; rows for unregistered queues (another process's
         // registrations against the shared database) are included as-is.
-        let mut queue_depth: HashMap<String, i64> =
-            self.queues.keys().map(|q| (q.clone(), 0)).collect();
+        let mut queue_depth: HashMap<String, i64> = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
+            .queues
+            .keys()
+            .map(|q| (q.clone(), 0))
+            .collect();
         for row in rows {
             if let (Some(Some(queue)), Some(count)) =
                 (row.group.get("queue_name").cloned(), row.count)
@@ -2971,6 +2996,23 @@ async fn recover_interrupted_run(
     }
 }
 
+/// Shared queue registry and active consumption policy. No registry snapshot
+/// is taken when the first workflow initializes Runtime.
+struct QueueConfig {
+    queues: HashMap<String, Arc<WorkflowQueue>>,
+    listen_filter: Option<HashSet<String>>,
+}
+
+impl QueueConfig {
+    fn is_producer_only(&self, queue: &str) -> bool {
+        queue != INTERNAL_QUEUE
+            && self
+                .listen_filter
+                .as_ref()
+                .is_some_and(|listen| !listen.contains(queue))
+    }
+}
+
 /// The shared execution core: everything needed to create and run a workflow.
 ///
 /// Reachable both from [`DurableEngine`] methods and from inside a running
@@ -2980,9 +3022,7 @@ async fn recover_interrupted_run(
 pub(crate) struct Runtime {
     provider: Arc<dyn StateProvider>,
     workflows: HashMap<String, WorkflowFn>,
-    queues: HashMap<String, Arc<WorkflowQueue>>,
-    // Store the filter itself so queues registered after initialization obey it too.
-    listen_filter: std::sync::RwLock<Option<HashSet<String>>>,
+    queue_config: Arc<std::sync::RwLock<QueueConfig>>,
     /// Required-roles declarations keyed by workflow name; enforced before a
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
@@ -3008,20 +3048,17 @@ pub(crate) struct EngineCounters {
 
 impl Runtime {
     fn set_listen_filter(&self, listen: Option<&HashSet<String>>) {
-        *self
-            .listen_filter
+        self.queue_config
             .write()
-            .expect("queue routing lock poisoned") = listen.cloned();
+            .expect("queue configuration lock poisoned")
+            .listen_filter = listen.cloned();
     }
 
     fn is_producer_only(&self, queue: &str) -> bool {
-        queue != INTERNAL_QUEUE
-            && self
-                .listen_filter
-                .read()
-                .expect("queue routing lock poisoned")
-                .as_ref()
-                .is_some_and(|listen| !listen.contains(queue))
+        self.queue_config
+            .read()
+            .expect("queue configuration lock poisoned")
+            .is_producer_only(queue)
     }
 
     pub(crate) fn provider(&self) -> &Arc<dyn StateProvider> {
@@ -3084,7 +3121,13 @@ impl Runtime {
         opts.validate_deduplication(opts.queue.as_deref())?;
         let queued = opts.queue.is_some();
         if let Some(q) = &opts.queue {
-            if !self.queues.contains_key(q) {
+            if !self
+                .queue_config
+                .read()
+                .expect("queue configuration lock poisoned")
+                .queues
+                .contains_key(q)
+            {
                 return Err(Error::UnknownQueue(q.clone()));
             }
         }
@@ -3246,8 +3289,12 @@ impl Runtime {
         let handler = self
             .workflows
             .get(&registry_key(name, opts.config_name.as_deref()));
+        let config = self
+            .queue_config
+            .read()
+            .expect("queue configuration lock poisoned");
         if let Some(queue) = opts.queue.as_deref() {
-            if !self.queues.contains_key(queue) {
+            if !config.queues.contains_key(queue) {
                 return Err(Error::UnknownQueue(queue.to_owned()));
             }
             if handler.is_none() {
@@ -3259,7 +3306,7 @@ impl Runtime {
                 // A foreign version cannot be claimed by this producer. A
                 // same-version remote target still needs a producer-only queue.
                 if opts.app_version.as_deref() == Some(self.app_version.as_str())
-                    && !self.is_producer_only(queue)
+                    && !config.is_producer_only(queue)
                 {
                     return Err(Error::app(
                         "same-version remote child queues must be excluded from local dispatch using listen_queues",

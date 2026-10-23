@@ -40,8 +40,10 @@ pub(crate) fn check_target(
     config_name: Option<&str>,
 ) -> Result<()> {
     if row.name != name
-        || row.class_name.as_deref() != class_name
-        || row.config_name.as_deref() != config_name
+        || row.class_name.as_deref().filter(|s| !s.is_empty())
+            != class_name.filter(|s| !s.is_empty())
+        || row.config_name.as_deref().filter(|s| !s.is_empty())
+            != config_name.filter(|s| !s.is_empty())
     {
         return Err(Error::workflow_target_conflict(&row.id));
     }
@@ -2183,7 +2185,10 @@ pub trait StateProvider: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_roles, drain_stream_from, encode_roles, StreamBackend, STATUS_SUCCESS};
+    use super::{
+        check_target, decode_roles, drain_stream_from, encode_roles, StreamBackend, WorkflowStatus,
+        STATUS_PENDING, STATUS_SUCCESS,
+    };
     use crate::error::Result;
     use async_trait::async_trait;
     use serde_json::{json, Value};
@@ -2240,6 +2245,35 @@ mod tests {
             vec!["final".to_string()],
             "the value committed just before the producer went inactive must not be dropped",
         );
+    }
+
+    #[test]
+    fn target_identity_normalizes_only_absent_fields() {
+        for class in [None, Some("")] {
+            for config in [None, Some("")] {
+                let mut row = WorkflowStatus::new(
+                    "id",
+                    "name",
+                    serde_json::json!(null),
+                    STATUS_PENDING,
+                    "",
+                    "",
+                );
+                row.class_name = class.map(str::to_owned);
+                row.config_name = config.map(str::to_owned);
+                for requested_class in [None, Some("")] {
+                    for requested_config in [None, Some("")] {
+                        assert!(
+                            check_target(&row, "name", requested_class, requested_config).is_ok()
+                        );
+                    }
+                }
+                assert!(check_target(&row, "other", None, None).is_err());
+                assert!(check_target(&row, "name", Some("Orders"), None).is_err());
+                assert!(check_target(&row, "name", None, Some("instance")).is_err());
+                assert!(check_target(&row, "name", Some(" "), None).is_err());
+            }
+        }
     }
 
     #[test]

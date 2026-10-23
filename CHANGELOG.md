@@ -63,9 +63,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checkpoint, preventing duplicate children after a deduplication slot is freed.
   Custom providers must implement atomic child insertion for `ReturnExisting`;
   the default refuses that mode before writing.
-- Updating `listen_queues` before launch also updates an initialized runtime;
-  child routing and queue dispatch use the same filter, including queues
-  registered after runtime initialization.
+- Queue registration and `listen_queues` share a locked configuration between
+  the engine and runtime. Queues added after the first workflow starts are
+  available to both enqueue APIs and dispatch at launch.
+- Workflow target comparison treats empty class/config names like absent values,
+  matching rows written by other SDKs without accepting different named targets.
 - Forked workflows retain their source's searchable attributes on all backends.
 - Admin queue rate limits use lowercase `limit`/`period` keys and seconds,
   including fractional seconds, matching the reference SDK wire format.

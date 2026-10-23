@@ -27,6 +27,27 @@ fn child(id: &str, parent: &str) -> WorkflowStatus {
 
 async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
     db.init().await?;
+    // Foreign SDKs may encode absent identity fields as either NULL or ''.
+    // Exercise both directions through each backend's atomic adoption path.
+    for stored_empty in [false, true] {
+        let id = format!("alias-{stored_empty}");
+        db.insert_workflow_status(parent(&id)).await?;
+        let mut holder = child(&format!("{id}-holder"), &id);
+        holder.dedup_id = Some(id.clone());
+        holder.class_name = stored_empty.then(String::new);
+        holder.config_name = stored_empty.then(String::new);
+        db.insert_workflow_status(holder.clone()).await?;
+        let mut requested = holder.clone();
+        requested.id = format!("{id}-request");
+        requested.class_name = (!stored_empty).then(String::new);
+        requested.config_name = (!stored_empty).then(String::new);
+        let (adopted, created) = db
+            .insert_child_workflow(requested, &id, 0, true)
+            .await?
+            .unwrap();
+        assert_eq!(adopted.id, holder.id);
+        assert!(!created);
+    }
     db.insert_workflow_status(parent("parent")).await?;
     db.insert_workflow_status(child("existing", "parent"))
         .await?;

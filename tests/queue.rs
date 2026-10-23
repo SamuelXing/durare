@@ -662,36 +662,63 @@ async fn late_queue_registration_obeys_existing_listen_filter() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("echo", |_: DurableContext, n: i64| async move { Ok(n) });
+    engine.register(
+        "late-parent",
+        |ctx: DurableContext, queue: String| async move {
+            Ok(ctx
+                .enqueue_workflow::<_, i64>(&queue, "echo", 7_i64, WorkflowOptions::default())
+                .await?
+                .id()
+                .to_owned())
+        },
+    );
     engine
         .start::<_, i64>("echo", 0, WorkflowOptions::with_id("warmup"))
         .await?
         .result()
         .await?;
-    // Runtime is already initialized. Neither queue is in its registry snapshot.
+    // Add queues after Runtime initialization and enqueue through public APIs.
+    // Both the child preflight and top-level run builder must see them.
     engine.listen_queues(["included"]);
     engine.register_queue(test_queue("excluded"));
     engine.register_queue(test_queue("included"));
+    let mut child_ids = Vec::new();
     for queue in ["excluded", "included"] {
-        let mut row = durare::WorkflowStatus::new(
-            queue,
-            "echo",
-            serde_json::json!(7),
-            STATUS_ENQUEUED,
-            "",
-            engine.app_version(),
+        child_ids.push(
+            engine
+                .start::<_, String>(
+                    "late-parent",
+                    queue.to_owned(),
+                    WorkflowOptions::with_id(queue),
+                )
+                .await?
+                .result()
+                .await?,
         );
-        row.queue_name = Some(queue.into());
-        provider.insert_workflow_status(row).await?;
+        assert_eq!(engine.verify_replay(queue).await?.divergence, None);
     }
+    let direct = engine
+        .start::<_, i64>(
+            "echo",
+            8_i64,
+            WorkflowOptions::with_id("top-level").queue("included"),
+        )
+        .await?;
     engine.launch().await?;
-    let included = engine.retrieve_workflow::<i64>("included").await?;
+    let included = engine.retrieve_workflow::<i64>(&child_ids[1]).await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(3), included.result())
             .await
             .unwrap()?,
         7
     );
-    let excluded = engine.retrieve_workflow::<i64>("excluded").await?;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), direct.result())
+            .await
+            .unwrap()?,
+        8
+    );
+    let excluded = engine.retrieve_workflow::<i64>(&child_ids[0]).await?;
     assert!(
         tokio::time::timeout(Duration::from_millis(100), excluded.result())
             .await
@@ -699,7 +726,7 @@ async fn late_queue_registration_obeys_existing_listen_filter() -> Result<()> {
     );
     assert_eq!(
         provider
-            .get_workflow_status("excluded")
+            .get_workflow_status(&child_ids[0])
             .await?
             .unwrap()
             .status,
