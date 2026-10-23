@@ -29,8 +29,6 @@ pub enum ErrorCode {
     /// An enqueue was rejected because its deduplication key is already in use
     /// on the queue.
     QueueDeduplicated,
-    /// An existing workflow ID or deduplication key names a different workflow target.
-    WorkflowTargetConflict,
     /// The caller's authentication context does not satisfy the workflow's
     /// required roles.
     NotAuthorized,
@@ -61,6 +59,8 @@ pub enum ErrorCode {
     ReplayDiverged,
     /// An error raised by user code.
     Application,
+    /// An existing workflow ID or deduplication key names a different workflow target.
+    WorkflowTargetConflict,
 }
 
 /// The crate-wide error type.
@@ -579,6 +579,9 @@ mod tests {
 
     #[test]
     fn codes_map_to_variants() {
+        // Published numeric casts must survive additions to this non-exhaustive enum.
+        assert_eq!(ErrorCode::NotAuthorized as isize, 8);
+        assert_eq!(ErrorCode::Application as isize, 18);
         assert_eq!(Error::app("x").code(), ErrorCode::Application);
         assert_eq!(Error::Timeout.code(), ErrorCode::Timeout);
         assert_eq!(
