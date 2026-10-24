@@ -469,7 +469,7 @@ async fn client_resume_runs_via_internal_queue_not_own_queue() -> Result<()> {
     engine.register_queue(WorkflowQueue::new("orders"));
     // Listen to a different queue: "orders" gets no dispatcher here, but the
     // internal queue is always dispatched.
-    engine.listen_queues(["something-else"]);
+    engine.listen_queues(["something-else"])?;
     engine.launch().await?;
 
     let client = Client::new(provider.clone());

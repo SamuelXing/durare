@@ -39,6 +39,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `DurableEngine::listen_queues` returns `Result` and is refused once the engine
+  is launched. The filter now lives only in the shared queue configuration, so
+  remote-child routing and the dispatcher set cannot read different values.
+- `StateProvider::insert_child_workflow` returns `ChildInsert`. A position that
+  already holds a child checkpoint replays as `ChildInsert::Replayed` with the
+  recorded id alone; the child's status row is no longer read on replay.
 - Queued `start_workflow` children can target workflows not registered locally
   when an explicit target version and safe queue routing are supplied.
   Both child APIs reject empty workflow names and empty queue names.
@@ -58,6 +64,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Replaying a child checkpoint whose child status row was removed by retention
+  returns the recorded child id instead of failing with a storage error, on all
+  built-in providers.
 - Child creation checks parent cancellation before starting fresh work. Built-in
   providers atomically commit child creation/deduplication and its parent
   checkpoint, preventing duplicate children after a deduplication slot is freed.

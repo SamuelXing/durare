@@ -379,7 +379,7 @@ async fn listen_queues_dispatches_only_listened() -> Result<()> {
     });
     engine.register_queue(test_queue("listened"));
     engine.register_queue(test_queue("ignored"));
-    engine.listen_queues(["listened"]);
+    engine.listen_queues(["listened"])?;
     engine.launch().await?;
 
     // The listened queue runs to completion.
@@ -679,7 +679,7 @@ async fn late_queue_registration_obeys_existing_listen_filter() -> Result<()> {
         .await?;
     // Add queues after Runtime initialization and enqueue through public APIs.
     // Both the child preflight and top-level run builder must see them.
-    engine.listen_queues(["included"]);
+    engine.listen_queues(["included"])?;
     engine.register_queue(test_queue("excluded"));
     engine.register_queue(test_queue("included"));
     let mut child_ids = Vec::new();
@@ -731,6 +731,24 @@ async fn late_queue_registration_obeys_existing_listen_filter() -> Result<()> {
             .unwrap()
             .status,
         STATUS_ENQUEUED
+    );
+    engine.shutdown(Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+/// The dispatcher set is fixed while launched, so the listen filter cannot
+/// change underneath it: a late `listen_queues` is refused, not half-applied.
+#[tokio::test]
+async fn listen_queues_is_refused_after_launch() -> Result<()> {
+    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+    engine.register_queue(test_queue("dispatched"));
+    engine.register_queue(test_queue("remote"));
+    engine.listen_queues(["dispatched"])?;
+    engine.launch().await?;
+    let refused = engine.listen_queues(["remote"]);
+    assert!(
+        matches!(refused, Err(Error::App { .. })),
+        "late listen_queues must be refused, got {refused:?}"
     );
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
