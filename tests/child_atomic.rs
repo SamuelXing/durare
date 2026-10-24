@@ -1,6 +1,6 @@
 //! The provider commits child selection and its parent checkpoint together.
 use durare::{
-    Error, InMemoryProvider, Result, StateProvider, WorkflowStatus, STATUS_CANCELLED,
+    ChildInsert, Error, InMemoryProvider, Result, StateProvider, WorkflowStatus, STATUS_CANCELLED,
     STATUS_ENQUEUED, STATUS_PENDING, STATUS_SUCCESS,
 };
 use serde_json::json;
@@ -24,6 +24,13 @@ fn child(id: &str, parent: &str) -> WorkflowStatus {
     row.dedup_id = Some("key".into());
     row
 }
+/// The child a provider settled on, created, adopted, or replayed.
+fn settled(outcome: Option<ChildInsert>) -> (String, bool) {
+    match outcome.expect("atomic provider") {
+        ChildInsert::Replayed(id) => (id, false),
+        ChildInsert::Resolved { child, created } => (child.id, created),
+    }
+}
 
 async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
     db.init().await?;
@@ -41,22 +48,19 @@ async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
         requested.id = format!("{id}-request");
         requested.class_name = (!stored_empty).then(String::new);
         requested.config_name = (!stored_empty).then(String::new);
-        let (adopted, created) = db
-            .insert_child_workflow(requested, &id, 0, true)
-            .await?
-            .unwrap();
-        assert_eq!(adopted.id, holder.id);
+        let (adopted, created) = settled(db.insert_child_workflow(requested, &id, 0, true).await?);
+        assert_eq!(adopted, holder.id);
         assert!(!created);
     }
     db.insert_workflow_status(parent("parent")).await?;
     db.insert_workflow_status(child("existing", "parent"))
         .await?;
     let request = child("parent-0", "parent");
-    let (adopted, created) = db
-        .insert_child_workflow(request.clone(), "parent", 0, true)
-        .await?
-        .expect("atomic provider");
-    assert_eq!(adopted.id, "existing");
+    let (adopted, created) = settled(
+        db.insert_child_workflow(request.clone(), "parent", 0, true)
+            .await?,
+    );
+    assert_eq!(adopted, "existing");
     assert!(!created);
     assert_eq!(
         db.check_child_workflow("parent", 0).await?,
@@ -70,12 +74,10 @@ async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
         .await?;
     db.insert_workflow_status(child("replacement", "parent"))
         .await?;
-    let (replayed, created) = db
-        .insert_child_workflow(request, "parent", 0, true)
-        .await?
-        .expect("atomic provider");
-    assert_eq!(replayed.id, "existing");
-    assert!(!created);
+    assert!(matches!(
+        db.insert_child_workflow(request, "parent", 0, true).await?,
+        Some(ChildInsert::Replayed(id)) if id == "existing"
+    ));
     assert!(db.get_workflow_status("parent-0").await?.is_none());
 
     db.insert_workflow_status(parent("race")).await?;
@@ -87,11 +89,11 @@ async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
         db.insert_child_workflow(a, "race", 0, false),
         db.insert_child_workflow(b, "race", 0, false)
     );
-    let (a, ac) = a?.expect("atomic provider");
-    let (b, bc) = b?.expect("atomic provider");
-    assert_eq!(a.id, b.id);
+    let (a, ac) = settled(a?);
+    let (b, bc) = settled(b?);
+    assert_eq!(a, b);
     assert_ne!(ac, bc);
-    let loser = if a.id == "race-a" { "race-b" } else { "race-a" };
+    let loser = if a == "race-a" { "race-b" } else { "race-a" };
     assert!(db.get_workflow_status(loser).await?.is_none());
 
     db.insert_workflow_status(parent("conflict")).await?;
@@ -123,6 +125,17 @@ async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
         Err(Error::Cancelled(_))
     ));
     assert!(db.check_child_workflow("cancelled", 0).await?.is_none());
+
+    // A checkpoint outlives its child's status row (retention). Replay still
+    // returns the recorded id rather than failing on the missing row.
+    db.insert_workflow_status(parent("swept")).await?;
+    db.record_child_workflow("swept", 0, "child", "swept-child")
+        .await?;
+    assert!(matches!(
+        db.insert_child_workflow(child("swept-0", "swept"), "swept", 0, false)
+            .await?,
+        Some(ChildInsert::Replayed(id)) if id == "swept-child"
+    ));
     Ok(())
 }
 

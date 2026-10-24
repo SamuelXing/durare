@@ -20,7 +20,7 @@ async fn queue_depth_counts_enqueued_work() -> Result<()> {
     });
     engine.register_queue(WorkflowQueue::new("obs-mq"));
     engine.register_queue(WorkflowQueue::new("obs-mq-live"));
-    engine.listen_queues(["obs-mq-live"]);
+    engine.listen_queues(["obs-mq-live"])?;
     engine.launch().await?;
 
     for n in 0..3 {
