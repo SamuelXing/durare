@@ -25,7 +25,7 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
     let effects = Arc::new(AtomicUsize::new(0));
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register_queue(WorkflowQueue::new("remote"));
-    engine.listen_queues(Vec::<String>::new());
+    engine.listen_queues(Vec::<String>::new())?;
     let invoked = calls.clone();
     let ran = effects.clone();
     engine.register("parent", move |ctx: DurableContext, _: ()| {
@@ -612,7 +612,7 @@ async fn invalid_and_nested_enqueues_have_no_side_effect() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register_queue(WorkflowQueue::new("remote"));
-    engine.listen_queues(Vec::<String>::new());
+    engine.listen_queues(Vec::<String>::new())?;
     engine.register("parent", |ctx: DurableContext, _: ()| async move {
         assert!(ctx
             .enqueue_workflow::<_, ()>("", "external", (), WorkflowOptions::default())
@@ -666,7 +666,7 @@ async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Res
             let mut engine = builder.build().await?;
             engine.register_queue(WorkflowQueue::new("remote"));
             if !producer_only {
-                engine.listen_queues(Vec::<String>::new());
+                engine.listen_queues(Vec::<String>::new())?;
             }
             let missing = version.is_none_or(str::is_empty);
             let unsafe_route = !producer_only && version == Some("producer-version");
@@ -706,7 +706,7 @@ async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Res
                 vec![]
             } else {
                 vec!["remote"]
-            });
+            })?;
             let result = engine
                 .start::<_, ()>("parent", (), WorkflowOptions::with_id("guard"))
                 .await?
@@ -729,7 +729,7 @@ async fn cancelled_parent_cannot_enqueue_new_children() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register_queue(WorkflowQueue::new("remote"));
-    engine.listen_queues(Vec::<String>::new());
+    engine.listen_queues(Vec::<String>::new())?;
     let db = provider.clone();
     engine.register("parent", move |ctx: DurableContext, _: ()| {
         let db = db.clone();
@@ -798,7 +798,7 @@ async fn configuration_recovery_contract(provider: Arc<dyn StateProvider>) -> Re
             .await?
             .result()
             .await?;
-        engine.listen_queues(Vec::<String>::new());
+        engine.listen_queues(Vec::<String>::new())?;
         if fixed {
             // Deployment alone does not retry a terminal ERROR. Explicitly
             // reset this fixture to model an operator-requested re-execution.

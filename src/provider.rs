@@ -1381,6 +1381,28 @@ pub enum RecoveryClaim {
     Lost,
 }
 
+/// What [`StateProvider::insert_child_workflow`] settled on when it commits the
+/// child decision and the parent checkpoint together.
+// `Resolved` is the common outcome and is moved straight into dispatch; boxing
+// it would add an allocation to every child start to slim the rare `Replayed`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum ChildInsert {
+    /// The parent's position already held a checkpoint for this child; only
+    /// the recorded id is returned. The checkpoint is authoritative even after
+    /// retention removed the child's own status row, so replay never reads it.
+    Replayed(String),
+    /// A child was created (`created`) or an existing deduplication target
+    /// adopted (`!created`), and the parent checkpoint committed with it. Only
+    /// the insert winner may dispatch inline.
+    Resolved {
+        /// The canonical child row as stored.
+        child: WorkflowStatus,
+        /// Whether this call created the row.
+        created: bool,
+    },
+}
+
 /// Postgres implementation and an in-memory one; a DynamoDB / Aurora DSQL
 /// implementation can be added later **without touching the engine**.
 ///
@@ -1966,12 +1988,14 @@ pub trait StateProvider: Send + Sync {
 
     /// Create or adopt a child and checkpoint its canonical ID at the parent's
     /// position. Built-in providers commit the deduplication decision, child
-    /// insert, and parent checkpoint atomically; replay returns the original
-    /// child even after its deduplication slot has been released.
+    /// insert, and parent checkpoint atomically. A position that already holds
+    /// a child checkpoint replays as [`ChildInsert::Replayed`], even after the
+    /// child's deduplication slot was released or its row removed by retention.
     ///
     /// `return_existing` adopts an active matching queue/deduplication target.
-    /// A different name, class, or configured instance is rejected. The returned
-    /// boolean identifies the insert winner, which alone may dispatch inline.
+    /// A different name, class, or configured instance is rejected.
+    /// [`ChildInsert::Resolved`] identifies the insert winner, which alone may
+    /// dispatch inline.
     /// `Some` means the checkpoint committed atomically. `None` means unsupported
     /// and MUST leave storage untouched: the engine falls back to its existing
     /// deterministic-ID insert, dispatch, then checkpoint sequence. Implementations
@@ -1986,7 +2010,7 @@ pub trait StateProvider: Send + Sync {
         _parent_id: &str,
         _seq: i32,
         return_existing: bool,
-    ) -> Result<Option<(WorkflowStatus, bool)>> {
+    ) -> Result<Option<ChildInsert>> {
         if return_existing {
             return Err(crate::execution::recovery_error(Error::app(
                 "provider must implement atomic child deduplication",

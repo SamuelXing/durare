@@ -1633,7 +1633,7 @@ impl StateProvider for SqliteProvider {
         parent_id: &str,
         seq: i32,
         return_existing: bool,
-    ) -> Result<Option<(WorkflowStatus, bool)>> {
+    ) -> Result<Option<crate::provider::ChildInsert>> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let parent = sqlx::query("SELECT status FROM workflow_status WHERE workflow_uuid = ?")
             .bind(parent_id)
@@ -1653,15 +1653,8 @@ impl StateProvider for SqliteProvider {
             if step.get::<String, _>("function_name") != child.name || id.is_none() {
                 return Err(Error::WorkflowConflict(parent_id.to_owned()));
             }
-            let row = sqlx::query(&format!(
-                "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
-            ))
-            .bind(id.unwrap())
-            .fetch_one(&mut *tx)
-            .await?;
-            let canonical = row_to_status(&self.serializer, &row);
             tx.commit().await?;
-            return Ok(Some((canonical, false)));
+            return Ok(Some(crate::provider::ChildInsert::Replayed(id.unwrap())));
         }
         if parent.get::<String, _>("status") == STATUS_CANCELLED {
             return Err(Error::Cancelled(parent_id.to_owned()));
@@ -1700,7 +1693,10 @@ impl StateProvider for SqliteProvider {
             return Err(Error::WorkflowConflict(parent_id.to_owned()));
         }
         tx.commit().await?;
-        Ok(Some((canonical, created)))
+        Ok(Some(crate::provider::ChildInsert::Resolved {
+            child: canonical,
+            created,
+        }))
     }
 
     async fn record_child_workflow(

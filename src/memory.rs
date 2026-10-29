@@ -1079,20 +1079,15 @@ impl StateProvider for InMemoryProvider {
         parent_id: &str,
         seq: i32,
         return_existing: bool,
-    ) -> Result<Option<(WorkflowStatus, bool)>> {
+    ) -> Result<Option<crate::provider::ChildInsert>> {
         let mut g = self.inner.lock().await;
         let key = (parent_id.to_owned(), seq);
         if let Some(step) = g.steps.get(&key) {
             if step.name != child.name || step.child_workflow_id.is_none() {
                 return Err(Error::WorkflowConflict(parent_id.to_owned()));
             }
-            let row = g
-                .workflows
-                .get(step.child_workflow_id.as_ref().unwrap())
-                .ok_or_else(|| {
-                    crate::execution::recovery_error(Error::app("recorded child is missing"))
-                })?;
-            return Ok(Some((row.clone(), false)));
+            let id = step.child_workflow_id.clone().unwrap();
+            return Ok(Some(crate::provider::ChildInsert::Replayed(id)));
         }
         let parent = g
             .workflows
@@ -1128,7 +1123,10 @@ impl StateProvider for InMemoryProvider {
                 ..Default::default()
             },
         );
-        Ok(Some((row, created)))
+        Ok(Some(crate::provider::ChildInsert::Resolved {
+            child: row,
+            created,
+        }))
     }
 
     async fn record_child_workflow(

@@ -695,7 +695,6 @@ pub struct DurableEngine {
     /// If set, only these registered queues get a dispatcher at
     /// [`launch`](Self::launch); `None` dispatches every registered queue. Set
     /// by [`listen_queues`](Self::listen_queues).
-    listen_filter: Option<std::collections::HashSet<String>>,
     /// `(workflow_name, cron_spec)` for `#[workflow(schedule = …)]` workflows;
     /// each gets a scheduler task in [`launch`](Self::launch).
     scheduled: Vec<(String, String)>,
@@ -917,7 +916,6 @@ impl DurableEngineBuilder {
                 queues,
                 listen_filter: self.listen_filter.clone(),
             })),
-            listen_filter: self.listen_filter,
             scheduled,
             executor_id,
             app_version,
@@ -997,7 +995,6 @@ impl DurableEngine {
                 queues,
                 listen_filter: None,
             })),
-            listen_filter: None,
             scheduled,
             executor_id,
             app_version,
@@ -1206,28 +1203,34 @@ impl DurableEngine {
 
     /// Restrict which registered queues this process dispatches at
     /// [`launch`](Self::launch) to the named subset. By default every registered
-    /// queue gets a dispatcher; call this (before `launch`) to have a process
+    /// queue gets a dispatcher; call this before `launch` to have a process
     /// that *enqueues* to many queues but only *runs* work from some of them.
-    /// Names that are not registered are ignored. Must be called before `launch`.
-    pub fn listen_queues<I, S>(&mut self, names: I)
+    /// Names that are not registered are ignored.
+    ///
+    /// # Errors
+    ///
+    /// An application error once the engine is launched: the dispatcher set is
+    /// fixed while running, and the filter is left unchanged.
+    pub fn listen_queues<I, S>(&mut self, names: I) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.listen_filter = Some(names.into_iter().map(Into::into).collect());
-        // The dispatcher set is fixed while launched. Before launch, keep an
-        // already-created runtime in sync with the public configuration.
-        if self
+        if !self
             .dispatchers
             .lock()
             .expect("dispatcher lock poisoned")
             .is_empty()
         {
-            self.queue_config
-                .write()
-                .expect("queue configuration lock poisoned")
-                .listen_filter = self.listen_filter.clone();
+            return Err(Error::app(
+                "listen_queues must be called before launch; the dispatcher set is fixed while running",
+            ));
         }
+        self.queue_config
+            .write()
+            .expect("queue configuration lock poisoned")
+            .listen_filter = Some(names.into_iter().map(Into::into).collect());
+        Ok(())
     }
 
     /// All queues registered on this engine, sorted by name. Includes queues this
@@ -1531,14 +1534,6 @@ impl DurableEngine {
         };
         self.tasks.reopen();
         let rt = self.runtime();
-        if self
-            .dispatchers
-            .lock()
-            .expect("dispatcher lock poisoned")
-            .is_empty()
-        {
-            rt.set_listen_filter(self.listen_filter.as_ref());
-        }
 
         let queues = self
             .queue_config
@@ -3047,13 +3042,6 @@ pub(crate) struct EngineCounters {
 }
 
 impl Runtime {
-    fn set_listen_filter(&self, listen: Option<&HashSet<String>>) {
-        self.queue_config
-            .write()
-            .expect("queue configuration lock poisoned")
-            .listen_filter = listen.cloned();
-    }
-
     fn is_producer_only(&self, queue: &str) -> bool {
         self.queue_config
             .read()
@@ -3351,7 +3339,8 @@ impl Runtime {
             .map_err(crate::execution::observation_error)?;
         let needs_checkpoint = atomic.is_none();
         let (canonical, created) = match atomic {
-            Some(run) => run,
+            Some(crate::provider::ChildInsert::Replayed(id)) => return Ok(id),
+            Some(crate::provider::ChildInsert::Resolved { child, created }) => (child, created),
             None => {
                 // Custom providers may retain the legacy deterministic-ID
                 // path, but never fall back for a dedup adoption decision.

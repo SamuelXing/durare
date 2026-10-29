@@ -77,7 +77,7 @@ async fn hostile_sweep(provider: Arc<dyn StateProvider>) -> Result<()> {
     }
     engine.register_queue(WorkflowQueue::new(&queue_name).partitioned());
     engine.register_queue(WorkflowQueue::new(&dedup_queue));
-    engine.listen_queues([queue_name.clone(), dedup_queue.clone()]);
+    engine.listen_queues([queue_name.clone(), dedup_queue.clone()])?;
     engine.launch().await?;
 
     // Direct run: hostile workflow id, authenticated user, role, app version.
