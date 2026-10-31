@@ -181,7 +181,11 @@ the first checkpoint that is missing.
 
 The consequence, as in every durable-execution system: workflow control flow
 must be deterministic. Wall-clock reads, random numbers, and anything else
-non-repeatable belong inside a step, where the result is recorded.
+non-repeatable belong inside a step, where the result is recorded. The
+[execution layers note](https://github.com/SamuelXing/durare/blob/main/docs/design/execution-layers.md)
+describes how this workflow-level contract stays separate from the engine's
+dispatch, recovery and ownership machinery, and gives the rule for deciding
+which side a new error belongs to.
 
 What the guarantees actually are:
 
