@@ -2,9 +2,8 @@
 
 durare has two orchestration layers that are easy to conflate because both are
 about "running workflows". They answer different questions, hold different
-invariants, and meet at one narrow seam. Most of the correctness bugs fixed in
-2026 were a decision made on the wrong side of that seam. This note names the
-layers, the seam, and the rule for deciding which side a new behavior belongs to.
+invariants, and meet at one narrow seam. This note names the layers, the seam,
+and the rule for deciding which side a new behavior belongs to.
 
 ## The two layers
 
@@ -81,17 +80,3 @@ workflow's to record.
 - **Recovered runs are dispatched, never run inline.** `recover()` spawns each
   run on the engine's task tracker and returns; a run parked on `recv` stalls
   nothing but itself.
-
-## History
-
-- #162 — recovery ran executions inline inside `recover()`: a runtime
-  scheduling choice broke a workflow-level semantic (construction deadlocked on
-  a parked `recv`).
-- #163 — two processes could run one id: the runtime did not enforce the
-  workflow layer's identity invariant.
-- #210, #214, #220 — body concurrency reached the position counter: positions
-  are now claimed at construction, scoped per poll, and refused in spawned tasks.
-- #239 → #243 — "queue not registered" moved between record, catchable error,
-  and interrupt over seven review rounds before the classification above was
-  written down. `validate_child_arguments` / `validate_child_configuration` is
-  that classification in code.
