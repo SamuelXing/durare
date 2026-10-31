@@ -2767,6 +2767,12 @@ impl DurableContext {
 
             let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
             loop {
+                // Watch before checking, so a message written between the check
+                // and the wait wakes the wait instead of waiting out the backstop.
+                let changed = self.provider.watch_change(ChangeWait::Notification {
+                    workflow_id: &self.workflow_id,
+                    topic: &topic,
+                });
                 if let Some(msg) = self
                     .provider
                     .consume_notification(&self.workflow_id, &topic, seq, "DBOS.recv")
@@ -2802,15 +2808,7 @@ impl DurableContext {
                     return Ok(None);
                 }
                 let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-                self.provider
-                    .await_change(
-                        ChangeWait::Notification {
-                            workflow_id: &self.workflow_id,
-                            topic: &topic,
-                        },
-                        remaining.min(self.wait_interval()),
-                    )
-                    .await;
+                let _ = tokio::time::timeout(remaining.min(self.wait_interval()), changed).await;
             }
         })
     }
@@ -2914,6 +2912,12 @@ impl DurableContext {
 
             let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
             loop {
+                // Watch before checking, so an event set between the check and
+                // the wait wakes the wait instead of waiting out the backstop.
+                let changed = self.provider.watch_change(ChangeWait::Event {
+                    workflow_id: &target_workflow_id,
+                    key: &key,
+                });
                 if let Some(value) = self
                     .provider
                     .get_event_value(&target_workflow_id, &key)
@@ -2960,15 +2964,7 @@ impl DurableContext {
                     return Ok(None);
                 }
                 let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-                self.provider
-                    .await_change(
-                        ChangeWait::Event {
-                            workflow_id: &target_workflow_id,
-                            key: &key,
-                        },
-                        remaining.min(self.wait_interval()),
-                    )
-                    .await;
+                let _ = tokio::time::timeout(remaining.min(self.wait_interval()), changed).await;
             }
         })
     }
@@ -3134,9 +3130,9 @@ impl DurableContext {
 
     /// How long a blocked `recv`/`get_event` waits before re-checking the
     /// database. On a backend with push wake-ups (Postgres `LISTEN`/`NOTIFY`)
-    /// this is just a long backstop — [`StateProvider::await_change`] returns as
-    /// soon as the awaited row is written — so we poll rarely; otherwise it is
-    /// the short polling interval.
+    /// this is just a long backstop — the [`StateProvider::watch_change`] taken
+    /// before each check resolves as soon as the awaited row is written — so we
+    /// poll rarely; otherwise it is the short polling interval.
     fn wait_interval(&self) -> Duration {
         if self.provider.supports_listen_notify() {
             LISTEN_NOTIFY_BACKSTOP
@@ -3151,8 +3147,9 @@ impl DurableContext {
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Backstop re-check interval on a backend with push wake-ups (Postgres
-/// `LISTEN`/`NOTIFY`): the await returns promptly when the row is written, so we
-/// only fall back to a database re-check this often (covering a missed signal).
+/// `LISTEN`/`NOTIFY`): the watch resolves promptly when the row is written, so we
+/// only fall back to a database re-check this often (covering a signal lost to a
+/// listener reconnect).
 const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 
 /// Prefix on the `function_name` of a patch marker recorded in `operation_outputs`.

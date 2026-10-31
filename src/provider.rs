@@ -116,7 +116,7 @@ pub(crate) const WORKFLOW_EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
 /// A condition a blocked `recv`/`get_event` wants to be nudged about, so it can
 /// re-check the database promptly instead of waiting out its poll interval. A
 /// backend with push signalling (Postgres `LISTEN`/`NOTIFY`) maps each variant to
-/// its channel + payload; others ignore it and simply sleep.
+/// its channel + payload; others ignore it and leave the caller to poll.
 #[derive(Clone, Copy, Debug)]
 pub enum ChangeWait<'a> {
     /// A notification delivered to `workflow_id`'s mailbox on `topic`.
@@ -155,6 +155,10 @@ impl ChangeWait<'_> {
         }
     }
 }
+
+/// A registered interest in a [`ChangeWait`] condition, taken with
+/// [`StateProvider::watch_change`]. Resolves once the condition is signalled.
+pub type ChangeWatch = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 /// Group ordered `(key, value, serialization)` stream rows — sorted by key then
 /// offset — into one `(key, decoded values)` entry per key, decoding each value
@@ -1459,20 +1463,32 @@ pub trait StateProvider: Send + Sync {
     /// Whether this backend pushes change signals (Postgres `LISTEN`/`NOTIFY`),
     /// so a blocked `recv`/`get_event` is woken as soon as the row it waits for
     /// is written rather than only by polling. Callers that get `true` can wait
-    /// on a long backstop interval and rely on [`await_change`](Self::await_change)
+    /// on a long backstop interval and rely on [`watch_change`](Self::watch_change)
     /// for promptness; `false` means they must poll at a short interval.
     fn supports_listen_notify(&self) -> bool {
         false
     }
 
-    /// Wait up to `within` for a hint that `wait`'s condition may have changed,
-    /// returning early when a matching change is signalled. The wake is only a
-    /// hint: the caller must re-check the database (a signal can be missed in the
-    /// gap between the caller's last check and subscribing — the bounded `within`
-    /// is the backstop). Backends without push signalling just sleep.
-    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
+    /// Register interest in `wait`'s condition, returning a future that resolves
+    /// once a matching change is signalled. Take the watch **before** checking
+    /// the database and await it only after the check comes back empty: a
+    /// signal that lands in between is kept. The wake is only a hint — the
+    /// caller re-checks the database and bounds every wait by its poll
+    /// interval. A backend without push signalling returns a future that never
+    /// resolves.
+    fn watch_change(&self, wait: ChangeWait<'_>) -> ChangeWatch {
         let _ = wait;
-        tokio::time::sleep(within).await;
+        Box::pin(std::future::pending())
+    }
+
+    /// Wait up to `within` for `wait`'s condition to be signalled. Superseded by
+    /// [`watch_change`](Self::watch_change).
+    #[deprecated(
+        since = "0.6.0",
+        note = "take `watch_change` before checking the database"
+    )]
+    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
+        let _ = tokio::time::timeout(within, self.watch_change(wait)).await;
     }
 
     /// Idempotently insert a workflow row. If `status.id` already exists, the
