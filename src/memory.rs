@@ -416,38 +416,23 @@ impl StateProvider for InMemoryProvider {
         &self,
         rows: &[crate::provider::NotificationInsert],
     ) -> Result<()> {
-        // One lock for the whole batch, destinations validated before any
-        // insert — the same all-or-nothing the SQL backends get from a single
-        // multi-row statement.
         let mut g = self.inner.lock().await;
-        if let Some(missing) = rows
-            .iter()
-            .find(|r| !g.workflows.contains_key(&r.destination_id))
-        {
-            return Err(Error::nonexistent_workflow(&missing.destination_id));
+        push_notifications(&mut g, rows)
+    }
+
+    async fn send_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        rows: &[crate::provider::NotificationInsert],
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if recorded_at(&g, workflow_id, seq, step_name)?.is_some() {
+            return Ok(());
         }
-        let now = Utc::now().timestamp_millis();
-        for r in rows {
-            let message_uuid = match &r.idempotency_key {
-                Some(k) => format!("{k}::{}", r.destination_id),
-                None => uuid::Uuid::new_v4().to_string(),
-            };
-            if r.idempotency_key.is_some()
-                && g.notifications
-                    .iter()
-                    .any(|n| n.message_uuid == message_uuid)
-            {
-                continue;
-            }
-            g.notifications.push(NotificationRow {
-                message_uuid,
-                destination_id: r.destination_id.clone(),
-                topic: r.topic.clone(),
-                message: r.message.clone(),
-                consumed: false,
-                created_at_ms: now,
-            });
-        }
+        push_notifications(&mut g, rows)?;
+        checkpoint(&mut g, workflow_id, seq, step_name, Value::Null);
         Ok(())
     }
 
@@ -461,16 +446,7 @@ impl StateProvider for InMemoryProvider {
         // Single mutex covers both the claim and the checkpoint, giving the
         // same atomicity the SQL backends get from a transaction.
         let mut g = self.inner.lock().await;
-        // A rival may already have settled this position; serve that instead.
-        if let Some(recorded) = g.steps.get(&(workflow_id.to_string(), seq)) {
-            if recorded.name != step_name {
-                return Err(Error::unexpected_step(
-                    workflow_id,
-                    seq,
-                    step_name,
-                    &recorded.name,
-                ));
-            }
+        if let Some(recorded) = recorded_at(&g, workflow_id, seq, step_name)? {
             return step_row_outcome(recorded).into_value_result().map(Some);
         }
         let oldest = g
@@ -483,15 +459,7 @@ impl StateProvider for InMemoryProvider {
         };
         row.consumed = true;
         let message = row.message.clone();
-        g.steps.insert(
-            (workflow_id.to_string(), seq),
-            StepRow {
-                name: step_name.to_string(),
-                output: Some(message.clone()),
-                child_workflow_id: None,
-                ..Default::default()
-            },
-        );
+        checkpoint(&mut g, workflow_id, seq, step_name, message.clone());
         Ok(Some(message))
     }
 
@@ -1245,14 +1213,23 @@ impl StateProvider for InMemoryProvider {
         _function_id: i32,
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
-        let entries = g
-            .streams
-            .entry((workflow_id.to_string(), key.to_string()))
-            .or_default();
-        if entries.iter().any(|e| e.is_none()) {
-            return Err(Error::app(format!("stream `{key}` is already closed")));
+        append_stream(&mut g, workflow_id, key, value)
+    }
+
+    async fn write_stream_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if recorded_at(&g, workflow_id, seq, step_name)?.is_some() {
+            return Ok(());
         }
-        entries.push(value);
+        append_stream(&mut g, workflow_id, key, value)?;
+        checkpoint(&mut g, workflow_id, seq, step_name, Value::Null);
         Ok(())
     }
 
@@ -1772,6 +1749,91 @@ fn step_row_outcome(r: &StepRow) -> StepOutcome {
         }
         None => StepOutcome::Output(r.output.clone().unwrap_or(Value::Null)),
     }
+}
+
+/// The step already recorded at `(workflow_id, seq)`, if any; a different
+/// name there is a divergent replay.
+fn recorded_at<'g>(
+    g: &'g Inner,
+    workflow_id: &str,
+    seq: i32,
+    step_name: &str,
+) -> Result<Option<&'g StepRow>> {
+    let Some(recorded) = g.steps.get(&(workflow_id.to_string(), seq)) else {
+        return Ok(None);
+    };
+    if recorded.name != step_name {
+        return Err(Error::unexpected_step(
+            workflow_id,
+            seq,
+            step_name,
+            &recorded.name,
+        ));
+    }
+    Ok(Some(recorded))
+}
+
+/// Record `step_name` with `output` at `(workflow_id, seq)`.
+fn checkpoint(g: &mut Inner, workflow_id: &str, seq: i32, step_name: &str, output: Value) {
+    g.steps.insert(
+        (workflow_id.to_string(), seq),
+        StepRow {
+            name: step_name.to_string(),
+            output: Some(output),
+            completed_at_ms: Some(Utc::now().timestamp_millis()),
+            ..Default::default()
+        },
+    );
+}
+
+/// [`StateProvider::insert_notifications`] under a held lock, so a workflow
+/// send can share the critical section that checkpoints it.
+fn push_notifications(g: &mut Inner, rows: &[crate::provider::NotificationInsert]) -> Result<()> {
+    // Destinations validated before any insert, so the batch is all-or-nothing
+    // like the SQL backends' single multi-row statement.
+    if let Some(missing) = rows
+        .iter()
+        .find(|r| !g.workflows.contains_key(&r.destination_id))
+    {
+        return Err(Error::nonexistent_workflow(&missing.destination_id));
+    }
+    let now = Utc::now().timestamp_millis();
+    for r in rows {
+        let message_uuid = match &r.idempotency_key {
+            Some(k) => format!("{k}::{}", r.destination_id),
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        if r.idempotency_key.is_some()
+            && g.notifications
+                .iter()
+                .any(|n| n.message_uuid == message_uuid)
+        {
+            continue;
+        }
+        g.notifications.push(NotificationRow {
+            message_uuid,
+            destination_id: r.destination_id.clone(),
+            topic: r.topic.clone(),
+            message: r.message.clone(),
+            consumed: false,
+            created_at_ms: now,
+        });
+    }
+    Ok(())
+}
+
+/// [`StateProvider::write_stream`] under a held lock, so a workflow write can
+/// share the critical section that checkpoints it.
+fn append_stream(g: &mut Inner, workflow_id: &str, key: &str, value: Option<Value>) -> Result<()> {
+    let entries = g
+        .streams
+        .entry((workflow_id.to_string(), key.to_string()))
+        .or_default();
+    if entries.iter().any(|e| e.is_none()) {
+        return Err(Error::app(format!("stream `{key}` is already closed")));
+    }
+    entries.push(value);
+    Ok(())
 }
 
 /// An `operation_outputs` row in portable form, carrying the step's `output` or
