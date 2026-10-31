@@ -2,13 +2,14 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
-    ChangeWait, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo,
-    NotificationInsert, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
-    EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
+    ChangeWait, ChangeWatch, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
+    NotificationInfo, NotificationInsert, RecordedStep, RecoveryClaim, RecoveryClaimRequest,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome,
+    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
+    EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -40,17 +41,13 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
 /// listener task wakes them when a `NOTIFY` for that payload arrives.
 #[derive(Default)]
 struct NotifyHub {
-    waiters: Mutex<HashMap<String, WaitEntry>>,
+    waiters: Mutex<HashMap<String, Vec<Arc<Notify>>>>,
 }
 
-/// The shared wake handle for everyone waiting on one payload, plus a refcount so
-/// the entry is dropped when the last waiter leaves.
-struct WaitEntry {
-    notify: Arc<Notify>,
-    count: usize,
-}
-
-/// An active subscription on one payload; deregisters on drop.
+/// An active subscription on one payload; deregisters on drop. Each
+/// subscription owns its [`Notify`] and is woken with `notify_one`, which stores
+/// a permit when nothing is awaiting yet: a signal that lands between taking
+/// the subscription and awaiting it is kept rather than lost.
 struct Subscription {
     hub: Arc<NotifyHub>,
     payload: String,
@@ -61,13 +58,13 @@ impl NotifyHub {
     /// Register interest in `payload`, returning a [`Subscription`] whose
     /// `notify` fires when the listener sees a matching `NOTIFY` (or a reconnect).
     fn subscribe(self: &Arc<Self>, payload: String) -> Subscription {
-        let mut waiters = self.waiters.lock().unwrap();
-        let entry = waiters.entry(payload.clone()).or_insert_with(|| WaitEntry {
-            notify: Arc::new(Notify::new()),
-            count: 0,
-        });
-        entry.count += 1;
-        let notify = entry.notify.clone();
+        let notify = Arc::new(Notify::new());
+        self.waiters
+            .lock()
+            .unwrap()
+            .entry(payload.clone())
+            .or_default()
+            .push(Arc::clone(&notify));
         Subscription {
             hub: Arc::clone(self),
             payload,
@@ -77,16 +74,18 @@ impl NotifyHub {
 
     /// Wake everyone waiting on exactly `payload`.
     fn signal(&self, payload: &str) {
-        if let Some(entry) = self.waiters.lock().unwrap().get(payload) {
-            entry.notify.notify_waiters();
+        if let Some(waiters) = self.waiters.lock().unwrap().get(payload) {
+            for notify in waiters {
+                notify.notify_one();
+            }
         }
     }
 
     /// Wake every waiter — used after a listener reconnect, when a notification
     /// may have been missed and all waiters should re-check the database.
     fn signal_all(&self) {
-        for entry in self.waiters.lock().unwrap().values() {
-            entry.notify.notify_waiters();
+        for notify in self.waiters.lock().unwrap().values().flatten() {
+            notify.notify_one();
         }
     }
 }
@@ -94,9 +93,9 @@ impl NotifyHub {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut waiters = self.hub.waiters.lock().unwrap();
-        if let Some(entry) = waiters.get_mut(&self.payload) {
-            entry.count -= 1;
-            if entry.count == 0 {
+        if let Some(entries) = waiters.get_mut(&self.payload) {
+            entries.retain(|notify| !Arc::ptr_eq(notify, &self.notify));
+            if entries.is_empty() {
                 waiters.remove(&self.payload);
             }
         }
@@ -902,7 +901,7 @@ impl StateProvider for PostgresProvider {
         // connect-time default, so releasing the connection changes nothing).
         self.run_migrations().await?;
         self.warn_on_legacy_empty_app_version().await;
-        // Start the LISTEN/NOTIFY listener once (it powers await_change). Spawned
+        // Start the LISTEN/NOTIFY listener once (it powers watch_change). Spawned
         // here so it only runs for a provider that has been brought up; cancelled
         // when the provider is dropped. `Relaxed` suffices: this is purely a
         // spawn-once guard — the task's inputs are moved in via `spawn` (which
@@ -925,14 +924,11 @@ impl StateProvider for PostgresProvider {
         self.serializer.clone()
     }
 
-    async fn await_change(&self, wait: ChangeWait<'_>, within: Duration) {
-        // Subscribe before awaiting so a NOTIFY arriving during the wait wakes us;
-        // a NOTIFY in the gap before subscribing is covered by `within` (the
-        // caller re-checks the database on return).
+    fn watch_change(&self, wait: ChangeWait<'_>) -> ChangeWatch {
         let sub = self
             .notify_hub
             .subscribe(hub_key(wait.channel(), &wait.payload()));
-        let _ = tokio::time::timeout(within, sub.notify.notified()).await;
+        Box::pin(async move { sub.notify.notified().await })
     }
 
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<(WorkflowStatus, bool)> {
@@ -3576,4 +3572,43 @@ fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
         cols = cols.replacen("output,", "NULL AS output,", 1);
     }
     std::borrow::Cow::Owned(cols)
+}
+
+#[cfg(test)]
+mod notify_hub_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_signal_before_the_wait_is_kept() {
+        let hub = Arc::new(NotifyHub::default());
+        let sub = hub.subscribe("k".into());
+        hub.signal("k");
+        tokio::time::timeout(Duration::from_millis(100), sub.notify.notified())
+            .await
+            .expect("the permit stored by the early signal completes the wait");
+    }
+
+    #[tokio::test]
+    async fn every_subscriber_on_a_payload_wakes() {
+        let hub = Arc::new(NotifyHub::default());
+        let first = hub.subscribe("k".into());
+        let second = hub.subscribe("k".into());
+        hub.signal("k");
+        for sub in [&first, &second] {
+            tokio::time::timeout(Duration::from_millis(100), sub.notify.notified())
+                .await
+                .expect("each subscription has its own permit");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_subscription_deregisters_it() {
+        let hub = Arc::new(NotifyHub::default());
+        let kept = hub.subscribe("k".into());
+        let dropped = hub.subscribe("k".into());
+        drop(dropped);
+        assert_eq!(hub.waiters.lock().unwrap()["k"].len(), 1);
+        drop(kept);
+        assert!(hub.waiters.lock().unwrap().is_empty());
+    }
 }

@@ -36,6 +36,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   all existing descendants, including through completed ancestors. The conductor
   now honors `cancel_children`. Existing cancellation calls remain root-only.
   In-memory cancellation now matches SQL providers for parked workflows.
+- `StateProvider::watch_change` and `ChangeWatch`: a change watch registered
+  before the caller checks the database, resolving when the `ChangeWait`
+  condition is signalled. Providers without push signalling keep the default, a
+  future that never resolves, and callers stay on their poll interval.
 
 ### Changed
 
@@ -65,8 +69,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   turnover retains its unbounded retry behavior. Returning an existing enqueue
   verifies the workflow name, class, and configured instance.
 
+### Deprecated
+
+- `StateProvider::await_change`, superseded by `watch_change`. It now forwards
+  to `watch_change` under its timeout and will be removed in a later release.
+
 ### Fixed
 
+- `recv` and `get_event` take their change watch before checking the database.
+  On Postgres, a message or event written between the check and the wait was
+  noticed only at the 5 s backstop; a debounce producer could then time out
+  waiting for the collector's acknowledgement and start a second collector, so
+  one burst ran the target twice (#244).
 - Replaying a child checkpoint whose child status row was removed by retention
   returns the recorded child id instead of failing with a storage error, on all
   built-in providers.

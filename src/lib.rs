@@ -242,8 +242,8 @@ pub use memory::InMemoryProvider;
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 pub use postgres::PostgresProvider;
 pub use provider::{
-    is_terminal, CancelOptions, ChangeWait, ChildInsert, DequeueRequest, ExportedWorkflow,
-    ForkParams, ListFilter, NotificationInsert, ProviderIdentity, RecoveryClaim,
+    is_terminal, CancelOptions, ChangeWait, ChangeWatch, ChildInsert, DequeueRequest,
+    ExportedWorkflow, ForkParams, ListFilter, NotificationInsert, ProviderIdentity, RecoveryClaim,
     RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
     StepListOptions, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
     STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
