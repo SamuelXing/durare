@@ -2743,8 +2743,10 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// A timeout is **not** an error — it is `Ok(None)`. Fails on storage or
-    /// decode errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
+    /// A timeout is **not** an error — it is `Ok(None)`. A message whose
+    /// payload serializes to JSON `null` (such as `()`) is recorded the same way
+    /// as a timeout and is also returned as `None`. Fails on storage or decode
+    /// errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
     /// divergent replay.
     #[doc(alias = "signal")]
     pub fn recv<'a, T: DeserializeOwned + Send + 'a>(
@@ -2779,7 +2781,9 @@ impl DurableContext {
                     .await
                     .map_err(|error| self.execution.record(error))?
                 {
-                    return self.recorded_value(StepOutcome::Output(msg)).map(Some);
+                    // The position's settled outcome: taken now, or recorded
+                    // by a rival execution first (`Null` is a timeout).
+                    return self.recorded_value(StepOutcome::Output(msg));
                 }
 
                 // Mailbox empty: fix the durable deadline (first miss only), then

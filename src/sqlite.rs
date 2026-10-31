@@ -3,10 +3,10 @@ use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
     DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
-    RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate,
-    StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate,
-    WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
+    EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
     STREAM_CLOSED_SENTINEL,
 };
@@ -312,6 +312,49 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
         config_name: row.try_get("config_name").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
+    }
+}
+
+impl SqliteProvider {
+    /// The outcome already recorded at `(workflow_id, seq)`, which a `recv`
+    /// there serves instead of consuming another message; a recorded timeout
+    /// is `Value::Null`. A different step name at the position is a divergent
+    /// replay.
+    async fn recorded_recv<'e, E: sqlx::SqliteExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<Option<Value>> {
+        let row: Option<RecordedColumns> = sqlx::query_as(
+            "SELECT function_name, output, error, serialization FROM operation_outputs
+                 WHERE workflow_uuid = ? AND function_id = ?",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(executor)
+        .await?;
+        let Some((stored_name, output, error, fmt)) = row else {
+            return Ok(None);
+        };
+        if stored_name != step_name {
+            return Err(Error::unexpected_step(
+                workflow_id,
+                seq,
+                step_name,
+                stored_name,
+            ));
+        }
+        step_outcome_from(
+            &self.serializer,
+            fmt.as_deref(),
+            output.as_deref(),
+            error.as_deref(),
+        )?
+        .unwrap_or(StepOutcome::Output(Value::Null))
+        .into_value_result()
+        .map(Some)
     }
 }
 
@@ -1040,8 +1083,18 @@ impl StateProvider for SqliteProvider {
         step_name: &str,
     ) -> Result<Option<Value>> {
         // Claim and checkpoint in one transaction: a crash between them would
-        // otherwise lose the message.
-        let mut tx = self.pool.begin().await?;
+        // otherwise lose the message. IMMEDIATE takes the writer lock up front:
+        // the transaction reads before it writes, and two deferred readers
+        // that both try to upgrade deadlock instead of queueing.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+
+        // A rival may already have settled this position; serve that instead.
+        if let Some(recorded) = self
+            .recorded_recv(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            return Ok(Some(recorded));
+        }
 
         let claimed: Option<(String, Option<String>)> = sqlx::query_as(
             "UPDATE notifications SET consumed = TRUE
@@ -1050,7 +1103,7 @@ impl StateProvider for SqliteProvider {
                  WHERE destination_uuid = ? AND topic = ? AND consumed = FALSE
                  ORDER BY created_at_epoch_ms ASC
                  LIMIT 1
-             )
+             ) AND consumed = FALSE
              RETURNING message, serialization",
         )
         .bind(workflow_id)
@@ -1059,12 +1112,16 @@ impl StateProvider for SqliteProvider {
         .await?;
 
         let Some((message, fmt)) = claimed else {
-            return Ok(None);
+            // Empty now — unless a rival settled the position since the read
+            // above, in which case its outcome is served, not an empty mailbox.
+            return self
+                .recorded_recv(&mut *tx, workflow_id, seq, step_name)
+                .await;
         };
 
         // Checkpoint the consumed message verbatim, keeping its format so a
         // replay decodes it the same way.
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO operation_outputs
                  (workflow_uuid, function_id, function_name, output, serialization)
              VALUES (?, ?, ?, ?, ?)
@@ -1076,7 +1133,16 @@ impl StateProvider for SqliteProvider {
         .bind(&message)
         .bind(&fmt)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            // Mirrors the Postgres path; IMMEDIATE holds the writer lock from
+            // the read above, so a rival cannot reach this on SQLite.
+            tx.rollback().await?;
+            return self
+                .recorded_recv(&self.pool, workflow_id, seq, step_name)
+                .await;
+        }
 
         tx.commit().await?;
         Ok(Some(serialize::decode(

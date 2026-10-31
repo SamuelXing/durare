@@ -3,13 +3,13 @@ use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
     ChangeWait, ChangeWatch, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
-    NotificationInfo, NotificationInsert, RecordedStep, RecoveryClaim, RecoveryClaimRequest,
-    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome,
-    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus,
-    EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED,
-    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
-    WORKFLOW_EVENTS_CHANNEL,
+    NotificationInfo, NotificationInsert, RecordedColumns, RecordedStep, RecoveryClaim,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -829,6 +829,50 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
         config_name: row.try_get("config_name").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
+    }
+}
+
+impl PostgresProvider {
+    /// The outcome already recorded at `(workflow_id, seq)`, which a `recv`
+    /// there serves instead of consuming another message; a recorded timeout
+    /// is `Value::Null`. A different step name at the position is a divergent
+    /// replay.
+    async fn recorded_recv<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<Option<Value>> {
+        let row: Option<RecordedColumns> = sqlx::query_as(&format!(
+            "SELECT function_name, output, error, serialization FROM {operation_outputs}
+                 WHERE workflow_uuid = $1 AND function_id = $2",
+            operation_outputs = self.tables.operation_outputs
+        ))
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(executor)
+        .await?;
+        let Some((stored_name, output, error, fmt)) = row else {
+            return Ok(None);
+        };
+        if stored_name != step_name {
+            return Err(Error::unexpected_step(
+                workflow_id,
+                seq,
+                step_name,
+                stored_name,
+            ));
+        }
+        step_outcome_from(
+            &self.serializer,
+            fmt.as_deref(),
+            output.as_deref(),
+            error.as_deref(),
+        )?
+        .unwrap_or(StepOutcome::Output(Value::Null))
+        .into_value_result()
+        .map(Some)
     }
 }
 
@@ -1689,6 +1733,18 @@ impl StateProvider for PostgresProvider {
         // when several messages share a created_at millisecond.
         let mut tx = self.pool.begin().await?;
 
+        // A rival may already have settled this position; serve that instead.
+        if let Some(recorded) = self
+            .recorded_recv(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            return Ok(Some(recorded));
+        }
+
+        // `consumed = FALSE` is restated on the row itself: when a rival took
+        // the same oldest message and commits first, this UPDATE re-evaluates
+        // against the committed row and matches nothing, instead of handing
+        // the same message out twice.
         let claimed: Option<(String, Option<String>)> = sqlx::query_as(&format!(
             "WITH oldest_entry AS (
                  SELECT message_uuid FROM {notifications}
@@ -1698,6 +1754,7 @@ impl StateProvider for PostgresProvider {
              )
              UPDATE {notifications} SET consumed = TRUE
              WHERE message_uuid = (SELECT message_uuid FROM oldest_entry)
+               AND consumed = FALSE
              RETURNING message, serialization",
             notifications = self.tables.notifications
         ))
@@ -1707,12 +1764,16 @@ impl StateProvider for PostgresProvider {
         .await?;
 
         let Some((message, fmt)) = claimed else {
-            return Ok(None);
+            // Empty now — unless a rival settled the position since the read
+            // above, in which case its outcome is served, not an empty mailbox.
+            return self
+                .recorded_recv(&mut *tx, workflow_id, seq, step_name)
+                .await;
         };
 
         // Checkpoint the consumed message verbatim, keeping its format so a
         // replay decodes it the same way.
-        sqlx::query(&format!(
+        let inserted = sqlx::query(&format!(
             "INSERT INTO {operation_outputs}
                  (workflow_uuid, function_id, function_name, output, serialization)
              VALUES ($1, $2, $3, $4, $5)
@@ -1725,7 +1786,16 @@ impl StateProvider for PostgresProvider {
         .bind(&message)
         .bind(&fmt)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            // A rival checkpointed this position after the read above: give
+            // the message back and serve the rival's outcome.
+            tx.rollback().await?;
+            return self
+                .recorded_recv(&self.pool, workflow_id, seq, step_name)
+                .await;
+        }
 
         tx.commit().await?;
         Ok(Some(serialize::decode(
