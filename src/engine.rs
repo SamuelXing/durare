@@ -2307,7 +2307,8 @@ impl DurableEngine {
     /// [`Failed`](crate::Divergence::Failed) when nothing else diverged, and
     /// otherwise not at all, since a divergence is the better explanation for a
     /// body that panicked on an operation it did not get. A storage interruption
-    /// during replay returns [`Error::RecoveryRequired`], not a divergence report,
+    /// during replay, or a child start this engine's configuration refuses,
+    /// returns [`Error::RecoveryRequired`], not a divergence report,
     /// even if the body catches the fault and waits forever. Failures reading
     /// the history before the body starts return [`Error::ObservationFailed`];
     /// neither result is permission to recover the source workflow.
@@ -3260,8 +3261,15 @@ impl Runtime {
         }
     }
 
-    /// Validate fresh child calls without writing history or doing live work.
-    pub(crate) fn validate_child(&self, name: &str, opts: &WorkflowOptions) -> Result<()> {
+    /// Refuse a child call whose arguments this engine can never accept: an
+    /// empty name or queue, invalid deduplication options, or a delay without a
+    /// queue. These depend only on the call, so they return as ordinary errors
+    /// the body may handle; a replay makes the same refusal.
+    pub(crate) fn validate_child_arguments(
+        &self,
+        name: &str,
+        opts: &WorkflowOptions,
+    ) -> Result<()> {
         if name.is_empty() {
             return Err(Error::app("workflow name is required"));
         }
@@ -3274,35 +3282,55 @@ impl Runtime {
                 "WorkflowOptions.delay requires a queue; direct runs start immediately",
             ));
         }
+        Ok(())
+    }
+
+    /// Refuse a child start this process is not configured to perform: an
+    /// unregistered inline target or queue, a remote target without a version,
+    /// or unsafe same-version routing. The errors are returned plain; the
+    /// context interrupts the execution with them rather than handing them to
+    /// the body, because a body that branched on this process's configuration
+    /// would diverge from a replay on one configured differently. Nothing is
+    /// recorded and the workflow stays pending; settlement retries it with
+    /// backoff up to the recovery-attempt cap, so a deployment that fixes the
+    /// configuration completes it, and a persistent fault parks it.
+    pub(crate) fn validate_child_configuration(
+        &self,
+        name: &str,
+        opts: &WorkflowOptions,
+    ) -> Result<()> {
         let handler = self
             .workflows
             .get(&registry_key(name, opts.config_name.as_deref()));
+        let Some(queue) = opts.queue.as_deref() else {
+            return match handler {
+                Some(_) => Ok(()),
+                None => Err(Error::UnknownWorkflow(name.to_owned())),
+            };
+        };
         let config = self
             .queue_config
             .read()
             .expect("queue configuration lock poisoned");
-        if let Some(queue) = opts.queue.as_deref() {
-            if !config.queues.contains_key(queue) {
-                return Err(Error::UnknownQueue(queue.to_owned()));
-            }
-            if handler.is_none() {
-                if opts.app_version.as_deref().is_none_or(str::is_empty) {
-                    return Err(Error::app(
-                        "remote child requires an explicit nonempty app_version naming its worker version",
-                    ));
-                }
-                // A foreign version cannot be claimed by this producer. A
-                // same-version remote target still needs a producer-only queue.
-                if opts.app_version.as_deref() == Some(self.app_version.as_str())
-                    && !config.is_producer_only(queue)
-                {
-                    return Err(Error::app(
-                        "same-version remote child queues must be excluded from local dispatch using listen_queues",
-                    ));
-                }
-            }
-        } else if handler.is_none() {
-            return Err(Error::UnknownWorkflow(name.to_owned()));
+        if !config.queues.contains_key(queue) {
+            return Err(Error::UnknownQueue(queue.to_owned()));
+        }
+        if handler.is_some() {
+            return Ok(());
+        }
+        if opts.app_version.as_deref().is_none_or(str::is_empty) {
+            return Err(Error::app(
+                "remote child requires an explicit nonempty app_version naming its worker version",
+            ));
+        }
+        // A foreign version cannot be claimed by this producer. A same-version
+        // remote target still needs a producer-only queue.
+        if opts.app_version.as_deref() == Some(self.app_version.as_str())
+            && !config.is_producer_only(queue)
+        {
+            return Err(Error::app(
+                "same-version remote child queues must be excluded from local dispatch using listen_queues",
+            ));
         }
         Ok(())
     }

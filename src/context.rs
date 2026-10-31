@@ -950,8 +950,11 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// [`Error::UnknownWorkflow`] if an inline target is not registered on this
-    /// engine (queued targets need not be registered), or [`Error::UnexpectedStep`] if a replay finds a different child (or
+    /// [`Error::RecoveryRequired`] wrapping [`Error::UnknownWorkflow`] if an
+    /// inline target is not registered on this engine (queued targets need not
+    /// be); configuration refusals interrupt the execution rather than return to
+    /// the body — see [`enqueue_workflow`](Self::enqueue_workflow).
+    /// [`Error::UnexpectedStep`] if a replay finds a different child (or
     /// operation) recorded at this position.
     pub fn start_workflow<'a, I, O>(
         &'a self,
@@ -1007,11 +1010,14 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// An application error for an empty queue or workflow name, missing/empty
-    /// remote target version, invalid deduplication options, or unsafe same-version
-    /// routing; [`Error::UnknownQueue`] for an unregistered queue. These errors
-    /// are not checkpointed. An uncaught error fails the parent; deploying a fix
-    /// does not automatically retry a terminal workflow.
+    /// An application error for an empty queue or workflow name or invalid
+    /// deduplication options; these depend only on the call and return to the
+    /// body. [`Error::RecoveryRequired`] for refusals that depend on this
+    /// process's configuration — an unregistered queue (wrapping
+    /// [`Error::UnknownQueue`]), a missing or empty remote target version, or
+    /// unsafe same-version routing: the execution is interrupted and the
+    /// workflow stays pending until a correctly configured process recovers it.
+    /// Neither is checkpointed.
     /// [`ErrorCode::WorkflowTargetConflict`] identifies an existing ID/key that
     /// belongs to a different workflow name, class, or configured instance.
     /// [`Error::QueueDeduplicated`] reports a conflicting key under `Reject`;
@@ -1084,10 +1090,14 @@ impl DurableContext {
                 ));
             }
             // Keep 0.5.0 positions: serialization fails before claiming a slot;
-            // registration/argument rejections consume a slot but write nothing.
-            // Validate before the verification gate so caught errors take the
-            // same branch during verification, without permitting any insertion.
-            self.runtime.validate_child(&name, &opts)?;
+            // other refusals consume a slot but write nothing. Validate before
+            // the verification gate so verification observes the same outcome
+            // without permitting any insertion. Configuration refusals interrupt
+            // the execution; see `Runtime::validate_child_configuration`.
+            self.runtime.validate_child_arguments(&name, &opts)?;
+            self.runtime
+                .validate_child_configuration(&name, &opts)
+                .map_err(|error| self.execution.interrupt(error))?;
             self.refuse_live_work(seq, &name)?;
             if let Some(status) = self
                 .execution
