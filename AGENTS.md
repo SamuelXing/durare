@@ -41,6 +41,9 @@ change to any `pub` item must keep both green.
 - `src/execution.rs` — the per-execution latch (`RecoveryRequired`, `ObservationFailed`)
 - `src/provider.rs` — the `StateProvider` trait; `memory.rs`, `sqlite.rs`, `postgres.rs` implement it
 - `tests/` — integration tests; `tests/common/mod.rs` holds shared fixtures (`recorded`, `hermetic_pg_db`)
+- `docs/design/` — design notes: `execution-layers.md` (the two orchestration
+  layers, the seam, and which side a new behavior belongs to),
+  `explicit-context.md` (positions and concurrency inside a body)
 - `CONTRIBUTING.md`, `RELEASING.md`, `CHANGELOG.md`
 
 ## Conventions
@@ -65,6 +68,10 @@ change to any `pub` item must keep both green.
   `Changed`, even when the PR also adds something.
 - Plan or tracker numbering (phases, waves) never appears in code, file names
   or comments.
+- Before adding an error or a refusal, decide which orchestration layer it
+  belongs to with the rule in `docs/design/execution-layers.md`: a fact
+  observed through the database is recorded; a property of this process
+  interrupts the execution and records nothing.
 
 ## Workflow
 
