@@ -794,9 +794,17 @@ async fn postgres_provider_business_errors_remain_catchable() -> Result<()> {
     result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
+/// Argument errors return to the body and are not checkpointed; refusals that
+/// depend on this process's configuration interrupt the execution, so a body
+/// that catches one cannot record anything after it.
 #[tokio::test]
-async fn child_preflight_errors_are_catchable_without_checkpoints() -> Result<()> {
+async fn child_preflight_errors_split_argument_from_configuration() -> Result<()> {
     for kind in ["workflow", "queue", "delay"] {
+        let expected = match kind {
+            "workflow" => Some(ErrorCode::WorkflowNotRegistered),
+            "queue" => Some(ErrorCode::QueueNotRegistered),
+            _ => None,
+        };
         let provider = Arc::new(InMemoryProvider::new());
         let mut engine = DurableEngine::new(provider.clone()).await?;
         engine.register("child", |_: DurableContext, _: ()| async { Ok(()) });
@@ -823,19 +831,30 @@ async fn child_preflight_errors_are_catchable_without_checkpoints() -> Result<()
             .start::<_, ErrorCode>("parent", (), WorkflowOptions::with_id(kind))
             .await?
             .result()
-            .await?;
-        assert_eq!(
-            result,
-            match kind {
-                "workflow" => ErrorCode::WorkflowNotRegistered,
-                "queue" => ErrorCode::QueueNotRegistered,
-                _ => ErrorCode::Application,
-            }
-        );
-        assert_eq!(engine.verify_replay(kind).await?.divergence, None);
+            .await;
         let steps = provider.get_workflow_steps(kind).await?;
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].step_id, 1);
+        if let Some(expected) = expected {
+            // The body caught the refusal, but its `handled` step was refused
+            // by the latch: nothing is recorded and the parent stays pending.
+            assert!(
+                matches!(result, Err(Error::RecoveryRequired(ref cause)) if cause.code() == expected),
+                "{kind}: {result:?}"
+            );
+            assert_eq!(
+                provider.get_workflow_status(kind).await?.unwrap().status,
+                crate::STATUS_PENDING
+            );
+            assert!(steps.is_empty(), "{kind}: {steps:?}");
+            assert!(matches!(
+                engine.verify_replay(kind).await,
+                Err(Error::RecoveryRequired(_))
+            ));
+        } else {
+            assert_eq!(result?, ErrorCode::Application);
+            assert_eq!(engine.verify_replay(kind).await?.divergence, None);
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0].step_id, 1);
+        }
         engine.shutdown(Duration::from_secs(1)).await?;
     }
     Ok(())

@@ -48,11 +48,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Queued `start_workflow` children can target workflows not registered locally
   when an explicit target version and safe queue routing are supplied.
   Both child APIs reject empty workflow names and empty queue names.
-- Child argument and registration errors return ordinary errors without a
-  checkpoint. Uncaught errors fail the parent; fixing configuration does not
-  automatically retry terminal workflows. `Reject` deduplication and target
-  conflicts remain checkpointed. Serialization failures consume no position;
-  other refusals retain 0.5.0's consumed position, keeping old histories aligned.
+- Child-start refusals that depend on process configuration (an unregistered
+  inline target or queue, a remote target without a version, unsafe
+  same-version routing) interrupt the execution with `RecoveryRequired` instead
+  of returning a catchable error. The workflow stays pending and is retried, so
+  fixing the configuration completes it. A pending 0.5.0 history whose body
+  caught such an error and continued is now interrupted at that position;
+  finish it on 0.5.x or fork past the refusal. Argument errors remain ordinary
+  errors; positions and checkpointing are unchanged.
 - Reusing a workflow ID or adopting a deduplication key for a different workflow
   name, class, or configured instance now returns `WorkflowTargetConflict` from
   `Error::code()` (carried by the existing `Error::Portable` variant), instead

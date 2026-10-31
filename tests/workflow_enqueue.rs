@@ -20,6 +20,39 @@ impl serde::Serialize for Unserializable {
     }
 }
 
+/// An execution interrupted by a configuration refusal stays pending, and
+/// verification reports the interruption rather than a divergence.
+async fn assert_interrupted_pending(
+    engine: &DurableEngine,
+    provider: &dyn StateProvider,
+    id: &str,
+) -> Result<()> {
+    assert_eq!(
+        provider.get_workflow_status(id).await?.unwrap().status,
+        STATUS_PENDING,
+        "{id}"
+    );
+    assert!(
+        matches!(
+            engine.verify_replay(id).await,
+            Err(Error::RecoveryRequired(_))
+        ),
+        "{id}"
+    );
+    Ok(())
+}
+
+/// A fresh execution interrupted before its first durable call: pending, and
+/// nothing recorded.
+async fn assert_interrupted(
+    engine: &DurableEngine,
+    provider: &dyn StateProvider,
+    id: &str,
+) -> Result<()> {
+    assert!(common::recorded(engine, id).await?.is_empty(), "{id}");
+    assert_interrupted_pending(engine, provider, id).await
+}
+
 async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
     let calls = Arc::new(AtomicUsize::new(0));
     let effects = Arc::new(AtomicUsize::new(0));
@@ -164,11 +197,6 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
                 .await,
                 Err(Error::App { .. })
             ));
-            assert!(matches!(
-                ctx.start_workflow::<_, ()>("typo", (), WorkflowOptions::default())
-                    .await,
-                Err(Error::UnknownWorkflow(name)) if name == "typo"
-            ));
             ctx.step("after-refusals", || async {
                 effect_counter.fetch_add(1, Ordering::SeqCst);
                 Ok(42_i64)
@@ -190,20 +218,16 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
                 .await,
                 Err(Error::Serde(_))
             ));
+            // A registration refusal interrupts the execution. The body may
+            // catch it, but every later durable call is refused, so nothing
+            // after it can be recorded.
+            let refused = ctx
+                .start_workflow::<_, ()>("absent", (), WorkflowOptions::default())
+                .await;
             assert!(matches!(
-                ctx.start_workflow::<_, ()>("absent", (), WorkflowOptions::default())
-                    .await,
-                Err(Error::UnknownWorkflow(_))
-            ));
-            // 0.5.0 resolves the local handler before checking the queue.
-            assert!(matches!(
-                ctx.start_workflow::<_, ()>(
-                    "parent",
-                    (),
-                    WorkflowOptions::default().queue("absent")
-                )
-                .await,
-                Err(Error::UnknownQueue(_))
+                refused,
+                Err(Error::RecoveryRequired(ref cause))
+                    if cause.code() == durare::ErrorCode::WorkflowNotRegistered
             ));
             ctx.step("effect", || async {
                 legacy_counter.fetch_add(1, Ordering::SeqCst);
@@ -440,8 +464,9 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         .await?
         .is_none());
 
-    // Released 0.5.0 consumes no slot for serialization failure, then one
-    // each for UnknownWorkflow and UnknownQueue. Its effect is at position 2.
+    // Released 0.5.0 consumed a slot for a caught registration refusal and ran
+    // the effect at position 2. The refusal now interrupts the execution: the
+    // history is not replayed past a child this engine cannot start.
     provider
         .insert_workflow_status(durare::WorkflowStatus::new(
             "legacy",
@@ -456,20 +481,36 @@ async fn contract(provider: Arc<dyn StateProvider>) -> Result<()> {
         .record_step_result("legacy", 2, "effect", json!(42), None, None, None)
         .await?;
     assert_eq!(engine.recover().await?, 1);
-    let old = engine.retrieve_workflow::<i64>("legacy").await?;
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), old.result())
-            .await
-            .unwrap()?,
-        42
-    );
+    // The recovery claim counts one attempt; the interrupted execution's
+    // settlement claim counts the next. Observe the interruption through it.
+    let attempts = || async {
+        Ok::<_, Error>(
+            provider
+                .get_workflow_status("legacy")
+                .await?
+                .unwrap()
+                .recovery_attempts,
+        )
+    };
+    let claimed = attempts().await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while attempts().await? <= claimed {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "legacy was not interrupted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
         legacy_effects.load(Ordering::SeqCst),
         0,
-        "released side effect ran twice"
+        "an interrupted body reached its effect"
     );
-    assert_eq!(engine.verify_replay("legacy").await?.divergence, None);
-    assert_eq!(engine.get_workflow_steps("legacy").await?[0].step_id, 2);
+    assert_eq!(
+        common::recorded(&engine, "legacy").await?,
+        [(2, "effect".to_owned())]
+    );
+    assert_interrupted_pending(&engine, provider.as_ref(), "legacy").await?;
     engine.shutdown(Duration::from_secs(1)).await?;
     configuration_recovery_contract(provider).await
 }
@@ -670,6 +711,7 @@ async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Res
             }
             let missing = version.is_none_or(str::is_empty);
             let unsafe_route = !producer_only && version == Some("producer-version");
+            let refused = missing || unsafe_route;
             engine.register("parent", move |ctx: DurableContext, _: ()| async move {
                 let result = ctx
                     .enqueue_workflow::<_, ()>(
@@ -682,17 +724,29 @@ async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Res
                         },
                     )
                     .await;
-                if missing {
-                    let error = result.err().expect("missing target version accepted");
-                    assert!(matches!(error, Error::App { .. }));
-                    assert!(error.to_string().contains("explicit nonempty app_version"));
+                // Routing refusals depend on this process's configuration, so
+                // they interrupt the execution rather than return to the body.
+                let expected = if missing {
+                    Some("explicit nonempty app_version")
                 } else if unsafe_route {
-                    let error = result.err().expect("unsafe routing accepted");
-                    assert!(matches!(error, Error::App { .. }));
-                    assert!(error.to_string().contains("excluded from local dispatch"));
+                    Some("excluded from local dispatch")
                 } else {
-                    assert_eq!(result?.id(), "guard-0");
+                    None
+                };
+                if let Some(text) = expected {
+                    let error = result.err().expect("routing refusal accepted");
+                    assert!(
+                        matches!(
+                            &error,
+                            Error::RecoveryRequired(cause)
+                                if matches!(**cause, Error::App { .. })
+                                    && cause.to_string().contains(text)
+                        ),
+                        "{error:?}"
+                    );
+                    return Err(error);
                 }
+                assert_eq!(result?.id(), "guard-0");
                 ctx.step("after", || async { Ok(()) }).await
             });
             engine.register("warmup", |_: DurableContext, _: ()| async { Ok(()) });
@@ -712,11 +766,16 @@ async fn remote_routing_distinguishes_missing_foreign_and_same_versions() -> Res
                 .await?
                 .result()
                 .await;
-            result?;
-            assert_eq!(engine.verify_replay("guard").await?.divergence, None);
+            if refused {
+                assert!(matches!(result, Err(Error::RecoveryRequired(_))));
+                assert_interrupted(&engine, provider.as_ref(), "guard").await?;
+            } else {
+                result?;
+                assert_eq!(engine.verify_replay("guard").await?.divergence, None);
+            }
             assert_eq!(
                 provider.get_workflow_status("guard-0").await?.is_some(),
-                !missing && !unsafe_route
+                !refused
             );
             engine.shutdown(Duration::from_secs(1)).await?;
         }
@@ -762,10 +821,12 @@ async fn cancelled_parent_cannot_enqueue_new_children() -> Result<()> {
 }
 
 async fn configuration_recovery_contract(provider: Arc<dyn StateProvider>) -> Result<()> {
-    // Reject, explicitly re-execute after fixing config, then replay the saved
-    // child with that queue absent again. History takes precedence over config.
+    // Phase 0: the queue is unregistered, so the parent is interrupted and
+    // stays pending. Phase 1: a deployment that registers the queue recovers
+    // it with no operator action. Phase 2: the queue is absent again, but the
+    // recorded child replays — history takes precedence over configuration.
+    const PARENTS: [&str; 2] = ["configuration-parent", "catching-parent"];
     for phase in 0..3 {
-        let fixed = phase != 0;
         let mut builder = DurableEngine::builder(provider.clone());
         builder.app_version("configuration-recovery");
         let mut engine = builder.build().await?;
@@ -786,6 +847,26 @@ async fn configuration_recovery_contract(provider: Arc<dyn StateProvider>) -> Re
                 Ok(child?.id().to_owned())
             },
         );
+        // A body that catches the refusal and falls back. The fallback must
+        // never be recorded: on a process with the queue registered, replay
+        // would otherwise take the other branch over an orphaned step.
+        engine.register("catching-parent", |ctx: DurableContext, _: ()| async move {
+            match ctx
+                .enqueue_workflow::<_, ()>(
+                    "late-queue",
+                    "external",
+                    (),
+                    WorkflowOptions::default().app_version("worker"),
+                )
+                .await
+            {
+                Ok(child) => Ok(child.id().to_owned()),
+                Err(_) => {
+                    ctx.step("fallback", || async { Ok("fallback".to_owned()) })
+                        .await
+                }
+            }
+        });
         engine.register("warmup", |_: DurableContext, _: ()| async { Ok(()) });
         // Initialize Runtime before configuring the listen filter: permitted
         // by listen_queues' before-launch contract.
@@ -793,69 +874,56 @@ async fn configuration_recovery_contract(provider: Arc<dyn StateProvider>) -> Re
             .start::<_, ()>(
                 "warmup",
                 (),
-                WorkflowOptions::with_id(format!("warmup-{fixed}")),
+                WorkflowOptions::with_id(format!("warmup-{phase}")),
             )
             .await?
             .result()
             .await?;
         engine.listen_queues(Vec::<String>::new())?;
-        if fixed {
-            // Deployment alone does not retry a terminal ERROR. Explicitly
-            // reset this fixture to model an operator-requested re-execution.
-            assert_eq!(
-                provider
-                    .get_workflow_status("configuration-parent")
+        if phase == 0 {
+            for id in PARENTS {
+                let result = engine
+                    .start::<_, String>(id, (), WorkflowOptions::with_id(id))
                     .await?
-                    .unwrap()
-                    .status,
-                if phase == 1 {
-                    durare::STATUS_ERROR
-                } else {
-                    durare::STATUS_SUCCESS
-                }
-            );
-            provider
-                .set_workflow_status("configuration-parent", STATUS_PENDING, None, None)
-                .await?;
-            engine.recover_pending_for(&[]).await?;
-            let recovered = engine
-                .retrieve_workflow::<String>("configuration-parent")
-                .await?;
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), recovered.result())
-                    .await
-                    .unwrap()?,
-                "configuration-parent-0"
-            );
-            assert_eq!(
-                engine
-                    .verify_replay("configuration-parent")
-                    .await?
-                    .divergence,
-                None
-            );
+                    .result()
+                    .await;
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::RecoveryRequired(ref cause))
+                            if cause.code() == durare::ErrorCode::QueueNotRegistered
+                    ),
+                    "{id}: {result:?}"
+                );
+                assert_interrupted(&engine, provider.as_ref(), id).await?;
+            }
         } else {
-            let result = engine
-                .start::<_, String>(
-                    "configuration-parent",
-                    (),
-                    WorkflowOptions::with_id("configuration-parent"),
-                )
-                .await?
-                .result()
-                .await;
-            assert!(matches!(result, Err(Error::UnknownQueue(_))));
-            assert_eq!(
-                engine
-                    .verify_replay("configuration-parent")
-                    .await?
-                    .divergence,
-                None
-            );
-            assert!(provider
-                .get_workflow_steps("configuration-parent")
-                .await?
-                .is_empty());
+            // Phase 1 needs no status reset: both rows are still pending from
+            // phase 0. Phase 2 models a crash after completion.
+            if phase == 2 {
+                for id in PARENTS {
+                    provider
+                        .set_workflow_status(id, STATUS_PENDING, None, None)
+                        .await?;
+                }
+            }
+            assert_eq!(engine.recover_pending_for(&[]).await?.len(), 2);
+            for id in PARENTS {
+                let recovered = engine.retrieve_workflow::<String>(id).await?;
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(5), recovered.result())
+                        .await
+                        .unwrap()?,
+                    format!("{id}-0")
+                );
+                assert_eq!(engine.verify_replay(id).await?.divergence, None);
+                // The child alone: no orphaned fallback, nothing new on replay.
+                assert_eq!(
+                    common::recorded(&engine, id).await?,
+                    [(0, "external".to_owned())],
+                    "{id}"
+                );
+            }
         }
         engine.shutdown(Duration::from_secs(1)).await?;
     }
