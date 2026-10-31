@@ -461,6 +461,18 @@ impl StateProvider for InMemoryProvider {
         // Single mutex covers both the claim and the checkpoint, giving the
         // same atomicity the SQL backends get from a transaction.
         let mut g = self.inner.lock().await;
+        // A rival may already have settled this position; serve that instead.
+        if let Some(recorded) = g.steps.get(&(workflow_id.to_string(), seq)) {
+            if recorded.name != step_name {
+                return Err(Error::unexpected_step(
+                    workflow_id,
+                    seq,
+                    step_name,
+                    &recorded.name,
+                ));
+            }
+            return step_row_outcome(recorded).into_value_result().map(Some);
+        }
         let oldest = g
             .notifications
             .iter_mut()
@@ -471,19 +483,16 @@ impl StateProvider for InMemoryProvider {
         };
         row.consumed = true;
         let message = row.message.clone();
-        let canonical = g
-            .steps
-            .entry((workflow_id.to_string(), seq))
-            .or_insert_with(|| StepRow {
+        g.steps.insert(
+            (workflow_id.to_string(), seq),
+            StepRow {
                 name: step_name.to_string(),
-                output: Some(message),
+                output: Some(message.clone()),
                 child_workflow_id: None,
                 ..Default::default()
-            })
-            .output
-            .clone()
-            .unwrap_or(Value::Null);
-        Ok(Some(canonical))
+            },
+        );
+        Ok(Some(message))
     }
 
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {

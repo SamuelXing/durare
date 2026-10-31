@@ -160,6 +160,10 @@ impl ChangeWait<'_> {
 /// [`StateProvider::watch_change`]. Resolves once the condition is signalled.
 pub type ChangeWatch = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
+/// The `(function_name, output, error, serialization)` columns of one
+/// `operation_outputs` row, as the SQL backends read them back.
+pub(crate) type RecordedColumns = (String, Option<String>, Option<String>, Option<String>);
+
 /// Group ordered `(key, value, serialization)` stream rows — sorted by key then
 /// offset — into one `(key, decoded values)` entry per key, decoding each value
 /// and dropping the close sentinel (a key present only via its sentinel still
@@ -1696,6 +1700,15 @@ pub trait StateProvider: Send + Sync {
     /// checkpointing were separate, a crash between them would lose the
     /// message. Returns the message, or `None` when the mailbox is empty
     /// (nothing is recorded in that case).
+    ///
+    /// An outcome already recorded at `(workflow_id, seq)` wins: another
+    /// execution of this workflow took delivery at this position, or an
+    /// earlier attempt committed. Nothing further is consumed and that output
+    /// is returned, `Value::Null` for a recorded timeout. Serving it is exactly
+    /// a replay: unlike a step body, a claim that lost to a rival's checkpoint
+    /// is rolled back, so no side effect escapes and there is nothing to
+    /// conflict over. A different step name recorded there is a divergent
+    /// replay, [`Error::UnexpectedStep`](crate::Error::UnexpectedStep).
     async fn consume_notification(
         &self,
         workflow_id: &str,

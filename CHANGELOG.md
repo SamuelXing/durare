@@ -81,6 +81,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   noticed only at the 5 s backstop; a debounce producer could then time out
   waiting for the collector's acknowledgement and start a second collector, so
   one burst ran the target twice (#244).
+- `recv` serves the outcome already recorded at its position instead of
+  consuming another message. When a second execution of a workflow, such as a
+  recovery double-run, or a retried attempt reached a `recv` whose checkpoint
+  was already written, the built-in providers marked a further message
+  consumed and silently dropped its checkpoint, losing the message (#248).
 - Replaying a child checkpoint whose child status row was removed by retention
   returns the recorded child id instead of failing with a storage error, on all
   built-in providers.
