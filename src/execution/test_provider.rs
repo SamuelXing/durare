@@ -107,8 +107,8 @@ impl StateProvider for FaultProvider {
     fn supports_listen_notify(&self) -> bool {
         self.inner.supports_listen_notify()
     }
-    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
-        self.inner.await_change(wait, within).await
+    fn watch_change(&self, wait: ChangeWait<'_>) -> ChangeWatch {
+        self.inner.watch_change(wait)
     }
     async fn ping(&self) -> Result<()> {
         self.inner.ping().await
