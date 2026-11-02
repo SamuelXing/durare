@@ -316,11 +316,11 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
 }
 
 impl SqliteProvider {
-    /// The outcome already recorded at `(workflow_id, seq)`, which a `recv`
-    /// there serves instead of consuming another message; a recorded timeout
-    /// is `Value::Null`. A different step name at the position is a divergent
-    /// replay.
-    async fn recorded_recv<'e, E: sqlx::SqliteExecutor<'e>>(
+    /// The outcome already recorded at `(workflow_id, seq)`, read on
+    /// `executor`: what a `recv` there serves instead of consuming (a recorded
+    /// timeout is `Value::Null`), and how a lost checkpoint is classified. A
+    /// different step name at the position is a divergent replay.
+    async fn recorded_output_on<'e, E: sqlx::SqliteExecutor<'e>>(
         &self,
         executor: E,
         workflow_id: &str,
@@ -355,6 +355,170 @@ impl SqliteProvider {
         .unwrap_or(StepOutcome::Output(Value::Null))
         .into_value_result()
         .map(Some)
+    }
+    /// Record `step_name` at `(workflow_id, seq)` on `executor` with the given
+    /// encoded output, reporting whether this call wrote it; `false` means a
+    /// rival already holds the position.
+    async fn checkpoint_on<'e, E: sqlx::SqliteExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        output: &str,
+        serialization: Option<&str>,
+    ) -> Result<bool> {
+        let inserted = sqlx::query(
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  completed_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        )
+        .bind(workflow_id)
+        .bind(seq)
+        .bind(step_name)
+        .bind(output)
+        .bind(serialization)
+        .bind(Utc::now().timestamp_millis())
+        .execute(executor)
+        .await?
+        .rows_affected();
+        Ok(inserted == 1)
+    }
+
+    /// [`checkpoint_on`](Self::checkpoint_on) with a null output: the record a
+    /// send or stream write leaves. It does not refresh the workflow's
+    /// executor id.
+    async fn checkpoint_null_on<'e, E: sqlx::SqliteExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<bool> {
+        let output = self.serializer.encode(&Value::Null)?;
+        self.checkpoint_on(
+            executor,
+            workflow_id,
+            seq,
+            step_name,
+            &output,
+            Some(self.serializer.name()),
+        )
+        .await
+    }
+
+    /// Mirrors the Postgres row lock for symmetry; on SQLite `BEGIN IMMEDIATE`
+    /// already serializes writers, so this only checks the row is readable.
+    async fn lock_streams_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        workflow_id: &str,
+    ) -> Result<()> {
+        sqlx::query("SELECT 1 FROM workflow_status WHERE workflow_uuid = ?")
+            .bind(workflow_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
+    /// [`StateProvider::insert_notifications`] on `executor`, so a workflow
+    /// send can share the transaction that checkpoints it.
+    async fn insert_notifications_on<'e, E: sqlx::SqliteExecutor<'e>>(
+        &self,
+        executor: E,
+        rows: &[NotificationInsert],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Serialize up front (fallible), then build one multi-row INSERT — the
+        // whole batch commits or fails together, and each keyed row keeps the
+        // singular path's `{key}::{destination}` at-most-once id.
+        let mut prepared = Vec::with_capacity(rows.len());
+        for r in rows {
+            let message_uuid = match &r.idempotency_key {
+                Some(k) => format!("{k}::{}", r.destination_id),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            prepared.push((message_uuid, self.serializer.encode(&r.message)?));
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "INSERT INTO notifications
+                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms) ",
+        );
+        qb.push_values(rows.iter().zip(prepared), |mut b, (r, (uuid, encoded))| {
+            b.push_bind(uuid)
+                .push_bind(&r.destination_id)
+                .push_bind(&r.topic)
+                .push_bind(encoded)
+                .push_bind(self.serializer.name())
+                .push_bind(now);
+        });
+        qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
+        qb.build().execute(executor).await.map_err(|e| {
+            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
+            dests.sort_unstable();
+            dests.dedup();
+            nonexistent_or(e, &dests.join(", "))
+        })?;
+        Ok(())
+    }
+
+    /// [`StateProvider::write_stream`] on `conn`, so a workflow write can share
+    /// the transaction that checkpoints it.
+    async fn write_stream_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        workflow_id: &str,
+        key: &str,
+        value: Option<Value>,
+        function_id: i32,
+    ) -> Result<()> {
+        // A closed entry stores the sentinel verbatim with no serialization;
+        // user values are encoded and tagged with the serializer name.
+        let (stored, ser): (String, Option<String>) = match value {
+            Some(v) => (
+                self.serializer.encode(&v)?,
+                Some(self.serializer.name().to_string()),
+            ),
+            None => (STREAM_CLOSED_SENTINEL.to_string(), None),
+        };
+
+        let closed: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM streams WHERE workflow_uuid = ? AND key = ? AND value = ? LIMIT 1",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(STREAM_CLOSED_SENTINEL)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if closed.is_some() {
+            return Err(crate::error::Error::app(format!(
+                "stream `{key}` is already closed"
+            )));
+        }
+
+        sqlx::query(
+            "INSERT INTO streams (workflow_uuid, key, value, \"offset\", function_id, serialization)
+             SELECT ?, ?, ?, COALESCE(
+                 (SELECT MAX(\"offset\") FROM streams WHERE workflow_uuid = ? AND key = ?), -1
+             ) + 1, ?, ?",
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(&stored)
+        .bind(workflow_id)
+        .bind(key)
+        .bind(function_id)
+        .bind(&ser)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| nonexistent_or(e, workflow_id))?;
+
+        Ok(())
     }
 }
 
@@ -1038,40 +1202,30 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
-        if rows.is_empty() {
+        self.insert_notifications_on(&self.pool, rows).await
+    }
+
+    async fn send_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        rows: &[NotificationInsert],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // The checkpoint goes first: a position a rival already holds delivers
+        // nothing, and the read after the rollback classifies its name.
+        if !self
+            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            tx.rollback().await?;
+            self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
+                .await?;
             return Ok(());
         }
-        // Serialize up front (fallible), then build one multi-row INSERT — the
-        // whole batch commits or fails together, and each keyed row keeps the
-        // singular path's `{key}::{destination}` at-most-once id.
-        let mut prepared = Vec::with_capacity(rows.len());
-        for r in rows {
-            let message_uuid = match &r.idempotency_key {
-                Some(k) => format!("{k}::{}", r.destination_id),
-                None => uuid::Uuid::new_v4().to_string(),
-            };
-            prepared.push((message_uuid, self.serializer.encode(&r.message)?));
-        }
-        let now = Utc::now().timestamp_millis();
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "INSERT INTO notifications
-                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms) ",
-        );
-        qb.push_values(rows.iter().zip(prepared), |mut b, (r, (uuid, encoded))| {
-            b.push_bind(uuid)
-                .push_bind(&r.destination_id)
-                .push_bind(&r.topic)
-                .push_bind(encoded)
-                .push_bind(self.serializer.name())
-                .push_bind(now);
-        });
-        qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
-        qb.build().execute(&self.pool).await.map_err(|e| {
-            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
-            dests.sort_unstable();
-            dests.dedup();
-            nonexistent_or(e, &dests.join(", "))
-        })?;
+        self.insert_notifications_on(&mut *tx, rows).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1090,7 +1244,7 @@ impl StateProvider for SqliteProvider {
 
         // A rival may already have settled this position; serve that instead.
         if let Some(recorded) = self
-            .recorded_recv(&mut *tx, workflow_id, seq, step_name)
+            .recorded_output_on(&mut *tx, workflow_id, seq, step_name)
             .await?
         {
             return Ok(Some(recorded));
@@ -1115,32 +1269,28 @@ impl StateProvider for SqliteProvider {
             // Empty now — unless a rival settled the position since the read
             // above, in which case its outcome is served, not an empty mailbox.
             return self
-                .recorded_recv(&mut *tx, workflow_id, seq, step_name)
+                .recorded_output_on(&mut *tx, workflow_id, seq, step_name)
                 .await;
         };
 
         // Checkpoint the consumed message verbatim, keeping its format so a
         // replay decodes it the same way.
-        let inserted = sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
-        .bind(workflow_id)
-        .bind(seq)
-        .bind(step_name)
-        .bind(&message)
-        .bind(&fmt)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-        if inserted == 0 {
+        let inserted = self
+            .checkpoint_on(
+                &mut *tx,
+                workflow_id,
+                seq,
+                step_name,
+                &message,
+                fmt.as_deref(),
+            )
+            .await?;
+        if !inserted {
             // Mirrors the Postgres path; IMMEDIATE holds the writer lock from
             // the read above, so a rival cannot reach this on SQLite.
             tx.rollback().await?;
             return self
-                .recorded_recv(&self.pool, workflow_id, seq, step_name)
+                .recorded_output_on(&self.pool, workflow_id, seq, step_name)
                 .await;
         }
 
@@ -1871,51 +2021,37 @@ impl StateProvider for SqliteProvider {
         value: Option<Value>,
         function_id: i32,
     ) -> Result<()> {
-        // A closed entry stores the sentinel verbatim with no serialization;
-        // user values are encoded and tagged with the serializer name.
-        let (stored, ser): (String, Option<String>) = match value {
-            Some(v) => (
-                self.serializer.encode(&v)?,
-                Some(self.serializer.name().to_string()),
-            ),
-            None => (STREAM_CLOSED_SENTINEL.to_string(), None),
-        };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.lock_streams_on(&mut tx, workflow_id).await?;
+        self.write_stream_on(&mut tx, workflow_id, key, value, function_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
-        // Check-then-append in one transaction; SQLite serializes writers, so
-        // the next offset cannot be claimed concurrently.
-        let mut tx = self.pool.begin().await?;
-
-        let closed: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM streams WHERE workflow_uuid = ? AND key = ? AND value = ? LIMIT 1",
-        )
-        .bind(workflow_id)
-        .bind(key)
-        .bind(STREAM_CLOSED_SENTINEL)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if closed.is_some() {
-            return Err(crate::error::Error::app(format!(
-                "stream `{key}` is already closed"
-            )));
+    async fn write_stream_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Lock before the checkpoint, so a rival closing the same stream is
+        // seen at its checkpoint rather than at the closed-stream check.
+        self.lock_streams_on(&mut tx, workflow_id).await?;
+        if !self
+            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            tx.rollback().await?;
+            self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
+                .await?;
+            return Ok(());
         }
-
-        sqlx::query(
-            "INSERT INTO streams (workflow_uuid, key, value, \"offset\", function_id, serialization)
-             SELECT ?, ?, ?, COALESCE(
-                 (SELECT MAX(\"offset\") FROM streams WHERE workflow_uuid = ? AND key = ?), -1
-             ) + 1, ?, ?",
-        )
-        .bind(workflow_id)
-        .bind(key)
-        .bind(&stored)
-        .bind(workflow_id)
-        .bind(key)
-        .bind(function_id)
-        .bind(&ser)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| nonexistent_or(e, workflow_id))?;
-
+        self.write_stream_on(&mut tx, workflow_id, key, value, seq)
+            .await?;
         tx.commit().await?;
         Ok(())
     }

@@ -40,6 +40,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before the caller checks the database, resolving when the `ChangeWait`
   condition is signalled. Providers without push signalling keep the default, a
   future that never resolves, and callers stay on their poll interval.
+- `StateProvider::send_from_workflow` and `write_stream_from_workflow`: a
+  workflow's send or stream write and its step checkpoint in one transaction.
+  The defaults compose the existing primitives; the built-in providers
+  override them atomically.
 
 ### Changed
 
@@ -76,6 +80,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `send`, `send_bulk`, `write_stream` and `close_stream` commit their side
+  effect and their checkpoint together. A second execution of a workflow
+  reaching the same position used to deliver or append again, and a second
+  `close_stream` failed instead of converging (#250).
+- Concurrent appends to one workflow's streams no longer collide on the
+  offset primary key: Postgres serializes them on the workflow row, and SQLite
+  opens the append transaction immediately.
 - `recv` and `get_event` take their change watch before checking the database.
   On Postgres, a message or event written between the check and the wait was
   noticed only at the 5 s backstop; a debounce producer could then time out

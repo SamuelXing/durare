@@ -1,7 +1,9 @@
 use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
-use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
+use crate::provider::{
+    ChangeWait, NotificationInsert, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED,
+};
 use crate::replay::{Divergence, Verification};
 use crate::tx::{TransactionOptions, Tx, TxBody};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -2576,9 +2578,9 @@ impl DurableContext {
     /// # }
     /// ```
     ///
-    /// Like any step side effect, the send commits before its checkpoint: a
-    /// crash in that window re-sends on replay (at-least-once). The receiving
-    /// side ([`recv`](Self::recv)) consumes exactly once.
+    /// The send and its checkpoint commit together, so a replay never re-sends
+    /// and a second execution of this workflow reaching the same position sends
+    /// nothing. The receiving side ([`recv`](Self::recv)) consumes exactly once.
     ///
     /// # Errors
     ///
@@ -2606,23 +2608,16 @@ impl DurableContext {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
                 return Ok(());
             }
+            let row = NotificationInsert {
+                destination_id,
+                topic,
+                message: encoded,
+                idempotency_key: None,
+            };
             self.provider
-                .insert_notification(&destination_id, &topic, encoded, None)
+                .send_from_workflow(&self.workflow_id, seq, "DBOS.send", &[row])
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.send",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -2701,22 +2696,9 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .insert_notifications(&rows)
+                .send_from_workflow(&self.workflow_id, seq, "DBOS.send_bulk", &rows)
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.send_bulk",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -2978,8 +2960,9 @@ impl DurableContext {
     /// Each write lands at the next offset; readers drain values in order with
     /// [`DurableEngine::read_stream`](crate::DurableEngine::read_stream).
     ///
-    /// Like any step side effect, the append commits before its checkpoint: a
-    /// crash in that window re-appends on replay (at-least-once).
+    /// The append and its checkpoint commit together, so a replay never
+    /// re-appends and a second execution of this workflow reaching the same
+    /// position appends nothing.
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
@@ -3014,22 +2997,15 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .write_stream(&self.workflow_id, &key, Some(encoded), seq)
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
+                .write_stream_from_workflow(
                     &self.workflow_id,
                     seq,
                     "DBOS.writeStream",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
+                    &key,
+                    Some(encoded),
                 )
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -3050,22 +3026,9 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .write_stream(&self.workflow_id, &key, None, seq)
+                .write_stream_from_workflow(&self.workflow_id, seq, "DBOS.closeStream", &key, None)
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.closeStream",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 

@@ -253,6 +253,17 @@ impl StateProvider for FaultProvider {
     async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
         self.inner.insert_notifications(rows).await
     }
+    async fn send_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        rows: &[NotificationInsert],
+    ) -> Result<()> {
+        self.inner
+            .send_from_workflow(workflow_id, seq, step_name, rows)
+            .await
+    }
     async fn nth_newest_completed_at(&self, threshold: i64) -> Result<Option<i64>> {
         self.inner.nth_newest_completed_at(threshold).await
     }
@@ -406,6 +417,18 @@ impl StateProvider for FaultProvider {
     ) -> Result<()> {
         self.inner
             .write_stream(workflow_id, key, value, function_id)
+            .await
+    }
+    async fn write_stream_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<()> {
+        self.inner
+            .write_stream_from_workflow(workflow_id, seq, step_name, key, value)
             .await
     }
     async fn read_stream(
