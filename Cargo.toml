@@ -114,6 +114,12 @@ fail = "0.5"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
+# OTLP export for the `telemetry` example only; the library itself depends on
+# the `tracing` facade alone. Traces over OTLP/HTTP: no gRPC stack to build.
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "internal-logs"] }
+tracing-opentelemetry = "0.34"
 # A local websocket server for the conductor client tests.
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
@@ -172,6 +178,10 @@ path = "examples/stream.rs"
 [[example]]
 name = "dependencies"
 path = "examples/dependencies.rs"
+
+[[example]]
+name = "telemetry"
+path = "examples/telemetry/main.rs"
 
 # docs.rs builds with every feature enabled so conductor (and any future gated
 # APIs) appear in the rendered docs, and with `--cfg docsrs` so the

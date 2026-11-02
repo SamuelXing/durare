@@ -1,0 +1,19 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  # Datadog: add a `datadog` exporter here (needs DD_API_KEY) and list it in
+  # the traces pipeline.
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlp/tempo]

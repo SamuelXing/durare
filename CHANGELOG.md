@@ -44,6 +44,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   workflow's send or stream write and its step checkpoint in one transaction.
   The defaults compose the existing primitives; the built-in providers
   override them atomically.
+- `telemetry` example: durare's spans exported over OTLP, with a compose stack
+  of OpenTelemetry Collector, Grafana Tempo and Grafana, and an exporting
+  section in the `observability` docs covering Grafana and Datadog.
 
 ### Changed
 
