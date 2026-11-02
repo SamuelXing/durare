@@ -158,11 +158,7 @@ impl Client {
         row.authenticated_roles = opts.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
-        row.attributes = opts
-            .attributes
-            .clone()
-            .filter(|m| !m.is_empty())
-            .map(serde_json::Value::Object);
+        row.attributes = crate::engine::attributes_for_row(&opts);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
 

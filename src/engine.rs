@@ -452,6 +452,14 @@ pub struct WorkflowOptions {
     /// Class / namespace name recorded on the row (cross-SDK metadata). Not used
     /// for routing on its own.
     pub class_name: Option<String>,
+    /// Carry the current span's W3C trace context with the workflow, so its
+    /// run — inline, queued, or recovered — parents under the caller's trace
+    /// instead of starting its own. Stored in the attributes under the
+    /// `dbos.otelContext` key the Python SDK uses; not inherited by child
+    /// workflows. See [`observability`](crate::observability).
+    #[cfg(feature = "otel")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+    pub propagate_trace_context: bool,
 }
 
 impl WorkflowOptions {
@@ -505,6 +513,15 @@ impl WorkflowOptions {
     /// Attach custom attributes (see [`WorkflowOptions::attributes`]).
     pub fn attributes(mut self, attributes: serde_json::Map<String, serde_json::Value>) -> Self {
         self.attributes = Some(attributes);
+        self
+    }
+
+    /// Carry the current trace context with the workflow (see
+    /// [`WorkflowOptions::propagate_trace_context`]).
+    #[cfg(feature = "otel")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "otel")))]
+    pub fn propagate_trace_context(mut self) -> Self {
+        self.propagate_trace_context = true;
         self
     }
 
@@ -592,6 +609,19 @@ impl<T> SendMessage<T> {
         self.idempotency_key = Some(key.into());
         self
     }
+}
+
+/// The attributes column for a new run: the caller's attributes plus, when
+/// asked, the current trace context, or `NULL` when that leaves nothing.
+pub(crate) fn attributes_for_row(opts: &WorkflowOptions) -> Option<Value> {
+    let attributes = opts.attributes.clone();
+    #[cfg(feature = "otel")]
+    let attributes = if opts.propagate_trace_context {
+        crate::otel::with_current_carrier(attributes)
+    } else {
+        attributes
+    };
+    attributes.filter(|m| !m.is_empty()).map(Value::Object)
 }
 
 /// Validate a bulk-send batch and serialize it to provider rows: duplicate
@@ -3065,13 +3095,9 @@ impl Runtime {
     /// Created at the call site so a run started from inside another traced
     /// context — a child workflow, an instrumented HTTP handler — parents
     /// under it contextually.
-    fn workflow_span(
-        &self,
-        id: &str,
-        name: &str,
-        queue: Option<&str>,
-        auth: &AuthContext,
-    ) -> tracing::Span {
+    fn workflow_span(&self, status: &WorkflowStatus) -> tracing::Span {
+        let auth = AuthContext::from_status(status);
+        let (id, name, queue) = (&status.id, &status.name, status.queue_name.as_deref());
         // Roles are recorded as a JSON array string, matching what the other
         // DBOS SDKs emit for this attribute.
         let roles = if auth.authenticated_roles.is_empty() {
@@ -3079,7 +3105,7 @@ impl Runtime {
         } else {
             serde_json::to_string(&auth.authenticated_roles).ok()
         };
-        tracing::info_span!(
+        let span = tracing::info_span!(
             "workflow",
             otel.name = %name,
             dbos.operation.type = "workflow",
@@ -3092,7 +3118,12 @@ impl Runtime {
             dbos.user.roles = roles.as_deref(),
             dbos.workflow.status = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
-        )
+        );
+        // A persisted trace context outranks the live one: the run joins the
+        // trace that started it, wherever it happens to execute.
+        #[cfg(feature = "otel")]
+        crate::otel::parent_span(&span, status.attributes.as_ref());
+        span
     }
 
     /// Build a new run's status row from `opts`, including parent and identity.
@@ -3151,11 +3182,7 @@ impl Runtime {
         row.authenticated_roles = auth.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
-        row.attributes = opts
-            .attributes
-            .clone()
-            .filter(|m| !m.is_empty())
-            .map(serde_json::Value::Object);
+        row.attributes = attributes_for_row(opts);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
         if !queued {
@@ -3199,13 +3226,7 @@ impl Runtime {
         record: WorkflowStatus,
         handler: WorkflowFn,
     ) -> JoinHandle<Result<Value>> {
-        let auth = AuthContext::from_status(&record);
-        let span = self.workflow_span(
-            &record.id,
-            &record.name,
-            record.queue_name.as_deref(),
-            &auth,
-        );
+        let span = self.workflow_span(&record);
         self.tasks
             .spawn(run_to_completion(self.clone(), handler, record, span))
     }
@@ -3654,9 +3675,7 @@ async fn queue_dispatch_loop(
                         counter.fetch_add(1, Ordering::Relaxed);
                         let run_rt = rt.clone();
                         let local_guard = RunningGuard(counter.clone());
-                        let auth = AuthContext::from_status(&wf);
-                        let span =
-                            rt.workflow_span(&wf.id, &wf.name, wf.queue_name.as_deref(), &auth);
+                        let span = rt.workflow_span(&wf);
                         rt.tasks.spawn(async move {
                             let _ = run_to_completion(run_rt, handler, wf, span).await;
                             drop(local_guard);

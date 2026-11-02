@@ -44,6 +44,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   workflow's send or stream write and its step checkpoint in one transaction.
   The defaults compose the existing primitives; the built-in providers
   override them atomically.
+- `otel` feature with `WorkflowOptions::propagate_trace_context`: the caller's
+  W3C trace context travels in the workflow's attributes under
+  `dbos.otelContext`, the key the Python SDK uses, so queued and recovered
+  runs join the caller's trace (#149).
 
 ### Changed
 

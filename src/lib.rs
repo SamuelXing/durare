@@ -150,6 +150,11 @@
 //!   (health, recovery, and workflow management for the DBOS console/conductor
 //!   and health probes), behind a feature because it pulls in the axum/hyper/tower
 //!   HTTP stack.
+//! - **`otel`** *(off by default)* — trace-context propagation
+//!   ([`WorkflowOptions::propagate_trace_context`]): a workflow carries its
+//!   caller's W3C trace context so a queued or recovered run joins the caller's
+//!   trace, behind a feature because it pulls in the OpenTelemetry API and the
+//!   `tracing-opentelemetry` bridge.
 // Render `#[doc(cfg(...))]` "available on feature X" banners on docs.rs (which
 // builds with `--cfg docsrs`, see Cargo.toml). Inert on stable and CI builds.
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -193,6 +198,8 @@ mod error;
 mod execution;
 mod handle;
 mod memory;
+#[cfg(feature = "otel")]
+mod otel;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod provider;
