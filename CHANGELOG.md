@@ -86,6 +86,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Engine and client enqueue paths share deduplication validation. Partition
   keys cannot be combined with deduplication ids, and a non-default collision
   policy requires both a deduplication id and a queue.
+- `RecordedStep`, `StepOutcome`, and `NotificationInfo` are exported from the
+  crate root. They appear in the required `StateProvider` methods
+  `get_step_result`, `record_step_result`, and `list_workflow_notifications`,
+  so a provider implemented in another crate could not compile.
 
 ## [0.5.0] - 2026-10-06
 
