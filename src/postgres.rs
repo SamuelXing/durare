@@ -2,13 +2,14 @@ use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
     is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
-    ChangeWait, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo,
-    NotificationInsert, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
-    EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
+    ChangeWait, ChangeWatch, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
+    NotificationInfo, NotificationInsert, RecordedColumns, RecordedStep, RecoveryClaim,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -40,17 +41,13 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
 /// listener task wakes them when a `NOTIFY` for that payload arrives.
 #[derive(Default)]
 struct NotifyHub {
-    waiters: Mutex<HashMap<String, WaitEntry>>,
+    waiters: Mutex<HashMap<String, Vec<Arc<Notify>>>>,
 }
 
-/// The shared wake handle for everyone waiting on one payload, plus a refcount so
-/// the entry is dropped when the last waiter leaves.
-struct WaitEntry {
-    notify: Arc<Notify>,
-    count: usize,
-}
-
-/// An active subscription on one payload; deregisters on drop.
+/// An active subscription on one payload; deregisters on drop. Each
+/// subscription owns its [`Notify`] and is woken with `notify_one`, which stores
+/// a permit when nothing is awaiting yet: a signal that lands between taking
+/// the subscription and awaiting it is kept rather than lost.
 struct Subscription {
     hub: Arc<NotifyHub>,
     payload: String,
@@ -61,13 +58,13 @@ impl NotifyHub {
     /// Register interest in `payload`, returning a [`Subscription`] whose
     /// `notify` fires when the listener sees a matching `NOTIFY` (or a reconnect).
     fn subscribe(self: &Arc<Self>, payload: String) -> Subscription {
-        let mut waiters = self.waiters.lock().unwrap();
-        let entry = waiters.entry(payload.clone()).or_insert_with(|| WaitEntry {
-            notify: Arc::new(Notify::new()),
-            count: 0,
-        });
-        entry.count += 1;
-        let notify = entry.notify.clone();
+        let notify = Arc::new(Notify::new());
+        self.waiters
+            .lock()
+            .unwrap()
+            .entry(payload.clone())
+            .or_default()
+            .push(Arc::clone(&notify));
         Subscription {
             hub: Arc::clone(self),
             payload,
@@ -77,16 +74,18 @@ impl NotifyHub {
 
     /// Wake everyone waiting on exactly `payload`.
     fn signal(&self, payload: &str) {
-        if let Some(entry) = self.waiters.lock().unwrap().get(payload) {
-            entry.notify.notify_waiters();
+        if let Some(waiters) = self.waiters.lock().unwrap().get(payload) {
+            for notify in waiters {
+                notify.notify_one();
+            }
         }
     }
 
     /// Wake every waiter — used after a listener reconnect, when a notification
     /// may have been missed and all waiters should re-check the database.
     fn signal_all(&self) {
-        for entry in self.waiters.lock().unwrap().values() {
-            entry.notify.notify_waiters();
+        for notify in self.waiters.lock().unwrap().values().flatten() {
+            notify.notify_one();
         }
     }
 }
@@ -94,9 +93,9 @@ impl NotifyHub {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let mut waiters = self.hub.waiters.lock().unwrap();
-        if let Some(entry) = waiters.get_mut(&self.payload) {
-            entry.count -= 1;
-            if entry.count == 0 {
+        if let Some(entries) = waiters.get_mut(&self.payload) {
+            entries.retain(|notify| !Arc::ptr_eq(notify, &self.notify));
+            if entries.is_empty() {
                 waiters.remove(&self.payload);
             }
         }
@@ -833,6 +832,220 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
     }
 }
 
+impl PostgresProvider {
+    /// The outcome already recorded at `(workflow_id, seq)`, read on
+    /// `executor`: what a `recv` there serves instead of consuming (a recorded
+    /// timeout is `Value::Null`), and how a lost checkpoint is classified. A
+    /// different step name at the position is a divergent replay.
+    async fn recorded_output_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<Option<Value>> {
+        let row: Option<RecordedColumns> = sqlx::query_as(&format!(
+            "SELECT function_name, output, error, serialization FROM {operation_outputs}
+                 WHERE workflow_uuid = $1 AND function_id = $2",
+            operation_outputs = self.tables.operation_outputs
+        ))
+        .bind(workflow_id)
+        .bind(seq)
+        .fetch_optional(executor)
+        .await?;
+        let Some((stored_name, output, error, fmt)) = row else {
+            return Ok(None);
+        };
+        if stored_name != step_name {
+            return Err(Error::unexpected_step(
+                workflow_id,
+                seq,
+                step_name,
+                stored_name,
+            ));
+        }
+        step_outcome_from(
+            &self.serializer,
+            fmt.as_deref(),
+            output.as_deref(),
+            error.as_deref(),
+        )?
+        .unwrap_or(StepOutcome::Output(Value::Null))
+        .into_value_result()
+        .map(Some)
+    }
+    /// Record `step_name` at `(workflow_id, seq)` on `executor` with the given
+    /// encoded output, reporting whether this call wrote it; `false` means a
+    /// rival already holds the position.
+    async fn checkpoint_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        output: &str,
+        serialization: Option<&str>,
+    ) -> Result<bool> {
+        let inserted = sqlx::query(&format!(
+            "INSERT INTO {operation_outputs}
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  completed_at_epoch_ms)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+            operation_outputs = self.tables.operation_outputs
+        ))
+        .bind(workflow_id)
+        .bind(seq)
+        .bind(step_name)
+        .bind(output)
+        .bind(serialization)
+        .bind(Utc::now().timestamp_millis())
+        .execute(executor)
+        .await?
+        .rows_affected();
+        Ok(inserted == 1)
+    }
+
+    /// [`checkpoint_on`](Self::checkpoint_on) with a null output: the record a
+    /// send or stream write leaves. It does not refresh the workflow's
+    /// executor id.
+    async fn checkpoint_null_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<bool> {
+        let output = self.serializer.encode(&Value::Null)?;
+        self.checkpoint_on(
+            executor,
+            workflow_id,
+            seq,
+            step_name,
+            &output,
+            Some(self.serializer.name()),
+        )
+        .await
+    }
+
+    /// Serialize appends to `workflow_id`'s streams on its status row: the next
+    /// offset is `MAX + 1`, and two writers computing it from one snapshot
+    /// would collide on the primary key. `NO KEY` leaves the foreign-key
+    /// checks of concurrent sends and checkpoints unblocked. A missing row is
+    /// left for the append to report through its foreign key.
+    async fn lock_streams_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: &str,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "SELECT 1 FROM {workflow_status} WHERE workflow_uuid = $1 FOR NO KEY UPDATE",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(workflow_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
+    /// [`StateProvider::insert_notifications`] on `executor`, so a workflow
+    /// send can share the transaction that checkpoints it.
+    async fn insert_notifications_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        rows: &[NotificationInsert],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // Serialize up front (fallible), then build one multi-row INSERT — the
+        // whole batch commits or fails together, and each keyed row keeps the
+        // singular path's `{key}::{destination}` at-most-once id.
+        let mut prepared = Vec::with_capacity(rows.len());
+        for r in rows {
+            let message_uuid = match &r.idempotency_key {
+                Some(k) => format!("{k}::{}", r.destination_id),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            prepared.push((message_uuid, self.serializer.encode(&r.message)?));
+        }
+        let now = Utc::now().timestamp_millis();
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+            "INSERT INTO {notifications}
+                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms) ",
+            notifications = self.tables.notifications
+        ));
+        qb.push_values(rows.iter().zip(prepared), |mut b, (r, (uuid, encoded))| {
+            b.push_bind(uuid)
+                .push_bind(&r.destination_id)
+                .push_bind(&r.topic)
+                .push_bind(encoded)
+                .push_bind(self.serializer.name())
+                .push_bind(now);
+        });
+        qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
+        qb.build().execute(executor).await.map_err(|e| {
+            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
+            dests.sort_unstable();
+            dests.dedup();
+            nonexistent_or(e, &dests.join(", "))
+        })?;
+        Ok(())
+    }
+
+    /// [`StateProvider::write_stream`] on `conn`, so a workflow write can share
+    /// the transaction that checkpoints it.
+    async fn write_stream_on(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        workflow_id: &str,
+        key: &str,
+        value: Option<Value>,
+        function_id: i32,
+    ) -> Result<()> {
+        // A closed entry stores the sentinel verbatim with no serialization;
+        // user values are encoded and tagged with the serializer name.
+        let (stored, ser): (String, Option<String>) = match value {
+            Some(v) => (
+                self.serializer.encode(&v)?,
+                Some(self.serializer.name().to_string()),
+            ),
+            None => (STREAM_CLOSED_SENTINEL.to_string(), None),
+        };
+
+        let closed: Option<i32> = sqlx::query_scalar(&format!(
+            "SELECT 1 FROM {streams} WHERE workflow_uuid = $1 AND key = $2 AND value = $3 LIMIT 1",
+            streams = self.tables.streams
+        ))
+        .bind(workflow_id)
+        .bind(key)
+        .bind(STREAM_CLOSED_SENTINEL)
+        .fetch_optional(&mut *conn)
+        .await?;
+        if closed.is_some() {
+            return Err(crate::error::Error::app(format!(
+                "stream `{key}` is already closed"
+            )));
+        }
+
+        sqlx::query(&format!("INSERT INTO {streams} (workflow_uuid, key, value, \"offset\", function_id, serialization)
+             SELECT $1, $2, $3, COALESCE(
+                 (SELECT MAX(\"offset\") FROM {streams} WHERE workflow_uuid = $1 AND key = $2), -1
+             ) + 1, $4, $5", streams = self.tables.streams),
+        )
+        .bind(workflow_id)
+        .bind(key)
+        .bind(&stored)
+        .bind(function_id)
+        .bind(&ser)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| nonexistent_or(e, workflow_id))?;
+
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl StateProvider for PostgresProvider {
     fn provider_identity(&self) -> Option<&crate::provider::ProviderIdentity> {
@@ -902,7 +1115,7 @@ impl StateProvider for PostgresProvider {
         // connect-time default, so releasing the connection changes nothing).
         self.run_migrations().await?;
         self.warn_on_legacy_empty_app_version().await;
-        // Start the LISTEN/NOTIFY listener once (it powers await_change). Spawned
+        // Start the LISTEN/NOTIFY listener once (it powers watch_change). Spawned
         // here so it only runs for a provider that has been brought up; cancelled
         // when the provider is dropped. `Relaxed` suffices: this is purely a
         // spawn-once guard — the task's inputs are moved in via `spawn` (which
@@ -925,14 +1138,11 @@ impl StateProvider for PostgresProvider {
         self.serializer.clone()
     }
 
-    async fn await_change(&self, wait: ChangeWait<'_>, within: Duration) {
-        // Subscribe before awaiting so a NOTIFY arriving during the wait wakes us;
-        // a NOTIFY in the gap before subscribing is covered by `within` (the
-        // caller re-checks the database on return).
+    fn watch_change(&self, wait: ChangeWait<'_>) -> ChangeWatch {
         let sub = self
             .notify_hub
             .subscribe(hub_key(wait.channel(), &wait.payload()));
-        let _ = tokio::time::timeout(within, sub.notify.notified()).await;
+        Box::pin(async move { sub.notify.notified().await })
     }
 
     async fn insert_workflow_status(&self, s: WorkflowStatus) -> Result<(WorkflowStatus, bool)> {
@@ -1643,41 +1853,30 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
-        if rows.is_empty() {
+        self.insert_notifications_on(&self.pool, rows).await
+    }
+
+    async fn send_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        rows: &[NotificationInsert],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // The checkpoint goes first: a position a rival already holds delivers
+        // nothing, and the read after the rollback classifies its name.
+        if !self
+            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            tx.rollback().await?;
+            self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
+                .await?;
             return Ok(());
         }
-        // Serialize up front (fallible), then build one multi-row INSERT — the
-        // whole batch commits or fails together, and each keyed row keeps the
-        // singular path's `{key}::{destination}` at-most-once id.
-        let mut prepared = Vec::with_capacity(rows.len());
-        for r in rows {
-            let message_uuid = match &r.idempotency_key {
-                Some(k) => format!("{k}::{}", r.destination_id),
-                None => uuid::Uuid::new_v4().to_string(),
-            };
-            prepared.push((message_uuid, self.serializer.encode(&r.message)?));
-        }
-        let now = Utc::now().timestamp_millis();
-        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-            "INSERT INTO {notifications}
-                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms) ",
-            notifications = self.tables.notifications
-        ));
-        qb.push_values(rows.iter().zip(prepared), |mut b, (r, (uuid, encoded))| {
-            b.push_bind(uuid)
-                .push_bind(&r.destination_id)
-                .push_bind(&r.topic)
-                .push_bind(encoded)
-                .push_bind(self.serializer.name())
-                .push_bind(now);
-        });
-        qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
-        qb.build().execute(&self.pool).await.map_err(|e| {
-            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
-            dests.sort_unstable();
-            dests.dedup();
-            nonexistent_or(e, &dests.join(", "))
-        })?;
+        self.insert_notifications_on(&mut *tx, rows).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1693,6 +1892,18 @@ impl StateProvider for PostgresProvider {
         // when several messages share a created_at millisecond.
         let mut tx = self.pool.begin().await?;
 
+        // A rival may already have settled this position; serve that instead.
+        if let Some(recorded) = self
+            .recorded_output_on(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            return Ok(Some(recorded));
+        }
+
+        // `consumed = FALSE` is restated on the row itself: when a rival took
+        // the same oldest message and commits first, this UPDATE re-evaluates
+        // against the committed row and matches nothing, instead of handing
+        // the same message out twice.
         let claimed: Option<(String, Option<String>)> = sqlx::query_as(&format!(
             "WITH oldest_entry AS (
                  SELECT message_uuid FROM {notifications}
@@ -1702,6 +1913,7 @@ impl StateProvider for PostgresProvider {
              )
              UPDATE {notifications} SET consumed = TRUE
              WHERE message_uuid = (SELECT message_uuid FROM oldest_entry)
+               AND consumed = FALSE
              RETURNING message, serialization",
             notifications = self.tables.notifications
         ))
@@ -1711,25 +1923,33 @@ impl StateProvider for PostgresProvider {
         .await?;
 
         let Some((message, fmt)) = claimed else {
-            return Ok(None);
+            // Empty now — unless a rival settled the position since the read
+            // above, in which case its outcome is served, not an empty mailbox.
+            return self
+                .recorded_output_on(&mut *tx, workflow_id, seq, step_name)
+                .await;
         };
 
         // Checkpoint the consumed message verbatim, keeping its format so a
         // replay decodes it the same way.
-        sqlx::query(&format!(
-            "INSERT INTO {operation_outputs}
-                 (workflow_uuid, function_id, function_name, output, serialization)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            operation_outputs = self.tables.operation_outputs
-        ))
-        .bind(workflow_id)
-        .bind(seq)
-        .bind(step_name)
-        .bind(&message)
-        .bind(&fmt)
-        .execute(&mut *tx)
-        .await?;
+        let inserted = self
+            .checkpoint_on(
+                &mut *tx,
+                workflow_id,
+                seq,
+                step_name,
+                &message,
+                fmt.as_deref(),
+            )
+            .await?;
+        if !inserted {
+            // A rival checkpointed this position after the read above: give
+            // the message back and serve the rival's outcome.
+            tx.rollback().await?;
+            return self
+                .recorded_output_on(&self.pool, workflow_id, seq, step_name)
+                .await;
+        }
 
         tx.commit().await?;
         Ok(Some(serialize::decode(
@@ -2507,49 +2727,37 @@ impl StateProvider for PostgresProvider {
         value: Option<Value>,
         function_id: i32,
     ) -> Result<()> {
-        // A closed entry stores the sentinel verbatim with no serialization;
-        // user values are encoded and tagged with the serializer name.
-        let (stored, ser): (String, Option<String>) = match value {
-            Some(v) => (
-                self.serializer.encode(&v)?,
-                Some(self.serializer.name().to_string()),
-            ),
-            None => (STREAM_CLOSED_SENTINEL.to_string(), None),
-        };
-
-        // Check-then-append in one transaction so the next offset cannot be
-        // claimed by a concurrent writer.
         let mut tx = self.pool.begin().await?;
+        self.lock_streams_on(&mut tx, workflow_id).await?;
+        self.write_stream_on(&mut tx, workflow_id, key, value, function_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
-        let closed: Option<i32> = sqlx::query_scalar(&format!(
-            "SELECT 1 FROM {streams} WHERE workflow_uuid = $1 AND key = $2 AND value = $3 LIMIT 1",
-            streams = self.tables.streams
-        ))
-        .bind(workflow_id)
-        .bind(key)
-        .bind(STREAM_CLOSED_SENTINEL)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if closed.is_some() {
-            return Err(crate::error::Error::app(format!(
-                "stream `{key}` is already closed"
-            )));
+    async fn write_stream_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        // Lock before the checkpoint, so a rival closing the same stream is
+        // seen at its checkpoint rather than at the closed-stream check.
+        self.lock_streams_on(&mut tx, workflow_id).await?;
+        if !self
+            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            tx.rollback().await?;
+            self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
+                .await?;
+            return Ok(());
         }
-
-        sqlx::query(&format!("INSERT INTO {streams} (workflow_uuid, key, value, \"offset\", function_id, serialization)
-             SELECT $1, $2, $3, COALESCE(
-                 (SELECT MAX(\"offset\") FROM {streams} WHERE workflow_uuid = $1 AND key = $2), -1
-             ) + 1, $4, $5", streams = self.tables.streams),
-        )
-        .bind(workflow_id)
-        .bind(key)
-        .bind(&stored)
-        .bind(function_id)
-        .bind(&ser)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| nonexistent_or(e, workflow_id))?;
-
+        self.write_stream_on(&mut tx, workflow_id, key, value, seq)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3576,4 +3784,43 @@ fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
         cols = cols.replacen("output,", "NULL AS output,", 1);
     }
     std::borrow::Cow::Owned(cols)
+}
+
+#[cfg(test)]
+mod notify_hub_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_signal_before_the_wait_is_kept() {
+        let hub = Arc::new(NotifyHub::default());
+        let sub = hub.subscribe("k".into());
+        hub.signal("k");
+        tokio::time::timeout(Duration::from_millis(100), sub.notify.notified())
+            .await
+            .expect("the permit stored by the early signal completes the wait");
+    }
+
+    #[tokio::test]
+    async fn every_subscriber_on_a_payload_wakes() {
+        let hub = Arc::new(NotifyHub::default());
+        let first = hub.subscribe("k".into());
+        let second = hub.subscribe("k".into());
+        hub.signal("k");
+        for sub in [&first, &second] {
+            tokio::time::timeout(Duration::from_millis(100), sub.notify.notified())
+                .await
+                .expect("each subscription has its own permit");
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_subscription_deregisters_it() {
+        let hub = Arc::new(NotifyHub::default());
+        let kept = hub.subscribe("k".into());
+        let dropped = hub.subscribe("k".into());
+        drop(dropped);
+        assert_eq!(hub.waiters.lock().unwrap()["k"].len(), 1);
+        drop(kept);
+        assert!(hub.waiters.lock().unwrap().is_empty());
+    }
 }

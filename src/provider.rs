@@ -116,7 +116,7 @@ pub(crate) const WORKFLOW_EVENTS_CHANNEL: &str = "dbos_workflow_events_channel";
 /// A condition a blocked `recv`/`get_event` wants to be nudged about, so it can
 /// re-check the database promptly instead of waiting out its poll interval. A
 /// backend with push signalling (Postgres `LISTEN`/`NOTIFY`) maps each variant to
-/// its channel + payload; others ignore it and simply sleep.
+/// its channel + payload; others ignore it and leave the caller to poll.
 #[derive(Clone, Copy, Debug)]
 pub enum ChangeWait<'a> {
     /// A notification delivered to `workflow_id`'s mailbox on `topic`.
@@ -155,6 +155,35 @@ impl ChangeWait<'_> {
         }
     }
 }
+
+/// A registered interest in a [`ChangeWait`] condition, taken with
+/// [`StateProvider::watch_change`]. Resolves once the condition is signalled.
+pub type ChangeWatch = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// Whether `(workflow_id, seq)` already holds `step_name`'s checkpoint, for the
+/// default compositions on [`StateProvider`]; a different name there is a
+/// divergent replay.
+async fn step_already_recorded<P: StateProvider + ?Sized>(
+    provider: &P,
+    workflow_id: &str,
+    seq: i32,
+    step_name: &str,
+) -> Result<bool> {
+    match provider.get_step_result(workflow_id, seq).await? {
+        None => Ok(false),
+        Some(step) if step.name == step_name => Ok(true),
+        Some(step) => Err(Error::unexpected_step(
+            workflow_id,
+            seq,
+            step_name,
+            step.name,
+        )),
+    }
+}
+
+/// The `(function_name, output, error, serialization)` columns of one
+/// `operation_outputs` row, as the SQL backends read them back.
+pub(crate) type RecordedColumns = (String, Option<String>, Option<String>, Option<String>);
 
 /// Group ordered `(key, value, serialization)` stream rows — sorted by key then
 /// offset — into one `(key, decoded values)` entry per key, decoding each value
@@ -1459,20 +1488,32 @@ pub trait StateProvider: Send + Sync {
     /// Whether this backend pushes change signals (Postgres `LISTEN`/`NOTIFY`),
     /// so a blocked `recv`/`get_event` is woken as soon as the row it waits for
     /// is written rather than only by polling. Callers that get `true` can wait
-    /// on a long backstop interval and rely on [`await_change`](Self::await_change)
+    /// on a long backstop interval and rely on [`watch_change`](Self::watch_change)
     /// for promptness; `false` means they must poll at a short interval.
     fn supports_listen_notify(&self) -> bool {
         false
     }
 
-    /// Wait up to `within` for a hint that `wait`'s condition may have changed,
-    /// returning early when a matching change is signalled. The wake is only a
-    /// hint: the caller must re-check the database (a signal can be missed in the
-    /// gap between the caller's last check and subscribing — the bounded `within`
-    /// is the backstop). Backends without push signalling just sleep.
-    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
+    /// Register interest in `wait`'s condition, returning a future that resolves
+    /// once a matching change is signalled. Take the watch **before** checking
+    /// the database and await it only after the check comes back empty: a
+    /// signal that lands in between is kept. The wake is only a hint — the
+    /// caller re-checks the database and bounds every wait by its poll
+    /// interval. A backend without push signalling returns a future that never
+    /// resolves.
+    fn watch_change(&self, wait: ChangeWait<'_>) -> ChangeWatch {
         let _ = wait;
-        tokio::time::sleep(within).await;
+        Box::pin(std::future::pending())
+    }
+
+    /// Wait up to `within` for `wait`'s condition to be signalled. Superseded by
+    /// [`watch_change`](Self::watch_change).
+    #[deprecated(
+        since = "0.6.0",
+        note = "take `watch_change` before checking the database"
+    )]
+    async fn await_change(&self, wait: ChangeWait<'_>, within: std::time::Duration) {
+        let _ = tokio::time::timeout(within, self.watch_change(wait)).await;
     }
 
     /// Idempotently insert a workflow row. If `status.id` already exists, the
@@ -1674,12 +1715,48 @@ pub trait StateProvider: Send + Sync {
         Ok(())
     }
 
+    /// Deliver `rows` as step `(seq, step_name)` of `workflow_id`: the batch and
+    /// its checkpoint commit together or not at all. A position already
+    /// recorded delivers nothing (another execution or an earlier attempt got
+    /// there first); a different step name recorded there is
+    /// [`Error::UnexpectedStep`](crate::Error::UnexpectedStep). Delivery itself
+    /// follows [`insert_notifications`](Self::insert_notifications), and the
+    /// checkpoint does not refresh the workflow's executor id.
+    ///
+    /// The default composes the non-transactional primitives, which leaves a
+    /// double-run free to deliver twice between its read and its checkpoint;
+    /// the built-in providers override it with one transaction.
+    async fn send_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        rows: &[NotificationInsert],
+    ) -> Result<()> {
+        if step_already_recorded(self, workflow_id, seq, step_name).await? {
+            return Ok(());
+        }
+        self.insert_notifications(rows).await?;
+        self.record_step_result(workflow_id, seq, step_name, Value::Null, None, None, None)
+            .await
+            .map(|_| ())
+    }
+
     /// Atomically claim the **oldest unconsumed** message for
     /// `(workflow_id, topic)` and record it as the step checkpoint
     /// `(workflow_id, seq)` in the same transaction — if claiming and
     /// checkpointing were separate, a crash between them would lose the
     /// message. Returns the message, or `None` when the mailbox is empty
     /// (nothing is recorded in that case).
+    ///
+    /// An outcome already recorded at `(workflow_id, seq)` wins: another
+    /// execution of this workflow took delivery at this position, or an
+    /// earlier attempt committed. Nothing further is consumed and that output
+    /// is returned, `Value::Null` for a recorded timeout. Serving it is exactly
+    /// a replay: unlike a step body, a claim that lost to a rival's checkpoint
+    /// is rolled back, so no side effect escapes and there is nothing to
+    /// conflict over. A different step name recorded there is a divergent
+    /// replay, [`Error::UnexpectedStep`](crate::Error::UnexpectedStep).
     async fn consume_notification(
         &self,
         workflow_id: &str,
@@ -2092,7 +2169,9 @@ pub trait StateProvider: Send + Sync {
     /// step's `function_id`. `value` is the user value to encode and store;
     /// `None` writes the close sentinel instead, which seals the stream. Errors
     /// if the stream is already closed. The destination workflow's existence is
-    /// enforced by the streams foreign key.
+    /// enforced by the streams foreign key. A workflow body writes through
+    /// [`write_stream_from_workflow`](Self::write_stream_from_workflow), which
+    /// checkpoints the step in the same transaction.
     async fn write_stream(
         &self,
         workflow_id: &str,
@@ -2100,6 +2179,31 @@ pub trait StateProvider: Send + Sync {
         value: Option<Value>,
         function_id: i32,
     ) -> Result<()>;
+
+    /// Append to (or, with `None`, close) stream `(workflow_id, key)` as step
+    /// `(seq, step_name)` of `workflow_id`: the entry and its checkpoint commit
+    /// together or not at all. A position already recorded appends nothing, so
+    /// a second execution closing an already closed stream converges instead
+    /// of failing; a different step name recorded there is
+    /// [`Error::UnexpectedStep`](crate::Error::UnexpectedStep). The entry itself
+    /// follows [`write_stream`](Self::write_stream). Default and override as
+    /// for [`send_from_workflow`](Self::send_from_workflow).
+    async fn write_stream_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Option<Value>,
+    ) -> Result<()> {
+        if step_already_recorded(self, workflow_id, seq, step_name).await? {
+            return Ok(());
+        }
+        self.write_stream(workflow_id, key, value, seq).await?;
+        self.record_step_result(workflow_id, seq, step_name, Value::Null, None, None, None)
+            .await
+            .map(|_| ())
+    }
 
     /// Read stream `(workflow_id, key)` entries with `offset >= from_offset` in
     /// order, decoding each per its stored serialization. Returns the decoded

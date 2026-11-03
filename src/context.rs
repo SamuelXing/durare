@@ -1,7 +1,9 @@
 use crate::engine::{Runtime, WorkflowOptions};
 use crate::error::{panic_message, Error, ErrorCode, Result};
 use crate::handle::WorkflowHandle;
-use crate::provider::{ChangeWait, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED};
+use crate::provider::{
+    ChangeWait, NotificationInsert, StateProvider, StepOutcome, WorkflowStatus, STATUS_CANCELLED,
+};
 use crate::replay::{Divergence, Verification};
 use crate::tx::{TransactionOptions, Tx, TxBody};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -2576,9 +2578,9 @@ impl DurableContext {
     /// # }
     /// ```
     ///
-    /// Like any step side effect, the send commits before its checkpoint: a
-    /// crash in that window re-sends on replay (at-least-once). The receiving
-    /// side ([`recv`](Self::recv)) consumes exactly once.
+    /// The send and its checkpoint commit together, so a replay never re-sends
+    /// and a second execution of this workflow reaching the same position sends
+    /// nothing. The receiving side ([`recv`](Self::recv)) consumes exactly once.
     ///
     /// # Errors
     ///
@@ -2606,23 +2608,16 @@ impl DurableContext {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
                 return Ok(());
             }
+            let row = NotificationInsert {
+                destination_id,
+                topic,
+                message: encoded,
+                idempotency_key: None,
+            };
             self.provider
-                .insert_notification(&destination_id, &topic, encoded, None)
+                .send_from_workflow(&self.workflow_id, seq, "DBOS.send", &[row])
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.send",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -2701,22 +2696,9 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .insert_notifications(&rows)
+                .send_from_workflow(&self.workflow_id, seq, "DBOS.send_bulk", &rows)
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.send_bulk",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -2743,8 +2725,10 @@ impl DurableContext {
     ///
     /// # Errors
     ///
-    /// A timeout is **not** an error — it is `Ok(None)`. Fails on storage or
-    /// decode errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
+    /// A timeout is **not** an error — it is `Ok(None)`. A message whose
+    /// payload serializes to JSON `null` (such as `()`) is recorded the same way
+    /// as a timeout and is also returned as `None`. Fails on storage or decode
+    /// errors, [`Error::Cancelled`], or [`Error::UnexpectedStep`] on a
     /// divergent replay.
     #[doc(alias = "signal")]
     pub fn recv<'a, T: DeserializeOwned + Send + 'a>(
@@ -2767,13 +2751,21 @@ impl DurableContext {
 
             let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
             loop {
+                // Watch before checking, so a message written between the check
+                // and the wait wakes the wait instead of waiting out the backstop.
+                let changed = self.provider.watch_change(ChangeWait::Notification {
+                    workflow_id: &self.workflow_id,
+                    topic: &topic,
+                });
                 if let Some(msg) = self
                     .provider
                     .consume_notification(&self.workflow_id, &topic, seq, "DBOS.recv")
                     .await
                     .map_err(|error| self.execution.record(error))?
                 {
-                    return self.recorded_value(StepOutcome::Output(msg)).map(Some);
+                    // The position's settled outcome: taken now, or recorded
+                    // by a rival execution first (`Null` is a timeout).
+                    return self.recorded_value(StepOutcome::Output(msg));
                 }
 
                 // Mailbox empty: fix the durable deadline (first miss only), then
@@ -2802,15 +2794,7 @@ impl DurableContext {
                     return Ok(None);
                 }
                 let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-                self.provider
-                    .await_change(
-                        ChangeWait::Notification {
-                            workflow_id: &self.workflow_id,
-                            topic: &topic,
-                        },
-                        remaining.min(self.wait_interval()),
-                    )
-                    .await;
+                let _ = tokio::time::timeout(remaining.min(self.wait_interval()), changed).await;
             }
         })
     }
@@ -2914,6 +2898,12 @@ impl DurableContext {
 
             let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
             loop {
+                // Watch before checking, so an event set between the check and
+                // the wait wakes the wait instead of waiting out the backstop.
+                let changed = self.provider.watch_change(ChangeWait::Event {
+                    workflow_id: &target_workflow_id,
+                    key: &key,
+                });
                 if let Some(value) = self
                     .provider
                     .get_event_value(&target_workflow_id, &key)
@@ -2960,15 +2950,7 @@ impl DurableContext {
                     return Ok(None);
                 }
                 let remaining = (deadline - now).to_std().unwrap_or(Duration::ZERO);
-                self.provider
-                    .await_change(
-                        ChangeWait::Event {
-                            workflow_id: &target_workflow_id,
-                            key: &key,
-                        },
-                        remaining.min(self.wait_interval()),
-                    )
-                    .await;
+                let _ = tokio::time::timeout(remaining.min(self.wait_interval()), changed).await;
             }
         })
     }
@@ -2978,8 +2960,9 @@ impl DurableContext {
     /// Each write lands at the next offset; readers drain values in order with
     /// [`DurableEngine::read_stream`](crate::DurableEngine::read_stream).
     ///
-    /// Like any step side effect, the append commits before its checkpoint: a
-    /// crash in that window re-appends on replay (at-least-once).
+    /// The append and its checkpoint commit together, so a replay never
+    /// re-appends and a second execution of this workflow reaching the same
+    /// position appends nothing.
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
@@ -3014,22 +2997,15 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .write_stream(&self.workflow_id, &key, Some(encoded), seq)
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
+                .write_stream_from_workflow(
                     &self.workflow_id,
                     seq,
                     "DBOS.writeStream",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
+                    &key,
+                    Some(encoded),
                 )
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -3050,22 +3026,9 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .write_stream(&self.workflow_id, &key, None, seq)
+                .write_stream_from_workflow(&self.workflow_id, seq, "DBOS.closeStream", &key, None)
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.closeStream",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -3134,9 +3097,9 @@ impl DurableContext {
 
     /// How long a blocked `recv`/`get_event` waits before re-checking the
     /// database. On a backend with push wake-ups (Postgres `LISTEN`/`NOTIFY`)
-    /// this is just a long backstop — [`StateProvider::await_change`] returns as
-    /// soon as the awaited row is written — so we poll rarely; otherwise it is
-    /// the short polling interval.
+    /// this is just a long backstop — the [`StateProvider::watch_change`] taken
+    /// before each check resolves as soon as the awaited row is written — so we
+    /// poll rarely; otherwise it is the short polling interval.
     fn wait_interval(&self) -> Duration {
         if self.provider.supports_listen_notify() {
             LISTEN_NOTIFY_BACKSTOP
@@ -3151,8 +3114,9 @@ impl DurableContext {
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Backstop re-check interval on a backend with push wake-ups (Postgres
-/// `LISTEN`/`NOTIFY`): the await returns promptly when the row is written, so we
-/// only fall back to a database re-check this often (covering a missed signal).
+/// `LISTEN`/`NOTIFY`): the watch resolves promptly when the row is written, so we
+/// only fall back to a database re-check this often (covering a signal lost to a
+/// listener reconnect).
 const LISTEN_NOTIFY_BACKSTOP: Duration = Duration::from_secs(5);
 
 /// Prefix on the `function_name` of a patch marker recorded in `operation_outputs`.

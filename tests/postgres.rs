@@ -5,7 +5,7 @@
 //!   createdb durare_test && DATABASE_URL=postgres://localhost/durare_test cargo test --test postgres
 
 use durare::{
-    DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
+    ChangeWait, DurableContext, DurableEngine, Error, ErrorCode, ListFilter, PortableWorkflowError,
     PostgresProvider, RateLimiter, Result, ScheduledInput, Serializer, StateProvider,
     TransactionOptions, WorkflowOptions, WorkflowQueue, WorkflowStatus, STATUS_PENDING,
 };
@@ -2617,6 +2617,50 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
         elapsed < Duration::from_secs(2),
         "recv should wake via NOTIFY, not the backstop (took {elapsed:?})"
     );
+
+    engine
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
+    Ok(())
+}
+
+/// A change watch taken before the database check keeps a NOTIFY delivered
+/// before anything awaits it: a message written in the gap between a waiter's
+/// check and its wait wakes the wait at once rather than at the backstop.
+#[tokio::test]
+async fn pg_change_watch_keeps_a_signal_delivered_before_the_wait() -> Result<()> {
+    let Some(url) = database_url() else {
+        eprintln!(
+            "skipping pg_change_watch_keeps_a_signal_delivered_before_the_wait: DATABASE_URL unset"
+        );
+        return Ok(());
+    };
+    let id = format!("wf-watch-{}", uuid::Uuid::new_v4());
+
+    let provider = Arc::new(PostgresProvider::connect(&url).await?);
+    assert!(provider.supports_listen_notify());
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("sink", |_ctx: DurableContext, _: ()| async move {
+        Ok::<_, Error>(())
+    });
+    // A completed destination that can still receive messages.
+    engine
+        .start::<_, ()>("sink", (), WorkflowOptions::with_id(&id))
+        .await?
+        .result()
+        .await?;
+
+    let watch = provider.watch_change(ChangeWait::Notification {
+        workflow_id: &id,
+        topic: "topic",
+    });
+    engine.send(&id, "hello".to_string(), "topic").await?;
+    // Let the listener deliver the NOTIFY while nothing is awaiting the watch.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    tokio::time::timeout(Duration::from_secs(2), watch)
+        .await
+        .expect("the watch resolves from the kept signal, not the 5 s backstop");
 
     engine
         .delete_workflows(std::slice::from_ref(&id), false)
