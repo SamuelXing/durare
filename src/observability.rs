@@ -111,7 +111,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let exporter = opentelemetry_otlp::SpanExporter::builder()
 //!     .with_http()
-//!     .with_endpoint("http://localhost:4318")
+//!     .with_endpoint("http://localhost:4318/v1/traces")
 //!     .build()?;
 //! let provider = SdkTracerProvider::builder()
 //!     .with_batch_exporter(exporter)
