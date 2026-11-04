@@ -44,6 +44,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   workflow's send or stream write and its step checkpoint in one transaction.
   The defaults compose the existing primitives; the built-in providers
   override them atomically.
+- `StateProvider::set_event_from_workflow` and
+  `set_workflow_attributes_from_workflow`: a workflow's event set or attribute
+  replacement and its step checkpoint in one transaction. Defaults and
+  overrides as for `send_from_workflow`.
 - `telemetry` example: durare's spans exported over OTLP, with a compose stack
   of OpenTelemetry Collector, Grafana Tempo and Grafana, and an exporting
   section in the `observability` docs covering Grafana and Datadog.
@@ -91,6 +95,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   effect and their checkpoint together. A second execution of a workflow
   reaching the same position used to deliver or append again, and a second
   `close_stream` failed instead of converging (#250).
+- `set_event` and `set_workflow_attributes` commit their write and their
+  checkpoint together. An execution lagging behind another used to put back
+  the value it had computed after a later position had already replaced it,
+  and nothing reported the regression (#251).
 - Concurrent appends to one workflow's streams no longer collide on the
   offset primary key: Postgres serializes them on the workflow row, and SQLite
   opens the append transaction immediately.

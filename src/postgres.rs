@@ -928,6 +928,30 @@ impl PostgresProvider {
         .await
     }
 
+    /// Write step `(seq, step_name)` of `workflow_id`'s null checkpoint on
+    /// `tx` before anything else, so the side effect the caller adds next
+    /// commits with it or not at all. A position a rival already holds hands
+    /// back `None`: the transaction is rolled back, the recorded name checked,
+    /// and the caller has nothing left to do.
+    async fn claim_step<'c>(
+        &self,
+        mut tx: sqlx::Transaction<'c, Postgres>,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+    ) -> Result<Option<sqlx::Transaction<'c, Postgres>>> {
+        if self
+            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
+            .await?
+        {
+            return Ok(Some(tx));
+        }
+        tx.rollback().await?;
+        self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
+            .await?;
+        Ok(None)
+    }
+
     /// Serialize appends to `workflow_id`'s streams on its status row: the next
     /// offset is `MAX + 1`, and two writers computing it from one snapshot
     /// would collide on the primary key. `NO KEY` leaves the foreign-key
@@ -1042,6 +1066,59 @@ impl PostgresProvider {
         .await
         .map_err(|e| nonexistent_or(e, workflow_id))?;
 
+        Ok(())
+    }
+
+    /// [`StateProvider::upsert_event`] on `executor`, so a workflow set can
+    /// share the transaction that checkpoints it.
+    async fn upsert_event_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        workflow_id: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "INSERT INTO {workflow_events} (workflow_uuid, key, value, serialization)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (workflow_uuid, key)
+             DO UPDATE SET value = EXCLUDED.value, serialization = EXCLUDED.serialization",
+            workflow_events = self.tables.workflow_events
+        ))
+        .bind(workflow_id)
+        .bind(key)
+        .bind(self.serializer.encode(&value)?)
+        .bind(self.serializer.name())
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    /// [`StateProvider::set_workflow_attributes`] on `executor`, so a workflow
+    /// replacement can share the transaction that checkpoints it.
+    async fn set_workflow_attributes_on<'e, E: sqlx::PgExecutor<'e>>(
+        &self,
+        executor: E,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        // Replace-not-merge; an empty map clears to NULL (the reference shape).
+        let value = attributes
+            .filter(|m| !m.is_empty())
+            .map(|m| Value::Object(m.clone()));
+        let res = sqlx::query(&format!(
+            "UPDATE {workflow_status} SET attributes = $2, updated_at = $3
+             WHERE workflow_uuid = $1",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(id)
+        .bind(value)
+        .bind(Utc::now().timestamp_millis())
+        .execute(executor)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(Error::nonexistent_workflow(id));
+        }
         Ok(())
     }
 }
@@ -1863,18 +1940,10 @@ impl StateProvider for PostgresProvider {
         step_name: &str,
         rows: &[NotificationInsert],
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-        // The checkpoint goes first: a position a rival already holds delivers
-        // nothing, and the read after the rollback classifies its name.
-        if !self
-            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
-            .await?
-        {
-            tx.rollback().await?;
-            self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
-                .await?;
+        let tx = self.pool.begin().await?;
+        let Some(mut tx) = self.claim_step(tx, workflow_id, seq, step_name).await? else {
             return Ok(());
-        }
+        };
         self.insert_notifications_on(&mut *tx, rows).await?;
         tx.commit().await?;
         Ok(())
@@ -1960,19 +2029,25 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
-        sqlx::query(&format!(
-            "INSERT INTO {workflow_events} (workflow_uuid, key, value, serialization)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (workflow_uuid, key)
-             DO UPDATE SET value = EXCLUDED.value, serialization = EXCLUDED.serialization",
-            workflow_events = self.tables.workflow_events
-        ))
-        .bind(workflow_id)
-        .bind(key)
-        .bind(self.serializer.encode(&value)?)
-        .bind(self.serializer.name())
-        .execute(&self.pool)
-        .await?;
+        self.upsert_event_on(&self.pool, workflow_id, key, value)
+            .await
+    }
+
+    async fn set_event_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        let tx = self.pool.begin().await?;
+        let Some(mut tx) = self.claim_step(tx, workflow_id, seq, step_name).await? else {
+            return Ok(());
+        };
+        self.upsert_event_on(&mut *tx, workflow_id, key, value)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2372,23 +2447,25 @@ impl StateProvider for PostgresProvider {
         id: &str,
         attributes: Option<&serde_json::Map<String, Value>>,
     ) -> Result<()> {
-        // Replace-not-merge; an empty map clears to NULL (the reference shape).
-        let value = attributes
-            .filter(|m| !m.is_empty())
-            .map(|m| Value::Object(m.clone()));
-        let res = sqlx::query(&format!(
-            "UPDATE {workflow_status} SET attributes = $2, updated_at = $3
-             WHERE workflow_uuid = $1",
-            workflow_status = self.tables.workflow_status
-        ))
-        .bind(id)
-        .bind(value)
-        .bind(Utc::now().timestamp_millis())
-        .execute(&self.pool)
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(Error::nonexistent_workflow(id));
-        }
+        self.set_workflow_attributes_on(&self.pool, id, attributes)
+            .await
+    }
+
+    async fn set_workflow_attributes_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        let tx = self.pool.begin().await?;
+        let Some(mut tx) = self.claim_step(tx, workflow_id, seq, step_name).await? else {
+            return Ok(());
+        };
+        self.set_workflow_attributes_on(&mut *tx, id, attributes)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2747,15 +2824,9 @@ impl StateProvider for PostgresProvider {
         // Lock before the checkpoint, so a rival closing the same stream is
         // seen at its checkpoint rather than at the closed-stream check.
         self.lock_streams_on(&mut tx, workflow_id).await?;
-        if !self
-            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
-            .await?
-        {
-            tx.rollback().await?;
-            self.recorded_output_on(&self.pool, workflow_id, seq, step_name)
-                .await?;
+        let Some(mut tx) = self.claim_step(tx, workflow_id, seq, step_name).await? else {
             return Ok(());
-        }
+        };
         self.write_stream_on(&mut tx, workflow_id, key, value, seq)
             .await?;
         tx.commit().await?;

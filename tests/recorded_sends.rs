@@ -1,10 +1,7 @@
 //! A workflow's send or stream write commits with its checkpoint, so a
 //! position that already holds a recorded outcome delivers or appends
 //! nothing more, on every provider.
-use durare::{
-    ErrorCode, InMemoryProvider, NotificationInsert, Result, StateProvider, WorkflowStatus,
-    STATUS_PENDING,
-};
+use durare::{ErrorCode, InMemoryProvider, NotificationInsert, Result, StateProvider};
 use serde_json::{json, Value};
 use std::sync::Arc;
 mod common;
@@ -34,9 +31,7 @@ async fn write(db: &dyn StateProvider, seq: i32, name: &str, value: Option<&str>
 }
 
 async fn record(db: &dyn StateProvider, seq: i32, name: &str) -> Result<()> {
-    db.record_step_result(SENDER, seq, name, Value::Null, None, None, None)
-        .await
-        .map(|_| ())
+    common::record_null(db, SENDER, seq, name).await
 }
 
 /// Drain the destination mailbox, consuming at successive positions from
@@ -55,18 +50,7 @@ async fn delivered(db: &dyn StateProvider, cursor: &mut i32) -> Result<Vec<Value
 
 async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
     let db = db.as_ref();
-    db.init().await?;
-    for id in [SENDER, DEST] {
-        db.insert_workflow_status(WorkflowStatus::new(
-            id,
-            "wf",
-            json!(null),
-            STATUS_PENDING,
-            "executor",
-            "version",
-        ))
-        .await?;
-    }
+    common::seed_pending(db, &[SENDER, DEST]).await?;
 
     // --- send ---
     let mut inbox = 0;

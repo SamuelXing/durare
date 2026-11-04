@@ -470,6 +470,24 @@ impl StateProvider for InMemoryProvider {
         Ok(())
     }
 
+    async fn set_event_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if recorded_at(&g, workflow_id, seq, step_name)?.is_some() {
+            return Ok(());
+        }
+        g.events
+            .insert((workflow_id.to_string(), key.to_string()), value);
+        checkpoint(&mut g, workflow_id, seq, step_name, Value::Null);
+        Ok(())
+    }
+
     async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>> {
         let g = self.inner.lock().await;
         Ok(g.events
@@ -942,14 +960,23 @@ impl StateProvider for InMemoryProvider {
         attributes: Option<&serde_json::Map<String, Value>>,
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
-        let Some(row) = g.workflows.get_mut(id) else {
-            return Err(Error::nonexistent_workflow(id));
-        };
-        // Replace-not-merge; an empty map clears (the reference shape).
-        row.attributes = attributes
-            .filter(|m| !m.is_empty())
-            .map(|m| Value::Object(m.clone()));
-        row.updated_at = Utc::now();
+        replace_attributes(&mut g, id, attributes)
+    }
+
+    async fn set_workflow_attributes_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        id: &str,
+        attributes: Option<&serde_json::Map<String, Value>>,
+    ) -> Result<()> {
+        let mut g = self.inner.lock().await;
+        if recorded_at(&g, workflow_id, seq, step_name)?.is_some() {
+            return Ok(());
+        }
+        replace_attributes(&mut g, id, attributes)?;
+        checkpoint(&mut g, workflow_id, seq, step_name, Value::Null);
         Ok(())
     }
 
@@ -1819,6 +1846,24 @@ fn push_notifications(g: &mut Inner, rows: &[crate::provider::NotificationInsert
             created_at_ms: now,
         });
     }
+    Ok(())
+}
+
+/// [`StateProvider::set_workflow_attributes`] under a held lock, so a workflow
+/// replacement can share the critical section that checkpoints it.
+fn replace_attributes(
+    g: &mut Inner,
+    id: &str,
+    attributes: Option<&serde_json::Map<String, Value>>,
+) -> Result<()> {
+    let Some(row) = g.workflows.get_mut(id) else {
+        return Err(Error::nonexistent_workflow(id));
+    };
+    // Replace-not-merge; an empty map clears (the reference shape).
+    row.attributes = attributes
+        .filter(|m| !m.is_empty())
+        .map(|m| Value::Object(m.clone()));
+    row.updated_at = Utc::now();
     Ok(())
 }
 

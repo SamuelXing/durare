@@ -2649,22 +2649,15 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .set_workflow_attributes(&id, attributes.as_ref())
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
+                .set_workflow_attributes_from_workflow(
                     &self.workflow_id,
                     seq,
                     "DBOS.updateWorkflowAttributes",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
+                    &id,
+                    attributes.as_ref(),
                 )
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
@@ -2832,22 +2825,9 @@ impl DurableContext {
                 return Ok(());
             }
             self.provider
-                .upsert_event(&self.workflow_id, &key, encoded)
+                .set_event_from_workflow(&self.workflow_id, seq, "DBOS.setEvent", &key, encoded)
                 .await
-                .map_err(|error| self.execution.record(error))?;
-            self.provider
-                .record_step_result(
-                    &self.workflow_id,
-                    seq,
-                    "DBOS.setEvent",
-                    Value::Null,
-                    None,
-                    None,
-                    Some(self.runtime.executor_id()),
-                )
-                .await
-                .map_err(|error| self.execution.record(error))?;
-            Ok(())
+                .map_err(|error| self.execution.record(error))
         })
     }
 
