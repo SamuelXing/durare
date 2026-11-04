@@ -123,8 +123,8 @@ durare = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-The repository ships eleven self-contained examples, one per primitive plus the
-dependency-injection pattern:
+The repository ships twelve examples, one per primitive plus dependency
+injection and tracing export:
 
 | Example | Shows |
 | --- | --- |
@@ -139,6 +139,7 @@ dependency-injection pattern:
 | `subworkflow` | child-workflow fan-out |
 | `stream` | live-tailed progress feed |
 | `dependencies` | dependency injection: deps in a global, read inside steps |
+| `telemetry` | OTLP trace export; compose stack with Tempo and Grafana |
 
 ```bash
 cargo run --example saga          # in-memory, no database needed

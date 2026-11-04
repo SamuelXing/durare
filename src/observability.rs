@@ -106,18 +106,34 @@
 //! # }
 //! ```
 //!
+//! # Exporting over OpenTelemetry
+//!
 //! For OpenTelemetry export, bridge the same spans with
 //! [`tracing-opentelemetry`](https://docs.rs/tracing-opentelemetry) — no
 //! engine configuration involved; the layer picks the spans up from the
-//! subscriber like any other:
+//! subscriber like any other. An OTLP exporter to a local Collector:
 //!
-//! ```ignore
+//! ```no_run
+//! use opentelemetry::trace::TracerProvider as _;
+//! use opentelemetry_sdk::trace::SdkTracerProvider;
+//! use opentelemetry_otlp::WithExportConfig;
 //! use tracing_subscriber::layer::SubscriberExt;
+//! use tracing_subscriber::util::SubscriberInitExt;
 //!
-//! let tracer = /* an opentelemetry SDK tracer wired to your OTLP endpoint */;
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let exporter = opentelemetry_otlp::SpanExporter::builder()
+//!     .with_http()
+//!     .with_endpoint("http://localhost:4318/v1/traces")
+//!     .build()?;
+//! let provider = SdkTracerProvider::builder()
+//!     .with_batch_exporter(exporter)
+//!     .build();
 //! tracing_subscriber::registry()
-//!     .with(tracing_opentelemetry::layer().with_tracer(tracer))
+//!     .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("my-app")))
 //!     .init();
+//! // ... run the engine; call `provider.shutdown()` before exiting to flush.
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! The bridge understands the `otel.name` and `otel.status_code` fields:
@@ -125,6 +141,20 @@
 //! `workflow` / `step` span names) and carry OTel status. Under a plain
 //! [`fmt`](https://docs.rs/tracing-subscriber) subscriber the two appear as
 //! ordinary fields.
+//!
+//! From the Collector the spans go anywhere OTLP goes. The `telemetry`
+//! example ships a compose stack — Collector, Grafana Tempo, and Grafana with
+//! Tempo provisioned — and prints the trace id to search for. Datadog takes
+//! the same spans through a Datadog Agent with OTLP ingestion enabled or the
+//! Collector's `datadog` exporter; no vendor client is involved.
+//!
+//! Two things the export does not give you. durare emits spans and log
+//! events, not metrics: throughput, failure rate and step latency are either
+//! derived from the spans by the backend or polled from
+//! [`DurableEngine::metrics`] and published by the application. And, as noted
+//! under Parenting, queued and recovered runs need the `otel` feature and a
+//! persisted trace context to continue the caller's trace; scheduled ticks
+//! without a caller remain roots.
 //!
 //! # Probes
 //!

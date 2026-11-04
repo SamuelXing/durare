@@ -123,8 +123,13 @@ fail = "0.5"
 
 [dev-dependencies]
 tracing-subscriber = "0.3"
-# In-memory span exporter for the trace-context tests (`otel` feature).
+# OTLP export for the telemetry example and an in-memory exporter for the
+# trace-context tests. Exporters remain dev-only; the otel feature uses the
+# OpenTelemetry API and tracing bridge without configuring an exporter.
+opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "internal-logs"] }
+tracing-opentelemetry = "0.34"
 # A local websocket server for the conductor client tests.
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
@@ -189,6 +194,10 @@ path = "examples/stream.rs"
 [[example]]
 name = "dependencies"
 path = "examples/dependencies.rs"
+
+[[example]]
+name = "telemetry"
+path = "examples/telemetry/main.rs"
 
 # docs.rs builds with every feature enabled so conductor (and any future gated
 # APIs) appear in the rendered docs, and with `--cfg docsrs` so the
