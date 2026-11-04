@@ -47,6 +47,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `telemetry` example: durare's spans exported over OTLP, with a compose stack
   of OpenTelemetry Collector, Grafana Tempo and Grafana, and an exporting
   section in the `observability` docs covering Grafana and Datadog.
+- `StepCtx::write_stream` and `close_stream`: stream writes from inside a step
+  body, stamped with the step's position and taking no position of their own,
+  as the reference SDKs allow. They are at-least-once across retries and
+  recovery; the workflow body's checkpointed writes are unchanged (#173).
 - `otel` feature with `WorkflowOptions::propagate_trace_context`: the caller's
   W3C trace context travels in the workflow's attributes under
   `dbos.otelContext`, the key the Python SDK uses, so queued and recovered

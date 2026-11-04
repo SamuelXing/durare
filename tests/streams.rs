@@ -2,9 +2,13 @@
 //! append-only stream that an external reader drains in order, observing the
 //! close (or the producer going inactive).
 
-use durare::{DurableContext, DurableEngine, Error, InMemoryProvider, Result, WorkflowOptions};
+use durare::{
+    DurableContext, DurableEngine, Error, InMemoryProvider, Result, StateProvider, StepCtx,
+    StepOptions, WorkflowOptions,
+};
 use std::sync::Arc;
 use std::time::Duration;
+mod common;
 
 /// A producer writes three values and closes the stream; the reader drains them
 /// in order and sees `closed`. Each write/close is recorded as its own step.
@@ -267,4 +271,97 @@ async fn read_drains_while_producer_runs() -> Result<()> {
     assert!(closed);
     producer.result().await?;
     Ok(())
+}
+
+/// A step reports progress on a stream without taking a position: its writes
+/// land in order with the workflow body's, the step stays one checkpoint, and
+/// the positions after it are unchanged, so a replay reaches the same history.
+/// Writes from a step are at-least-once: a retried attempt appends again.
+async fn step_writes(db: Arc<dyn StateProvider>) -> Result<()> {
+    let mut engine = DurableEngine::new(db).await?;
+    engine.register("producer", |ctx: DurableContext, _: ()| async move {
+        ctx.step("work", |step: StepCtx| async move {
+            for i in 0..3_i64 {
+                step.write_stream("progress", i).await?;
+            }
+            Ok::<_, Error>(())
+        })
+        .await?;
+        ctx.write_stream("progress", 3_i64).await?;
+        ctx.step("finish", |step: StepCtx| async move {
+            step.close_stream("progress").await
+        })
+        .await?;
+        Ok::<_, Error>(())
+    });
+    engine.register("flaky", |ctx: DurableContext, _: ()| async move {
+        ctx.step_with(
+            StepOptions::new("flaky")
+                .max_retries(1)
+                .base_interval(Duration::ZERO),
+            |step: StepCtx| async move {
+                step.write_stream("attempts", step.attempt()).await?;
+                if step.attempt() == 0 {
+                    return Err(Error::app("first attempt fails"));
+                }
+                Ok::<_, Error>(())
+            },
+        )
+        .await
+    });
+
+    engine
+        .start::<_, ()>("producer", (), WorkflowOptions::with_id("p6"))
+        .await?
+        .result()
+        .await?;
+    let (values, closed): (Vec<i64>, bool) = engine.read_stream("p6", "progress").await?;
+    assert_eq!(values, vec![0, 1, 2, 3]);
+    assert!(closed);
+    assert_eq!(
+        common::recorded(&engine, "p6").await?,
+        vec![
+            (0, "work".into()),
+            (1, "DBOS.writeStream".into()),
+            (2, "finish".into())
+        ]
+    );
+    let report = engine.verify_replay("p6").await?;
+    assert_eq!(report.matched, report.recorded);
+    assert_eq!(report.divergence, None);
+
+    engine
+        .start::<_, ()>("flaky", (), WorkflowOptions::with_id("p7"))
+        .await?
+        .result()
+        .await?;
+    let (values, _): (Vec<u32>, bool) = engine.read_stream("p7", "attempts").await?;
+    assert_eq!(values, vec![0, 1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn step_writes_memory() -> Result<()> {
+    step_writes(Arc::new(InMemoryProvider::new())).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn step_writes_sqlite() -> Result<()> {
+    step_writes(Arc::new(
+        durare::SqliteProvider::connect("sqlite::memory:").await?,
+    ))
+    .await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn step_writes_postgres() -> Result<()> {
+    let Ok(base) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let (admin, url, name) = common::hermetic_pg_db(&base, "step_writes").await;
+    let result = step_writes(Arc::new(durare::PostgresProvider::connect(&url).await?)).await;
+    common::drop_hermetic_pg_db(&admin, &name).await;
+    result
 }
