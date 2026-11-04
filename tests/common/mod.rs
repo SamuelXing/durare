@@ -102,3 +102,42 @@ pub async fn drop_hermetic_pg_db(admin: &PgPool, dbname: &str) {
         eprintln!("hermetic db cleanup: leaving {dbname} behind: {e}");
     }
 }
+
+/// Insert `ids` as `PENDING` workflows on a freshly initialised provider, the
+/// fixture the provider contract tests share.
+pub async fn seed_pending(db: &dyn StateProvider, ids: &[&str]) -> Result<()> {
+    db.init().await?;
+    for id in ids {
+        db.insert_workflow_status(durare::WorkflowStatus::new(
+            *id,
+            "wf",
+            serde_json::json!(null),
+            durare::STATUS_PENDING,
+            "executor",
+            "version",
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// Record `name` with a null output at `(workflow_id, seq)`, as another
+/// execution that got there first would have.
+pub async fn record_null(
+    db: &dyn StateProvider,
+    workflow_id: &str,
+    seq: i32,
+    name: &str,
+) -> Result<()> {
+    db.record_step_result(
+        workflow_id,
+        seq,
+        name,
+        serde_json::Value::Null,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map(|_| ())
+}

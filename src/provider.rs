@@ -1765,8 +1765,37 @@ pub trait StateProvider: Send + Sync {
         step_name: &str,
     ) -> Result<Option<Value>>;
 
-    /// Set (or overwrite) the value of event `key` on `workflow_id`.
+    /// Set (or overwrite) the value of event `key` on `workflow_id`. A
+    /// workflow body sets through
+    /// [`set_event_from_workflow`](Self::set_event_from_workflow), which
+    /// checkpoints the step in the same transaction.
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()>;
+
+    /// Set event `key` on `workflow_id` as step `(seq, step_name)` of
+    /// `workflow_id`: the value and its checkpoint commit together or not at
+    /// all. A position already recorded sets nothing, so an execution lagging
+    /// behind another cannot put back a value a later position has already
+    /// replaced; a different step name recorded there is
+    /// [`Error::UnexpectedStep`](crate::Error::UnexpectedStep). The write
+    /// itself follows [`upsert_event`](Self::upsert_event), and the checkpoint
+    /// does not refresh the workflow's executor id. Default and override as
+    /// for [`send_from_workflow`](Self::send_from_workflow).
+    async fn set_event_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        if step_already_recorded(self, workflow_id, seq, step_name).await? {
+            return Ok(());
+        }
+        self.upsert_event(workflow_id, key, value).await?;
+        self.record_step_result(workflow_id, seq, step_name, Value::Null, None, None, None)
+            .await
+            .map(|_| ())
+    }
 
     /// Read the current value of event `key` on `workflow_id`, if set.
     async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>>;
@@ -2005,6 +2034,33 @@ pub trait StateProvider: Send + Sync {
         id: &str,
         attributes: Option<&Map<String, Value>>,
     ) -> Result<()>;
+
+    /// Replace the attributes of workflow `id` as step `(seq, step_name)` of
+    /// `workflow_id`: the replacement and its checkpoint commit together or
+    /// not at all. A position already recorded replaces nothing; a different
+    /// step name recorded there is
+    /// [`Error::UnexpectedStep`](crate::Error::UnexpectedStep). The
+    /// replacement itself follows
+    /// [`set_workflow_attributes`](Self::set_workflow_attributes), so a
+    /// missing `id` fails and leaves no checkpoint; the checkpoint does not
+    /// refresh the workflow's executor id. Default and override as for
+    /// [`send_from_workflow`](Self::send_from_workflow).
+    async fn set_workflow_attributes_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        id: &str,
+        attributes: Option<&Map<String, Value>>,
+    ) -> Result<()> {
+        if step_already_recorded(self, workflow_id, seq, step_name).await? {
+            return Ok(());
+        }
+        self.set_workflow_attributes(id, attributes).await?;
+        self.record_step_result(workflow_id, seq, step_name, Value::Null, None, None, None)
+            .await
+            .map(|_| ())
+    }
 
     /// Create `params.new_id` as a fork of `params.original_id`: a fresh
     /// `ENQUEUED` workflow on `params.queue_name` with the same
