@@ -60,7 +60,19 @@
 //! nests under the parent workflow's — the tree above. A workflow started
 //! from an already-instrumented context (say, an HTTP handler span) parents
 //! under it. Queued, scheduled, and recovered runs have no live parent and
-//! form roots.
+//! form roots — unless the start carried its trace context along.
+//!
+//! With the `otel` feature,
+//! [`WorkflowOptions::propagate_trace_context`](crate::WorkflowOptions::propagate_trace_context)
+//! stores the current span's W3C `traceparent` (and `tracestate`) in the
+//! workflow's attributes under `dbos.otelContext`, the key the Python SDK
+//! uses, and every run of that workflow — inline, after a queue handoff, or
+//! on recovery — parents its span under it. A carrier a Python enqueuer wrote
+//! is honored the same way. Only the trace context travels, never baggage,
+//! and children do not inherit it: set the option again on a child start to
+//! keep it on the trace. A scheduled tick has no caller and stays a root; its
+//! child starts can opt in. Without a valid span context at the call site
+//! nothing is stored.
 //!
 //! The attribute names are the `dbos.*` ones the other DBOS SDKs emit in
 //! their OpenTelemetry semantic-convention mode, so dashboards keyed on
@@ -140,8 +152,9 @@
 //! events, not metrics: throughput, failure rate and step latency are either
 //! derived from the spans by the backend or polled from
 //! [`DurableEngine::metrics`] and published by the application. And, as noted
-//! under Parenting, a queued, scheduled or recovered run starts a new trace
-//! rather than continuing the one that enqueued it.
+//! under Parenting, queued and recovered runs need the `otel` feature and a
+//! persisted trace context to continue the caller's trace; scheduled ticks
+//! without a caller remain roots.
 //!
 //! # Probes
 //!

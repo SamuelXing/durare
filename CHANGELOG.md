@@ -47,6 +47,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `telemetry` example: durare's spans exported over OTLP, with a compose stack
   of OpenTelemetry Collector, Grafana Tempo and Grafana, and an exporting
   section in the `observability` docs covering Grafana and Datadog.
+- `otel` feature with `WorkflowOptions::propagate_trace_context`: the caller's
+  W3C trace context travels in the workflow's attributes under
+  `dbos.otelContext`, the key the Python SDK uses, so queued and recovered
+  runs join the caller's trace (#149).
 
 ### Changed
 

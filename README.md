@@ -163,6 +163,7 @@ neither is a compile error. `InMemoryProvider` is always available (no feature).
 | `sqlite` | ✅ | The `SqliteProvider` backend (sqlx SQLite driver — a bundled C library). |
 | `conductor` | — | The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a websocket client for the DBOS control plane; pulls in a TLS websocket stack and gzip framing. |
 | `admin` | — | The `AdminServer` HTTP control surface — health, recovery, and workflow-management endpoints for the DBOS console/conductor and health probes; pulls in the axum/hyper/tower stack. |
+| `otel` | — | `WorkflowOptions::propagate_trace_context`: carry the caller's W3C trace context with a workflow so queued and recovered runs join its trace; pulls in the OpenTelemetry API and the `tracing-opentelemetry` bridge. |
 
 For a Postgres-only build (no SQLite C compile) that also enables the Conductor
 client:
