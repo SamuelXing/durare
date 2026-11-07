@@ -301,6 +301,18 @@ impl StateProvider for FaultProvider {
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
         self.inner.upsert_event(workflow_id, key, value).await
     }
+    async fn set_event_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<()> {
+        self.inner
+            .set_event_from_workflow(workflow_id, seq, step_name, key, value)
+            .await
+    }
     async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>> {
         self.inner.get_event_value(workflow_id, key).await
     }
@@ -343,6 +355,18 @@ impl StateProvider for FaultProvider {
         attributes: Option<&Map<String, Value>>,
     ) -> Result<()> {
         self.inner.set_workflow_attributes(id, attributes).await
+    }
+    async fn set_workflow_attributes_from_workflow(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        step_name: &str,
+        id: &str,
+        attributes: Option<&Map<String, Value>>,
+    ) -> Result<()> {
+        self.inner
+            .set_workflow_attributes_from_workflow(workflow_id, seq, step_name, id, attributes)
+            .await
     }
     async fn fork_workflow(&self, params: &ForkParams) -> Result<()> {
         self.inner.fork_workflow(params).await
