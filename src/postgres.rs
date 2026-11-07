@@ -107,6 +107,48 @@ impl Drop for Subscription {
 /// tables they write.
 const DEFAULT_SCHEMA: &str = "dbos";
 
+/// Pool size when the URL names none.
+const DEFAULT_POOL_SIZE: u32 = 8;
+
+/// Take `pool_max_conns`, the pool-size parameter the Go SDK's driver reads,
+/// out of a connection URL: sqlx does not know it and would warn and drop it.
+/// Other `pool_*` parameters are not applied, as in the Go SDK, which sets
+/// them itself; build the pool and use [`PostgresProvider::from_pool`] to
+/// control them.
+fn take_pool_max_conns(database_url: &str) -> Result<(String, Option<u32>)> {
+    const KEY: &str = "pool_max_conns";
+    let Some((base, query)) = database_url.split_once('?') else {
+        return Ok((database_url.to_owned(), None));
+    };
+    let mut size = None;
+    let mut kept = Vec::new();
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some((key, value)) if key == KEY => {
+                // The LISTEN/NOTIFY listener holds one connection for the
+                // provider's lifetime, so one alone would starve every query.
+                size = Some(match value.parse::<u32>() {
+                    Ok(n) if n >= 2 => n,
+                    _ => {
+                        return Err(Error::app(format!(
+                            "invalid {KEY}={value:?} in the database URL: expected an \
+                             integer of at least 2, one connection being held by the \
+                             notification listener"
+                        )))
+                    }
+                });
+            }
+            _ => kept.push(pair),
+        }
+    }
+    let url = if kept.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((url, size))
+}
+
 /// A schema name safe to interpolate into `CREATE SCHEMA` and `search_path`
 /// without quoting games: `[A-Za-z_][A-Za-z0-9_]*`.
 pub(crate) fn is_plain_identifier(s: &str) -> bool {
@@ -413,14 +455,17 @@ impl PostgresProvider {
             )));
         }
         use std::str::FromStr as _;
-        let opts = sqlx::postgres::PgConnectOptions::from_str(database_url)?
+        let (database_url, max_connections) = take_pool_max_conns(database_url)?;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&database_url)?
             .options([("search_path", schema)]);
         // One of these is held by the LISTEN/NOTIFY listener for its lifetime
         // (see `notify_hub`), leaving the rest for workflow/app queries.
+        let max_connections = max_connections.unwrap_or(DEFAULT_POOL_SIZE);
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(max_connections)
             .connect_with(opts)
             .await?;
+        tracing::info!(max_connections, schema, "opened the system database pool");
         let mut provider = Self::from_pool(pool);
         provider.schema = schema.to_string();
         provider.tables = SystemTables::new(schema);
@@ -3893,5 +3938,31 @@ mod notify_hub_tests {
         assert_eq!(hub.waiters.lock().unwrap()["k"].len(), 1);
         drop(kept);
         assert!(hub.waiters.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::take_pool_max_conns;
+
+    #[test]
+    fn taken_from_the_query_and_stripped() {
+        let (url, size) =
+            take_pool_max_conns("postgres://u:p@h/db?sslmode=require&pool_max_conns=20").unwrap();
+        assert_eq!(url, "postgres://u:p@h/db?sslmode=require");
+        assert_eq!(size, Some(20));
+        let (url, size) = take_pool_max_conns("postgres://u:p@h/db?pool_max_conns=3").unwrap();
+        assert_eq!(url, "postgres://u:p@h/db");
+        assert_eq!(size, Some(3));
+        let (url, size) = take_pool_max_conns("postgres://u:p@h/db").unwrap();
+        assert_eq!(url, "postgres://u:p@h/db");
+        assert_eq!(size, None);
+    }
+
+    #[test]
+    fn rejects_a_bad_size() {
+        for bad in ["0", "1", "many"] {
+            assert!(take_pool_max_conns(&format!("postgres://h/db?pool_max_conns={bad}")).is_err());
+        }
     }
 }

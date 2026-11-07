@@ -55,6 +55,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   body, stamped with the step's position and taking no position of their own,
   as the reference SDKs allow. They are at-least-once across retries and
   recovery; the workflow body's checkpointed writes are unchanged (#173).
+- `PostgresProvider::connect` honours `pool_max_conns` in the database URL,
+  the pool-size parameter the Go SDK's driver reads, in place of the fixed
+  default of eight connections, and logs the size it opens. Other `pool_*`
+  parameters are not applied; build the pool and use `from_pool` for those
+  (#201).
 - `otel` feature with `WorkflowOptions::propagate_trace_context`: the caller's
   W3C trace context travels in the workflow's attributes under
   `dbos.otelContext`, the key the Python SDK uses, so queued and recovered
