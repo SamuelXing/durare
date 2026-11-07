@@ -760,6 +760,31 @@ impl StateProvider for SqliteProvider {
         started_at_ms: Option<i64>,
         executor_id: Option<&str>,
     ) -> Result<StepOutcome> {
+        self.record_timed_step_result(
+            workflow_id,
+            seq,
+            name,
+            value,
+            error,
+            started_at_ms,
+            None,
+            executor_id,
+        )
+        .await
+    }
+
+    async fn record_timed_step_result(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        value: Value,
+        error: Option<&str>,
+        started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
+        executor_id: Option<&str>,
+    ) -> Result<StepOutcome> {
+        let completed_at_ms = completed_at_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
         // A failure records its (already-encoded) error with a null output; a
         // success records the encoded output with a null error.
         let (output_col, error_col) = match error {
@@ -780,7 +805,7 @@ impl StateProvider for SqliteProvider {
         .bind(&error_col)
         .bind(self.serializer.name())
         .bind(started_at_ms)
-        .bind(Utc::now().timestamp_millis())
+        .bind(completed_at_ms)
         .execute(&self.pool)
         .await?
         .rows_affected()
@@ -1972,16 +1997,18 @@ impl StateProvider for SqliteProvider {
         };
         crate::provider::check_child_target(&canonical, &child)?;
         let recorded = sqlx::query(
-            "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name, child_workflow_id)
-             VALUES (?, ?, ?, ?) ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+            "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, child_workflow_id, started_at_epoch_ms)
+             VALUES (?, ?, ?, ?, ?) ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
         )
-            .bind(parent_id)
-            .bind(seq)
-            .bind(&child.name)
-            .bind(&canonical.id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        .bind(parent_id)
+        .bind(seq)
+        .bind(&child.name)
+        .bind(&canonical.id)
+        .bind(child.created_at.timestamp_millis())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if recorded != 1 {
             return Err(Error::WorkflowConflict(parent_id.to_owned()));
         }

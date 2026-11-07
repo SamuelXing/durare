@@ -95,6 +95,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Step timing matches the reference SDKs: a child workflow's checkpoint
+  records when the child was started (on the built-in providers), a durable
+  timer's `DBOS.sleep` row (`sleep`, and the `recv`/`get_event` deadlines)
+  records its wake instant as its completion so the row spans the wait, and a
+  step's start is taken before its replay check rather than after it.
+  `StateProvider::record_timed_step_result` carries the completion instant;
+  a provider that does not override it records such rows untimed, as before
+  (#199).
 - `send`, `send_bulk`, `write_stream` and `close_stream` commit their side
   effect and their checkpoint together. A second execution of a workflow
   reaching the same position used to deliver or append again, and a second

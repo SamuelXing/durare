@@ -1605,16 +1605,18 @@ pub trait StateProvider: Send + Sync {
     /// no exclusivity and never fails the checkpoint.
     ///
     /// `started_at_ms` is when the step's work began (epoch ms); the
-    /// implementation stamps `completed_at` itself as the time of the write.
+    /// implementation stamps `completed_at` itself as the time of the write
+    /// (see [`record_timed_step_result`](Self::record_timed_step_result) for
+    /// a given instant).
     /// `None` records no start time — used for instantaneous operations (sends,
-    /// event sets, sleep markers) that have no duration; such rows are excluded
+    /// event sets) that have no duration; such rows are excluded
     /// from step duration aggregates. (With no start time, the conflict
     /// comparison above falls back to name + content alone: identical
     /// instantaneous writes converge rather than conflict.)
     ///
     /// Durable sleep is built on this too: the wake instant is recorded as an
-    /// ordinary step (`DBOS.sleep`) in `operation_outputs` — there is no
-    /// separate timers table.
+    /// ordinary step (`DBOS.sleep`) in `operation_outputs`, with the wake
+    /// instant as its completion — there is no separate timers table.
     #[allow(clippy::too_many_arguments)] // one argument per checkpoint column
     async fn record_step_result(
         &self,
@@ -1626,6 +1628,45 @@ pub trait StateProvider: Send + Sync {
         started_at_ms: Option<i64>,
         executor_id: Option<&str>,
     ) -> Result<StepOutcome>;
+
+    /// [`record_step_result`](Self::record_step_result) with the completion
+    /// instant given rather than taken at the write: a durable sleep records
+    /// its wake instant there, so the row's duration is the sleep, not the
+    /// checkpoint. `None` means the time of the write. The built-in providers
+    /// store the instant; the default records no start time for a timed row
+    /// instead, keeping it out of duration aggregates rather than recording a
+    /// duration of nothing.
+    #[allow(clippy::too_many_arguments)] // one argument per checkpoint column
+    async fn record_timed_step_result(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        value: Value,
+        error: Option<&str>,
+        started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
+        executor_id: Option<&str>,
+    ) -> Result<StepOutcome> {
+        // Without the instant the row would span only the write, so a timed
+        // row degrades to the untimed one it was before: no start recorded,
+        // excluded from duration aggregates.
+        let started_at_ms = if completed_at_ms.is_some() {
+            None
+        } else {
+            started_at_ms
+        };
+        self.record_step_result(
+            workflow_id,
+            seq,
+            name,
+            value,
+            error,
+            started_at_ms,
+            executor_id,
+        )
+        .await
+    }
 
     /// Run a transactional step: `body`'s SQL writes and this step's
     /// `operation_outputs` checkpoint commit in **one** database transaction, so
@@ -2157,6 +2198,8 @@ pub trait StateProvider: Send + Sync {
     /// id, so a replay of the parent re-attaches to the same child instead of
     /// starting a new one. A second record for the same `(parent_id, seq)` is a
     /// no-op.
+    /// This legacy path records no start time for the child; the built-in
+    /// providers' atomic insert does.
     async fn record_child_workflow(
         &self,
         parent_id: &str,
