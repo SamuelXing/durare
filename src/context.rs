@@ -314,6 +314,63 @@ impl StepCtx {
         }
     }
 
+    /// Append `value` to this workflow's stream `key` from inside the step.
+    ///
+    /// The entry carries this step's position and takes no position of its
+    /// own, so a long step can report progress without the workflow's history
+    /// growing by one checkpoint per write. That makes the write at-least-once
+    /// rather than exactly-once: a retried attempt, or a recovered execution
+    /// running this step again, appends again, so readers must tolerate
+    /// duplicates. From the workflow body, [`DurableContext::write_stream`]
+    /// checkpoints each write instead.
+    ///
+    /// ```no_run
+    /// # use durare::{DurableContext, Error, Result, StepCtx};
+    /// # async fn demo(ctx: DurableContext) -> Result<()> {
+    /// ctx.step("import", |step: StepCtx| async move {
+    ///     for batch in 0..10 {
+    ///         // ... process the batch ...
+    ///         step.write_stream("progress", batch).await?;
+    ///     }
+    ///     Ok::<_, Error>(())
+    /// }).await
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Fails if the stream was already closed, and on a value that will not
+    /// serialize. A storage failure interrupts the execution for recovery.
+    pub async fn write_stream<T: Serialize>(&self, key: &str, value: T) -> Result<()> {
+        let encoded = serde_json::to_value(value)?;
+        self.append(key, Some(encoded)).await
+    }
+
+    /// Close this workflow's stream `key` from inside the step, sealing it
+    /// against further writes. Like [`write_stream`](Self::write_stream) it
+    /// takes no position of its own, so a retried attempt or a recovered
+    /// execution reaching it again finds the stream already closed and fails.
+    /// Close from the workflow body with [`DurableContext::close_stream`] when
+    /// the close must be exactly-once.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the stream was already closed. A storage failure interrupts
+    /// the execution for recovery.
+    pub async fn close_stream(&self, key: &str) -> Result<()> {
+        self.append(key, None).await
+    }
+
+    async fn append(&self, key: &str, value: Option<Value>) -> Result<()> {
+        self.execution.0.check()?;
+        self.execution.0.storage(
+            self.provider
+                .0
+                .write_stream(&self.workflow_id, key, value, self.step_id)
+                .await,
+        )
+    }
+
     /// A stable, fixed-length key for one external effect in this step.
     ///
     /// Use a distinct, stable `effect` label for each external operation whose
@@ -2942,7 +2999,8 @@ impl DurableContext {
     ///
     /// The append and its checkpoint commit together, so a replay never
     /// re-appends and a second execution of this workflow reaching the same
-    /// position appends nothing.
+    /// position appends nothing. Inside a step body, use
+    /// [`StepCtx::write_stream`].
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};

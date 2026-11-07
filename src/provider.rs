@@ -2227,7 +2227,8 @@ pub trait StateProvider: Send + Sync {
     /// if the stream is already closed. The destination workflow's existence is
     /// enforced by the streams foreign key. A workflow body writes through
     /// [`write_stream_from_workflow`](Self::write_stream_from_workflow), which
-    /// checkpoints the step in the same transaction.
+    /// checkpoints the step in the same transaction; a step body writes
+    /// through this method directly.
     async fn write_stream(
         &self,
         workflow_id: &str,
