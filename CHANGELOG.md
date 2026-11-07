@@ -95,6 +95,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A message sent or received with an empty topic uses the `__null__topic__`
+  mailbox every DBOS SDK stores a topic-less message in, so a durare `recv`
+  takes delivery of another SDK's topic-less send and the other way round.
+  Listings surface the sentinel as no topic. A topic-less message an earlier
+  durare stored under the empty string is listed as `Some("")` and is not
+  delivered to a topic-less `recv` after upgrading (#185).
 - `send`, `send_bulk`, `write_stream` and `close_stream` commit their side
   effect and their checkpoint together. A second execution of a workflow
   reaching the same position used to deliver or append again, and a second

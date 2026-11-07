@@ -1309,7 +1309,7 @@ impl StateProvider for InMemoryProvider {
         Ok(rows
             .into_iter()
             .map(|n| NotificationInfo {
-                topic: (!n.topic.is_empty()).then(|| n.topic.clone()),
+                topic: Some(n.topic.clone()),
                 message: n.message.clone(),
                 created_at_ms: n.created_at_ms,
                 consumed: n.consumed,
