@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::postgres::{PgListener, PgPool, PgPoolOptions, Postgres};
-use sqlx::{QueryBuilder, Row};
+use sqlx::{Connection as _, Executor as _, QueryBuilder, Row};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,6 +106,9 @@ impl Drop for Subscription {
 /// means a Rust engine pointed at a Go/Python system database reads the same
 /// tables they write.
 const DEFAULT_SCHEMA: &str = "dbos";
+
+/// The system schema's migrations, embedded at compile time.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
 /// A schema name safe to interpolate into `CREATE SCHEMA` and `search_path`
 /// without quoting games: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -250,7 +253,9 @@ struct SystemTables {
     workflow_schedules: String,
     application_versions: String,
     queues: String,
-    /// sqlx's own migration-bookkeeping table (`_sqlx_migrations`).
+    /// The shared migration ledger (`dbos_migrations`).
+    dbos_migrations: String,
+    /// sqlx's migration ledger from before durare kept the shared one.
     sqlx_migrations: String,
 }
 
@@ -273,7 +278,8 @@ impl SystemTables {
             workflow_schedules: name("workflow_schedules"),
             application_versions: name("application_versions"),
             queues: name("queues"),
-            sqlx_migrations: name("_sqlx_migrations"),
+            dbos_migrations: name(crate::migrate::LEDGER),
+            sqlx_migrations: name(crate::migrate::LEGACY_LEDGER),
         }
     }
 }
@@ -520,11 +526,6 @@ impl PostgresProvider {
     }
 
     /// Run the embedded migrations on one held connection. The migrations'
-    /// DDL is unqualified, and a pooled connection's session `search_path` can
-    /// have been changed by earlier SQL — so pin it to the system schema
-    /// explicitly first. (The SET matches the pool's connect-time default, so
-    /// releasing the connection afterwards changes nothing. `from_pool` has no
-    /// schema and keeps the caller's resolution untouched.)
     /// Warn if the database still holds workflows whose `application_version` is
     /// the legacy empty string.
     ///
@@ -563,6 +564,11 @@ impl PostgresProvider {
         }
     }
 
+    /// Bring the system schema to the version this binary embeds, recording it
+    /// in the shared `dbos_migrations` ledger (see [`crate::migrate`]). The
+    /// migrations' DDL is unqualified and lands where the connection's
+    /// `search_path` points, so that is pinned on the one connection that runs
+    /// them.
     async fn run_migrations(&self) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
         if !self.schema.is_empty() {
@@ -570,12 +576,149 @@ impl PostgresProvider {
                 .execute(&mut *conn)
                 .await?;
         }
-        // `run_direct` rather than `run`: sqlx provides it precisely to avoid
-        // rustc's "implementation of `Acquire` is not general enough" error
-        // when migrating over a plain `&mut` connection.
-        sqlx::migrate!("./migrations/postgres")
-            .run_direct(&mut *conn)
+        let latest = crate::migrate::latest(&MIGRATOR);
+        // The common case, a database already at this version, costs one read.
+        if self
+            .ledger_version(&mut conn)
+            .await?
+            .is_some_and(|version| version >= latest)
+        {
+            return Ok(());
+        }
+        // Everything else happens in one transaction under an advisory lock:
+        // two durare processes starting together apply the pending set once,
+        // and no peer sees a migration half-applied.
+        let mut tx = conn.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::migrate::lock_key(&self.schema))
+            .execute(&mut *tx)
             .await?;
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {ledger} (version BIGINT NOT NULL PRIMARY KEY)",
+            ledger = self.tables.dbos_migrations
+        ))
+        .execute(&mut *tx)
+        .await?;
+        let recorded = self.ledger_version(&mut tx).await?;
+        let applied = match recorded {
+            Some(version) => version,
+            None => {
+                // A database durare migrated before it kept the shared ledger
+                // records its version in sqlx's; adopt that once.
+                let legacy = self.legacy_ledger_version(&mut tx).await?.unwrap_or(0);
+                if legacy > 0 {
+                    tracing::info!(
+                        version = legacy,
+                        "adopted the schema version from durare's legacy `_sqlx_migrations` ledger"
+                    );
+                }
+                legacy
+            }
+        };
+        if applied > latest {
+            tracing::info!(applied, latest, "system schema is ahead of this binary");
+        }
+        if applied == 0 {
+            // Tables without a ledger: a schema something else created and
+            // left unrecorded. Migration 1 would fail on them less clearly.
+            let occupied: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                .bind(&self.tables.workflow_status)
+                .fetch_one(&mut *tx)
+                .await?;
+            if occupied {
+                return Err(Error::app(crate::migrate::UNRECORDED_SCHEMA));
+            }
+        }
+        for migration in crate::migrate::pending(&MIGRATOR, applied) {
+            if migration.no_tx {
+                return Err(Error::app(format!(
+                    "migration {} is marked no-transaction, which this runner does not support",
+                    migration.version
+                )));
+            }
+            (&mut *tx).execute(&*migration.sql).await?;
+            tracing::info!(
+                version = migration.version,
+                "applied system schema migration"
+            );
+        }
+        let reached = applied.max(latest);
+        if recorded != Some(reached) {
+            self.record_schema_version(&mut tx, reached).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The version the shared ledger records; `None` before it exists or has
+    /// its row. Outside a transaction only, when the ledger may be missing: a
+    /// failed statement would abort one.
+    async fn ledger_version(&self, conn: &mut sqlx::PgConnection) -> Result<Option<i64>> {
+        let read = sqlx::query_scalar(&format!(
+            "SELECT version FROM {ledger} LIMIT 1",
+            ledger = self.tables.dbos_migrations
+        ))
+        .fetch_optional(conn)
+        .await;
+        match read {
+            Ok(version) => Ok(version),
+            // undefined_table: no ledger yet.
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The newest version durare's legacy sqlx ledger applied, if that table
+    /// exists.
+    async fn legacy_ledger_version(&self, conn: &mut sqlx::PgConnection) -> Result<Option<i64>> {
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&self.tables.sqlx_migrations)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !exists {
+            return Ok(None);
+        }
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT max(version) FROM {legacy} WHERE success",
+            legacy = self.tables.sqlx_migrations
+        ))
+        .fetch_one(conn)
+        .await?)
+    }
+
+    /// The schema version this database is at: the shared ledger, or the legacy
+    /// one for a durare database no new binary has initialised yet.
+    async fn recorded_schema_version(&self, conn: &mut sqlx::PgConnection) -> Result<Option<i64>> {
+        match self.ledger_version(conn).await? {
+            Some(version) => Ok(Some(version)),
+            None => self.legacy_ledger_version(conn).await,
+        }
+    }
+
+    /// Move the ledger's single row to `version`, creating it on first use, the
+    /// way the other SDKs write it.
+    async fn record_schema_version(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        version: i64,
+    ) -> Result<()> {
+        let updated = sqlx::query(&format!(
+            "UPDATE {ledger} SET version = $1",
+            ledger = self.tables.dbos_migrations
+        ))
+        .bind(version)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            sqlx::query(&format!(
+                "INSERT INTO {ledger} (version) VALUES ($1)",
+                ledger = self.tables.dbos_migrations
+            ))
+            .bind(version)
+            .execute(conn)
+            .await?;
+        }
         Ok(())
     }
 
@@ -1130,32 +1273,12 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn ping(&self) -> Result<()> {
-        // One round trip proves reachability and that the dbos system schema
-        // is migrated: `_sqlx_migrations` (in the system schema) must exist
-        // and hold every version this binary embeds. A *newer*
-        // schema is healthy — migrations are additive, and an older binary
-        // against an upgraded database is the normal rolling-deploy state.
-        let expected = sqlx::migrate!("./migrations/postgres")
-            .migrations
-            .iter()
-            .map(|m| m.version)
-            .max()
-            .unwrap_or(0);
-        let applied: Option<i64> = sqlx::query_scalar(&format!(
-            "SELECT max(version) FROM {sqlx_migrations}",
-            sqlx_migrations = self.tables.sqlx_migrations
-        ))
-        .fetch_one(&self.pool)
-        .await?;
-        match applied {
-            Some(v) if v >= expected => Ok(()),
-            Some(v) => Err(crate::error::Error::app(format!(
-                "dbos schema is behind: migration {v} applied, this binary expects {expected}"
-            ))),
-            None => Err(crate::error::Error::app(
-                "dbos schema is not migrated: no applied migrations recorded",
-            )),
-        }
+        // One round trip proves reachability and that the system schema is at
+        // least the version this binary embeds; a database no new binary has
+        // initialised yet is read from its legacy ledger instead.
+        let mut conn = self.pool.acquire().await?;
+        let recorded = self.recorded_schema_version(&mut conn).await?;
+        crate::migrate::check_current(recorded, crate::migrate::latest(&MIGRATOR))
     }
 
     async fn init(&self) -> Result<()> {
@@ -1181,15 +1304,8 @@ impl StateProvider for PostgresProvider {
                 }
             }
         }
-        // Embedded migrations (baked in at compile time from ./migrations/postgres).
-        // sqlx tracks applied versions in `_sqlx_migrations` (inside the schema,
-        // so each schema migrates independently) and applies only what is
-        // pending, so this is safe on every startup and upgrades existing DBs.
-        // The migrations' DDL is unqualified, so it lands wherever the
-        // connection's `search_path` points — and a pooled connection's session
-        // value can have been changed by earlier SQL. Pin it explicitly on one
-        // held connection before running them (the SET also matches the pool's
-        // connect-time default, so releasing the connection changes nothing).
+        // Apply what the shared ledger says is still pending; safe on every
+        // startup, and it upgrades an existing database in place.
         self.run_migrations().await?;
         self.warn_on_legacy_empty_app_version().await;
         // Start the LISTEN/NOTIFY listener once (it powers watch_change). Spawned
@@ -3893,5 +4009,13 @@ mod notify_hub_tests {
         assert_eq!(hub.waiters.lock().unwrap()["k"].len(), 1);
         drop(kept);
         assert!(hub.waiters.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod migration_set_tests {
+    #[test]
+    fn embedded_migrations_are_plain_and_uniquely_versioned() {
+        crate::migrate::check_embedded(&super::MIGRATOR);
     }
 }

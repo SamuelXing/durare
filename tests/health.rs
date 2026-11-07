@@ -64,8 +64,8 @@ async fn health_reports_deactivation_by_name() -> Result<()> {
 }
 
 /// The SQLite backend's ping verifies the migration ledger: current schema is
-/// ready; a schema behind the binary (simulated by deleting the newest
-/// applied-migration row) is reported with both versions.
+/// ready; a schema behind the binary (simulated by rolling the ledger's
+/// version back one) is reported with both versions.
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_health_verifies_schema_currency() -> Result<()> {
@@ -83,13 +83,10 @@ async fn sqlite_health_verifies_schema_currency() -> Result<()> {
     // Roll the ledger back one version, as if this binary were newer than the
     // database it reconnected to.
     let pool = sqlx::sqlite::SqlitePool::connect(&url).await.unwrap();
-    sqlx::query(
-        "DELETE FROM _sqlx_migrations
-         WHERE version = (SELECT max(version) FROM _sqlx_migrations)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE dbos_migrations SET version = version - 1")
+        .execute(&pool)
+        .await
+        .unwrap();
     pool.close().await;
 
     let report = engine.health().await;

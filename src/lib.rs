@@ -198,6 +198,7 @@ mod error;
 mod execution;
 mod handle;
 mod memory;
+mod migrate;
 #[cfg(feature = "otel")]
 mod otel;
 #[cfg(feature = "postgres")]

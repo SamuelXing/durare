@@ -62,6 +62,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The system schema's version is recorded in the `dbos_migrations` ledger every
+  DBOS SDK shares instead of sqlx's `_sqlx_migrations`, so durare and the other
+  SDKs can attach to a schema the other migrated and apply only what is pending.
+  A database durare migrated before this release is adopted once from
+  `_sqlx_migrations`, which is left in place so an older binary still runs
+  against it; a database this release creates has no `_sqlx_migrations`, so an
+  older binary cannot be rolled back onto it (#174).
 - `DurableEngine::listen_queues` returns `Result` and is refused once the engine
   is launched. The filter now lives only in the shared queue configuration, so
   remote-child routing and the dispatcher set cannot read different values.

@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::Executor as _;
 use sqlx::{QueryBuilder, Row};
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -599,6 +600,75 @@ impl SqliteProvider {
     }
 }
 
+/// The system schema's migrations, embedded at compile time.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
+
+/// The version the shared ledger records; `None` before it exists or has its
+/// row.
+async fn ledger_version(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>> {
+    let read = sqlx::query_scalar(&format!(
+        "SELECT version FROM {ledger} LIMIT 1",
+        ledger = crate::migrate::LEDGER
+    ))
+    .fetch_optional(conn)
+    .await;
+    match read {
+        Ok(version) => Ok(version),
+        Err(sqlx::Error::Database(db)) if db.message().contains("no such table") => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The newest version durare's legacy sqlx ledger applied, if that table exists.
+async fn legacy_ledger_version(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>> {
+    let exists: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(crate::migrate::LEGACY_LEDGER)
+            .fetch_one(&mut *conn)
+            .await?;
+    if exists == 0 {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(&format!(
+        "SELECT max(version) FROM {legacy} WHERE success",
+        legacy = crate::migrate::LEGACY_LEDGER
+    ))
+    .fetch_one(conn)
+    .await?)
+}
+
+/// The schema version this database is at: the shared ledger, or the legacy
+/// one for a durare database no new binary has initialised yet.
+async fn recorded_schema_version(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>> {
+    match ledger_version(conn).await? {
+        Some(version) => Ok(Some(version)),
+        None => legacy_ledger_version(conn).await,
+    }
+}
+
+/// Move the ledger's single row to `version`, creating it on first use, the way
+/// the other SDKs write it.
+async fn record_schema_version(conn: &mut sqlx::SqliteConnection, version: i64) -> Result<()> {
+    let updated = sqlx::query(&format!(
+        "UPDATE {ledger} SET version = ?",
+        ledger = crate::migrate::LEDGER
+    ))
+    .bind(version)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if updated == 0 {
+        sqlx::query(&format!(
+            "INSERT INTO {ledger} (version) VALUES (?)",
+            ledger = crate::migrate::LEDGER
+        ))
+        .bind(version)
+        .execute(conn)
+        .await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl StateProvider for SqliteProvider {
     fn provider_identity(&self) -> Option<&crate::provider::ProviderIdentity> {
@@ -606,33 +676,77 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn ping(&self) -> Result<()> {
-        // One round trip proves reachability and that the dbos system schema
-        // is migrated (see the Postgres provider for the rule; a newer schema
-        // than this binary embeds is healthy).
-        let expected = sqlx::migrate!("./migrations/sqlite")
-            .migrations
-            .iter()
-            .map(|m| m.version)
-            .max()
-            .unwrap_or(0);
-        let applied: Option<i64> = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
-            .fetch_one(&self.pool)
-            .await?;
-        match applied {
-            Some(v) if v >= expected => Ok(()),
-            Some(v) => Err(crate::error::Error::app(format!(
-                "dbos schema is behind: migration {v} applied, this binary expects {expected}"
-            ))),
-            None => Err(crate::error::Error::app(
-                "dbos schema is not migrated: no applied migrations recorded",
-            )),
-        }
+        // One round trip proves reachability and that the system schema is at
+        // least the version this binary embeds; a database no new binary has
+        // initialised yet is read from its legacy ledger instead.
+        let mut conn = self.pool.acquire().await?;
+        let recorded = recorded_schema_version(&mut conn).await?;
+        crate::migrate::check_current(recorded, crate::migrate::latest(&MIGRATOR))
     }
 
     async fn init(&self) -> Result<()> {
-        sqlx::migrate!("./migrations/sqlite")
-            .run(&self.pool)
+        let latest = crate::migrate::latest(&MIGRATOR);
+        // The common case, a database already at this version, costs one read.
+        let mut conn = self.pool.acquire().await?;
+        if ledger_version(&mut conn)
+            .await?
+            .is_some_and(|version| version >= latest)
+        {
+            return Ok(());
+        }
+        drop(conn);
+        // Everything else happens in one `BEGIN IMMEDIATE` transaction, so two
+        // processes starting together apply the pending set once.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {ledger} (version BIGINT NOT NULL PRIMARY KEY)",
+            ledger = crate::migrate::LEDGER
+        ))
+        .execute(&mut *tx)
+        .await?;
+        let recorded = ledger_version(&mut tx).await?;
+        let applied = match recorded {
+            Some(version) => version,
+            None => {
+                // A database durare migrated before it kept the shared ledger
+                // records its version in sqlx's; adopt that once.
+                let legacy = legacy_ledger_version(&mut tx).await?.unwrap_or(0);
+                if legacy > 0 {
+                    tracing::info!(
+                        version = legacy,
+                        "adopted the schema version from durare's legacy `_sqlx_migrations` ledger"
+                    );
+                }
+                legacy
+            }
+        };
+        if applied > latest {
+            tracing::info!(applied, latest, "system schema is ahead of this binary");
+        }
+        if applied == 0 {
+            // Tables without a ledger: a database something else created and
+            // left unrecorded. Migration 1 would fail on them less clearly.
+            let occupied: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'workflow_status'",
+            )
+            .fetch_one(&mut *tx)
             .await?;
+            if occupied > 0 {
+                return Err(Error::app(crate::migrate::UNRECORDED_SCHEMA));
+            }
+        }
+        for migration in crate::migrate::pending(&MIGRATOR, applied) {
+            (&mut *tx).execute(&*migration.sql).await?;
+            tracing::info!(
+                version = migration.version,
+                "applied system schema migration"
+            );
+        }
+        let reached = applied.max(latest);
+        if recorded != Some(reached) {
+            record_schema_version(&mut tx, reached).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3135,4 +3249,12 @@ fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
         cols = cols.replacen("output,", "NULL AS output,", 1);
     }
     std::borrow::Cow::Owned(cols)
+}
+
+#[cfg(test)]
+mod migration_set_tests {
+    #[test]
+    fn embedded_migrations_are_plain_and_uniquely_versioned() {
+        crate::migrate::check_embedded(&super::MIGRATOR);
+    }
 }
