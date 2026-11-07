@@ -143,7 +143,8 @@
 //! children, schedules, recovery dispatch and queues. An atomic ownership check
 //! uses the executor and recovery generation captured when that run started.
 //! Queued runs return to their queue; direct runs are dispatched after a won
-//! claim. Exceeding `max_recovery_attempts` parks the workflow and releases its
+//! claim. Exceeding the workflow's recovery cap (its own, or the engine's
+//! `max_recovery_attempts`) parks the workflow and releases its
 //! queue slot. Recorded business failures do not schedule recovery claims.
 //!
 //! Storage failures while claiming retry the same generation at most eight

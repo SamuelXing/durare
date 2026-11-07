@@ -22,21 +22,23 @@ use syn::parse::{Parse, ParseStream};
 use syn::visit_mut::{self, VisitMut};
 use syn::{
     parse_macro_input, parse_quote, FnArg, GenericParam, Ident, ItemFn, Lifetime, LifetimeParam,
-    LitStr, ReturnType, Signature, Token, Type, TypeParamBound, TypeReference,
+    LitInt, LitStr, ReturnType, Signature, Token, Type, TypeParamBound, TypeReference,
 };
 
 /// Parsed `#[workflow(...)]` arguments. Supports a bare name literal
 /// (`#[workflow("orders.process")]`) and/or keyed args
-/// (`#[workflow(name = "...", schedule = "* * * * * *")]`).
+/// (`#[workflow(name = "...", schedule = "* * * * * *", max_recovery_attempts = 5)]`).
 struct WorkflowArgs {
     name: Option<String>,
     schedule: Option<String>,
+    max_recovery_attempts: Option<i32>,
 }
 
 impl Parse for WorkflowArgs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut name = None;
         let mut schedule = None;
+        let mut max_recovery_attempts = None;
         while !input.is_empty() {
             if input.peek(LitStr) {
                 // Bare string literal: the registered name.
@@ -44,14 +46,16 @@ impl Parse for WorkflowArgs {
             } else {
                 let key: Ident = input.parse()?;
                 input.parse::<Token![=]>()?;
-                let val: LitStr = input.parse()?;
                 match key.to_string().as_str() {
-                    "name" => name = Some(val.value()),
-                    "schedule" => schedule = Some(val.value()),
+                    "name" => name = Some(input.parse::<LitStr>()?.value()),
+                    "schedule" => schedule = Some(input.parse::<LitStr>()?.value()),
+                    "max_recovery_attempts" => {
+                        max_recovery_attempts = Some(input.parse::<LitInt>()?.base10_parse()?)
+                    }
                     other => {
                         return Err(syn::Error::new(
                             key.span(),
-                            format!("unknown `#[workflow]` argument `{other}` (expected `name` or `schedule`)"),
+                            format!("unknown `#[workflow]` argument `{other}` (expected `name`, `schedule` or `max_recovery_attempts`)"),
                         ))
                     }
                 }
@@ -62,7 +66,11 @@ impl Parse for WorkflowArgs {
                 break;
             }
         }
-        Ok(WorkflowArgs { name, schedule })
+        Ok(WorkflowArgs {
+            name,
+            schedule,
+            max_recovery_attempts,
+        })
     }
 }
 
@@ -81,6 +89,10 @@ impl Parse for WorkflowArgs {
 /// // receives the scheduled tick time (RFC 3339) as its input:
 /// #[durare::workflow(schedule = "0 0 * * * *")] // top of every hour
 /// async fn hourly(ctx: DurableContext, scheduled_at: String) -> Result<()> { ... }
+///
+/// // Park this workflow after fewer recovery attempts than the engine's cap:
+/// #[durare::workflow(max_recovery_attempts = 3)]
+/// async fn fragile(ctx: DurableContext, input: Input) -> Result<()> { ... }
 /// ```
 ///
 /// The function is left as-is. The macro additionally emits:
@@ -101,6 +113,19 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
     let schedule = match args.schedule {
         Some(s) => quote! { Some(#s) },
         None => quote! { None },
+    };
+    // Emitted only when asked for, so a binary without the attribute depends
+    // on nothing new.
+    let recovery_cap = match args.max_recovery_attempts {
+        Some(n) => quote! {
+            durare::inventory::submit! {
+                durare::WorkflowRecoveryCap {
+                    name: #name,
+                    max_recovery_attempts: #n,
+                }
+            }
+        },
+        None => quote! {},
     };
 
     let ident = &func.sig.ident;
@@ -148,6 +173,8 @@ pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
                 schedule: #schedule,
             }
         }
+
+        #recovery_cap
     };
 
     expanded.into()
