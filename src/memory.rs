@@ -1767,7 +1767,7 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
 
 /// The [`StepOutcome`] a recorded [`StepRow`] represents: a recorded `error` is a
 /// failure (legacy text or a versioned error), otherwise its `output`.
-/// Mirrors the SQL backends' `step_outcome_from`.
+/// Mirrors the SQL backends' [`StepOutcome::from_columns`].
 fn step_row_outcome(r: &StepRow) -> StepOutcome {
     match &r.error {
         Some(e) => {

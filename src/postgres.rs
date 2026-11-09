@@ -1,15 +1,14 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
-    ChangeWait, ChangeWatch, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
-    NotificationInfo, NotificationInsert, RecordedColumns, RecordedStep, RecoveryClaim,
-    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
+    is_terminal, nonexistent_or, workflow_agg_selects, CancelOptions, ChangeWait, ChangeWatch,
+    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
+    RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
+    EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -864,7 +863,7 @@ impl PostgresProvider {
                 stored_name,
             ));
         }
-        step_outcome_from(
+        StepOutcome::from_columns(
             &self.serializer,
             fmt.as_deref(),
             output.as_deref(),
@@ -1321,7 +1320,7 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some(r) => Ok(step_outcome_from(
+            Some(r) => Ok(StepOutcome::from_columns(
                 &self.serializer,
                 r.get::<Option<String>, _>("serialization").as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
@@ -1419,7 +1418,7 @@ impl StateProvider for PostgresProvider {
 
         // Winning means the stored row is exactly this write — no read-back.
         if won {
-            return Ok(step_outcome_from(
+            return Ok(StepOutcome::from_columns(
                 &self.serializer,
                 Some(self.serializer.name()),
                 output_col.as_deref(),
@@ -1452,7 +1451,7 @@ impl StateProvider for PostgresProvider {
         if !same_write {
             return Err(Error::WorkflowConflict(workflow_id.to_string()));
         }
-        Ok(step_outcome_from(
+        Ok(StepOutcome::from_columns(
             &self.serializer,
             row.get::<Option<String>, _>("serialization").as_deref(),
             row.get::<Option<String>, _>("output").as_deref(),
@@ -1490,7 +1489,7 @@ impl StateProvider for PostgresProvider {
         .await?
         {
             let fmt: Option<String> = r.get("serialization");
-            if let Some(so) = step_outcome_from(
+            if let Some(so) = StepOutcome::from_columns(
                 &self.serializer,
                 fmt.as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),

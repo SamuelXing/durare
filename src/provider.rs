@@ -1093,6 +1093,34 @@ pub enum StepOutcome {
 }
 
 impl StepOutcome {
+    /// Rebuild a recorded outcome from a step row's columns.
+    ///
+    /// The arguments map directly to the `operation_outputs` table: `format` is
+    /// the `serialization` column, `output` the successful value, and `error`
+    /// the failure text. A non-null `error` is decoded as a failure; otherwise
+    /// `output` is the success value. Both null (an impossible row) yields
+    /// `None`.
+    ///
+    /// External [`StateProvider`] implementations can use this to decode step
+    /// rows exactly like the built-in SQL backends.
+    pub fn from_columns(
+        serializer: &crate::serialize::Serializer,
+        format: Option<&str>,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<Self>> {
+        if let Some(err) = error {
+            let (message, info) = crate::serialize::decode_error(format, err);
+            return Ok(Some(StepOutcome::Failure { message, info }));
+        }
+        match output {
+            Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(
+                serializer, format, o,
+            )?))),
+            None => Ok(None),
+        }
+    }
+
     /// The value this outcome represents: a recorded `Output` is returned as
     /// `Ok`, a recorded `Failure` as the reconstructed `Err`. Versioned records
     /// restore built-in variants; legacy text remains an application error.
@@ -1116,29 +1144,6 @@ pub struct RecordedStep {
     pub name: String,
     /// The recorded outcome (output or failure).
     pub outcome: StepOutcome,
-}
-
-/// Build a [`StepOutcome`] from an `operation_outputs` row's `output`/`error`
-/// columns and recorded serialization format. A non-null `error` is a failure
-/// (decoded with [`crate::serialize::decode_error`]); otherwise the `output` is
-/// the success value. Both null (an impossible row) yields `None`. Shared by the
-/// SQL backends' `get_step_result`/`record_step_result`.
-pub(crate) fn step_outcome_from(
-    serializer: &crate::serialize::Serializer,
-    fmt: Option<&str>,
-    output: Option<&str>,
-    error: Option<&str>,
-) -> Result<Option<StepOutcome>> {
-    if let Some(err) = error {
-        let (message, info) = crate::serialize::decode_error(fmt, err);
-        return Ok(Some(StepOutcome::Failure { message, info }));
-    }
-    match output {
-        Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(
-            serializer, fmt, o,
-        )?))),
-        None => Ok(None),
-    }
 }
 
 /// A registered application version (a row of `application_versions`). The
