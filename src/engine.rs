@@ -648,6 +648,25 @@ pub(crate) fn attributes_for_row(opts: &WorkflowOptions) -> Option<Value> {
 /// provided idempotency keys are rejected up front (each names a distinct
 /// at-most-once delivery — a repeat within one call is a caller bug, matching
 /// the reference behavior), payloads are serialized once.
+/// One message from outside any workflow, for the engine's and the client's
+/// `send`: the topic as the API spells it, the payload serialized here.
+pub(crate) async fn send_one<T: Serialize>(
+    provider: &dyn StateProvider,
+    destination_id: &str,
+    message: T,
+    topic: &str,
+    idempotency_key: Option<&str>,
+) -> Result<()> {
+    provider
+        .insert_notification(
+            destination_id,
+            crate::provider::wire_topic(topic),
+            serde_json::to_value(message)?,
+            idempotency_key,
+        )
+        .await
+}
+
 pub(crate) fn prepare_bulk<T: Serialize>(
     messages: &[SendMessage<T>],
 ) -> Result<Vec<crate::provider::NotificationInsert>> {
@@ -671,12 +690,12 @@ pub(crate) fn prepare_bulk<T: Serialize>(
     messages
         .iter()
         .map(|m| {
-            Ok(crate::provider::NotificationInsert {
-                destination_id: m.destination_id.clone(),
-                topic: m.topic.clone(),
-                message: serde_json::to_value(&m.message)?,
-                idempotency_key: m.idempotency_key.clone(),
-            })
+            Ok(crate::provider::NotificationInsert::new(
+                &m.destination_id,
+                &m.topic,
+                serde_json::to_value(&m.message)?,
+                m.idempotency_key.as_deref(),
+            ))
         })
         .collect()
 }
@@ -2169,9 +2188,7 @@ impl DurableEngine {
         message: T,
         topic: &str,
     ) -> Result<()> {
-        self.provider
-            .insert_notification(destination_id, topic, serde_json::to_value(message)?, None)
-            .await
+        crate::engine::send_one(self.provider.as_ref(), destination_id, message, topic, None).await
     }
 
     /// Like [`send`](Self::send) but idempotent: the message is delivered **at
@@ -2185,14 +2202,14 @@ impl DurableEngine {
         topic: &str,
         idempotency_key: &str,
     ) -> Result<()> {
-        self.provider
-            .insert_notification(
-                destination_id,
-                topic,
-                serde_json::to_value(message)?,
-                Some(idempotency_key),
-            )
-            .await
+        crate::engine::send_one(
+            self.provider.as_ref(),
+            destination_id,
+            message,
+            topic,
+            Some(idempotency_key),
+        )
+        .await
     }
 
     /// Send many messages in one call — the fan-out counterpart of
@@ -2479,7 +2496,14 @@ impl DurableEngine {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<crate::provider::NotificationInfo>> {
-        self.provider.list_workflow_notifications(workflow_id).await
+        let mut rows = self
+            .provider
+            .list_workflow_notifications(workflow_id)
+            .await?;
+        for row in &mut rows {
+            row.topic = row.topic.take().and_then(crate::provider::surface_topic);
+        }
+        Ok(rows)
     }
 
     /// All of a workflow's streams, grouped by key and ordered by write offset.

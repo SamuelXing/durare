@@ -2638,6 +2638,9 @@ impl DurableContext {
     /// The send and its checkpoint commit together, so a replay never re-sends
     /// and a second execution of this workflow reaching the same position sends
     /// nothing. The receiving side ([`recv`](Self::recv)) consumes exactly once.
+    /// An empty `topic` is the topic-less mailbox every DBOS SDK shares, so a
+    /// message sent without a topic from another SDK is received here with
+    /// `""`, and the other way round.
     ///
     /// # Errors
     ///
@@ -2657,20 +2660,13 @@ impl DurableContext {
             Ok(encoded) => encoded,
             Err(e) => return PendingStep::failed(e.into()),
         };
-        let destination_id = destination_id.to_owned();
-        let topic = topic.to_owned();
+        let row = NotificationInsert::new(destination_id, topic, encoded, None);
         let position = claim!(self, "send");
         let seq = position.seq();
         PendingStep::new(position, async move {
             if let Some(_done) = self.replay_or_guard::<Value>(seq, "DBOS.send").await? {
                 return Ok(());
             }
-            let row = NotificationInsert {
-                destination_id,
-                topic,
-                message: encoded,
-                idempotency_key: None,
-            };
             self.provider
                 .send_from_workflow(&self.workflow_id, seq, "DBOS.send", &[row])
                 .await
@@ -2758,7 +2754,9 @@ impl DurableContext {
     /// atomically, and a replay returns the recorded message without consuming
     /// another. Returns `None` on timeout (also recorded, so a replay does not
     /// wait again). The timeout deadline itself is durable: a crash mid-wait
-    /// resumes with the *remaining* time, not a fresh timeout.
+    /// resumes with the *remaining* time, not a fresh timeout. An empty
+    /// `topic` is the topic-less mailbox, shared with the other SDKs (see
+    /// [`send`](Self::send)).
     ///
     /// ```no_run
     /// # use durare::{DurableContext, Result};
@@ -2786,7 +2784,7 @@ impl DurableContext {
         topic: &str,
         timeout: Duration,
     ) -> PendingStep<'a, Option<T>> {
-        let topic = topic.to_owned();
+        let topic = crate::provider::wire_topic(topic).to_owned();
         let position = claim!(self, "recv");
         let seq = position.seq();
         let deadline_seq = self.next_seq();
