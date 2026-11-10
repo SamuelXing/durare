@@ -97,7 +97,8 @@ async fn workflow_steps_introspection_in_memory() -> Result<()> {
     assert_eq!(steps[1].child_workflow_id.as_deref(), Some("w-1"));
 
     // The durable step records start/finish timing (start no later than finish);
-    // the child-invocation marker has no step timing.
+    // the child-invocation marker records when the child was started and no
+    // completion of its own.
     let compute = &steps[0];
     let (start, end) = (
         compute.started_at.expect("step records started_at"),
@@ -105,8 +106,8 @@ async fn workflow_steps_introspection_in_memory() -> Result<()> {
     );
     assert!(start <= end);
     assert!(
-        steps[1].started_at.is_none() && steps[1].completed_at.is_none(),
-        "a child-invocation marker carries no step timing"
+        steps[1].started_at.is_some() && steps[1].completed_at.is_none(),
+        "a child-invocation marker records the child's start only"
     );
     Ok(())
 }

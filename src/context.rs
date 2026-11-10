@@ -1293,10 +1293,12 @@ impl DurableContext {
         let name = name.to_owned();
         PendingStep::new(position, async move {
             let out = async {
+                // Taken before the replay check, so a recorded duration spans
+                // the whole call as the reference SDKs measure it.
+                let started = chrono::Utc::now().timestamp_millis();
                 if let Some(stored) = self.replay_or_guard::<T>(seq, &name).await? {
                     return Ok(stored);
                 }
-                let started = chrono::Utc::now().timestamp_millis();
                 match run_step_catching(
                     &name,
                     in_body(|| {
@@ -1374,12 +1376,12 @@ impl DurableContext {
         let span = self.op_span("step", &opts.name, seq);
         PendingStep::new(position, async move {
             let out = async {
+                let started = chrono::Utc::now().timestamp_millis();
                 if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
                     return Ok(stored);
                 }
                 // Run with retries; only the final result/error is observed, then
                 // checkpointed — a success as its output, a failure as its error.
-                let started = chrono::Utc::now().timestamp_millis();
                 match self.run_with_retries(seq, &opts, &mut f).await {
                     Ok(v) => self.checkpoint(seq, &opts.name, v, Some(started)).await,
                     Err(e) if e.is_cancellation_for(&self.workflow_id) => Err(e),
@@ -1490,13 +1492,13 @@ impl DurableContext {
                 // verification run, which must not open one. Consult the record
                 // here first: a recorded outcome is served, and nothing recorded
                 // at this position stops the run before the body can execute.
+                let started = chrono::Utc::now().timestamp_millis();
                 if self.verifying() {
                     if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
                         return Ok(stored);
                     }
                 }
                 let _guard = self.begin_transaction()?;
-                let started = chrono::Utc::now().timestamp_millis();
                 // Separate the call from the `async move`: `f(tx)` borrows `f`
                 // and yields a future that we move in, so the wrapper stays `Fn`
                 // (re-runnable).
@@ -1705,11 +1707,11 @@ impl DurableContext {
         T: Serialize + DeserializeOwned + 'static,
         F: AsyncFn(&mut DS::Conn) -> Result<T> + Send + Sync,
     {
+        let started = chrono::Utc::now().timestamp_millis();
         // Layer 1: the system-database checkpoint — a completed run.
         if let Some(stored) = self.replay_or_guard::<T>(seq, &opts.name).await? {
             return Ok(stored);
         }
-        let started = chrono::Utc::now().timestamp_millis();
         let ser = self.provider.serializer();
 
         // A system data source runs on the system database's own pool, so one
@@ -2276,13 +2278,13 @@ impl DurableContext {
         let position = claim!(self, "select");
         let seq = position.seq();
         PendingStep::new(position, async move {
+            let started = chrono::Utc::now().timestamp_millis();
             if let Some(stored) = self
                 .replay_or_guard::<(usize, T)>(seq, "DBOS.select")
                 .await?
             {
                 return Ok(stored);
             }
-            let started = chrono::Utc::now().timestamp_millis();
 
             // Poll the branches in index order on this one task; the first ready wins
             // (lowest index on a tie). The losers are dropped — and so cancelled —
@@ -2380,16 +2382,18 @@ impl DurableContext {
         value: Value,
         encoded_error: Option<&str>,
         started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
     ) -> Result<T> {
         let outcome = self
             .provider
-            .record_step_result(
+            .record_timed_step_result(
                 &self.workflow_id,
                 seq,
                 name,
                 value,
                 encoded_error,
                 started_at_ms,
+                completed_at_ms,
                 Some(self.runtime.executor_id()),
             )
             .await
@@ -2408,6 +2412,20 @@ impl DurableContext {
         result: T,
         started_at_ms: Option<i64>,
     ) -> Result<T> {
+        self.checkpoint_timed(seq, name, result, started_at_ms, None)
+            .await
+    }
+
+    /// [`checkpoint`](Self::checkpoint) with the completion instant given: a
+    /// durable timer records its wake instant there, so the row spans the wait.
+    async fn checkpoint_timed<T: Serialize + DeserializeOwned>(
+        &self,
+        seq: i32,
+        name: &str,
+        result: T,
+        started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
+    ) -> Result<T> {
         self.execution.check()?;
         let json = match serde_json::to_value(&result) {
             Ok(value) => value,
@@ -2419,7 +2437,7 @@ impl DurableContext {
                     .await;
             }
         };
-        self.write_step_outcome(seq, name, json, None, started_at_ms)
+        self.write_step_outcome(seq, name, json, None, started_at_ms, completed_at_ms)
             .await
     }
 
@@ -2436,7 +2454,7 @@ impl DurableContext {
         self.execution.check()?;
         let encoded = crate::serialize::encode_error(&self.provider.serializer(), &err)
             .map_err(|error| self.execution.record(error))?;
-        self.write_step_outcome(seq, name, Value::Null, Some(&encoded), started_at_ms)
+        self.write_step_outcome(seq, name, Value::Null, Some(&encoded), started_at_ms, None)
             .await
     }
 
@@ -2535,9 +2553,7 @@ impl DurableContext {
         let position = claim!(self, "sleep");
         let seq = position.seq();
         PendingStep::new(position, async move {
-            let wake_at = self
-                .durable_value_at(seq, "DBOS.sleep", || wake_instant(dur))
-                .await?;
+            let wake_at = self.durable_wake_at(seq, dur).await?;
             let now = chrono::Utc::now();
             // A verification run reads the recorded wake instant and moves on.
             // Waiting it out would stall the check for however long the timer
@@ -2605,10 +2621,8 @@ impl DurableContext {
     }
 
     /// [`durable_value`](Self::durable_value)'s run, once the position is
-    /// claimed: serve the recorded value, or produce and checkpoint one. Also the
-    /// wake instant behind [`sleep`](Self::sleep) and the `recv`/`get_event`
-    /// timeouts, recorded as a `DBOS.sleep` step so a timer never extends across
-    /// a crash.
+    /// claimed: serve the recorded value, or produce and checkpoint one. Timers
+    /// go through [`durable_wake_at`](Self::durable_wake_at) instead.
     ///
     /// No cancellation check, unlike [`replay_or_guard`](Self::replay_or_guard):
     /// reading the clock or minting an id is not work a cancelled workflow is
@@ -2622,6 +2636,32 @@ impl DurableContext {
             return Ok(value);
         }
         self.checkpoint(seq, name, produce(), None).await
+    }
+
+    /// The instant a durable timer claimed at `seq` fires: the recorded one, or
+    /// `dur` from now, recorded as a `DBOS.sleep` step whose start is now and
+    /// whose completion is the wake instant, so the row spans the wait and a
+    /// timer never extends across a crash. Behind [`sleep`](Self::sleep) and
+    /// the `recv`/`get_event` timeouts.
+    async fn durable_wake_at(
+        &self,
+        seq: i32,
+        dur: Duration,
+    ) -> Result<chrono::DateTime<chrono::Utc>> {
+        if let Some(recorded) = self.serve_recorded(seq, "DBOS.sleep").await? {
+            return Ok(recorded);
+        }
+        let started = chrono::Utc::now();
+        let wake_at =
+            started + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
+        self.checkpoint_timed(
+            seq,
+            "DBOS.sleep",
+            wake_at,
+            Some(started.timestamp_millis()),
+            Some(wake_at.timestamp_millis()),
+        )
+        .await
     }
 
     /// Durably send a message to another workflow on `topic`. Recorded as a
@@ -2820,10 +2860,7 @@ impl DurableContext {
                 // poll until a message arrives or the deadline passes.
                 let deadline = match deadline {
                     Some(d) => d,
-                    None => *deadline.insert(
-                        self.durable_value_at(deadline_seq, "DBOS.sleep", || wake_instant(timeout))
-                            .await?,
-                    ),
+                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
                 };
                 let now = chrono::Utc::now();
                 if now >= deadline {
@@ -2963,10 +3000,7 @@ impl DurableContext {
 
                 let deadline = match deadline {
                     Some(d) => d,
-                    None => *deadline.insert(
-                        self.durable_value_at(deadline_seq, "DBOS.sleep", || wake_instant(timeout))
-                            .await?,
-                    ),
+                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
                 };
                 let now = chrono::Utc::now();
                 if now >= deadline {
@@ -3216,14 +3250,6 @@ fn completion_row_matches(
     }
     let stored = crate::serialize::decode(ser, row.serialization.as_deref(), output)?;
     Ok(stored == *value)
-}
-
-/// The absolute instant a durable timer started now would fire at. A duration
-/// too large for `chrono` counts as zero, so an absurd timeout fires at once
-/// rather than failing the workflow.
-fn wake_instant(dur: Duration) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now()
-        + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero())
 }
 
 /// Await a step's future, converting a panic in the step body into an error so

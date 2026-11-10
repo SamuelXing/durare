@@ -193,6 +193,31 @@ impl StateProvider for InMemoryProvider {
         started_at_ms: Option<i64>,
         executor_id: Option<&str>,
     ) -> Result<StepOutcome> {
+        self.record_timed_step_result(
+            workflow_id,
+            seq,
+            name,
+            value,
+            error,
+            started_at_ms,
+            None,
+            executor_id,
+        )
+        .await
+    }
+
+    async fn record_timed_step_result(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        value: Value,
+        error: Option<&str>,
+        started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
+        executor_id: Option<&str>,
+    ) -> Result<StepOutcome> {
+        let completed_at_ms = completed_at_ms.unwrap_or_else(|| Utc::now().timestamp_millis());
         let mut g = self.inner.lock().await;
         // A failure records its error with no output; a success records the
         // output with no error. The single-process store keeps the value as-is.
@@ -225,7 +250,7 @@ impl StateProvider for InMemoryProvider {
                 error: error_field,
                 child_workflow_id: None,
                 started_at_ms,
-                completed_at_ms: Some(Utc::now().timestamp_millis()),
+                completed_at_ms: Some(completed_at_ms),
             },
         );
         // Winning the checkpoint proves this executor is the one actually
@@ -1124,6 +1149,7 @@ impl StateProvider for InMemoryProvider {
             StepRow {
                 name: child.name,
                 child_workflow_id: Some(row.id.clone()),
+                started_at_ms: Some(child.created_at.timestamp_millis()),
                 ..Default::default()
             },
         );

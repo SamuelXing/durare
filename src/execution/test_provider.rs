@@ -221,6 +221,38 @@ impl StateProvider for FaultProvider {
         }
         Ok(result)
     }
+    async fn record_timed_step_result(
+        &self,
+        workflow_id: &str,
+        seq: i32,
+        name: &str,
+        value: Value,
+        error: Option<&str>,
+        started_at_ms: Option<i64>,
+        completed_at_ms: Option<i64>,
+        executor_id: Option<&str>,
+    ) -> Result<StepOutcome> {
+        if self.take(Fault::WriteBefore) {
+            return Self::failure();
+        }
+        let result = self
+            .inner
+            .record_timed_step_result(
+                workflow_id,
+                seq,
+                name,
+                value,
+                error,
+                started_at_ms,
+                completed_at_ms,
+                executor_id,
+            )
+            .await?;
+        if self.take(Fault::WriteAfter) {
+            return Self::failure();
+        }
+        Ok(result)
+    }
     async fn run_transaction_step(
         &self,
         workflow_id: &str,

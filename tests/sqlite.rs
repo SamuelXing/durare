@@ -1255,7 +1255,8 @@ async fn sqlite_workflow_aggregates() -> Result<()> {
 }
 
 /// Step start/finish timestamps are persisted and surface through
-/// get_workflow_steps; an instantaneous DBOS.* op records no start time.
+/// get_workflow_steps; a durable sleep's row spans from its start to its wake
+/// instant.
 #[tokio::test]
 async fn sqlite_step_timing_is_recorded() -> Result<()> {
     let (url, path) = temp_db_url("step-timing");
@@ -1282,13 +1283,14 @@ async fn sqlite_step_timing_is_recorded() -> Result<()> {
     let end = compute.completed_at.expect("completed_at persisted");
     assert!(start <= end);
 
-    // The sleep marker is instantaneous: completed but no start time.
+    // The sleep row runs from its start to the wake instant it recorded.
     let sleep = steps
         .iter()
         .find(|s| s.name == "DBOS.sleep")
         .expect("sleep step");
-    assert!(sleep.started_at.is_none());
-    assert!(sleep.completed_at.is_some());
+    let start = sleep.started_at.expect("sleep records its start");
+    let wake = sleep.completed_at.expect("sleep records its wake instant");
+    assert!(start <= wake);
 
     let _ = std::fs::remove_file(path);
     Ok(())
