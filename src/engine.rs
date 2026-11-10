@@ -57,6 +57,13 @@ pub type WorkflowFn = Arc<
         + Sync,
 >;
 
+/// Whether `name` is registered, directly or as a configured instance
+/// (`name/<config>`), the key shape [`registry_key`] produces.
+fn is_registered(workflows: &HashMap<String, WorkflowFn>, name: &str) -> bool {
+    let configured_prefix = format!("{name}/");
+    workflows.contains_key(name) || workflows.keys().any(|k| k.starts_with(&configured_prefix))
+}
+
 /// The registry key for a workflow: plain `name`, or an instance-qualified
 /// `name/config` when a non-empty config name is present. Keeps un-configured
 /// registrations keyed exactly by name (backward compatible) while letting
@@ -108,6 +115,19 @@ pub struct WorkflowRegistration {
 }
 
 inventory::collect!(WorkflowRegistration);
+
+/// A compile-time recovery-attempt cap for one workflow, emitted by
+/// `#[workflow(max_recovery_attempts = N)]` alongside its
+/// [`WorkflowRegistration`] and collected the same way. See
+/// [`DurableEngine::max_recovery_attempts_for`].
+pub struct WorkflowRecoveryCap {
+    /// The workflow's registered name.
+    pub name: &'static str,
+    /// Recovery claims allowed before its runs are parked.
+    pub max_recovery_attempts: i32,
+}
+
+inventory::collect!(WorkflowRecoveryCap);
 
 /// A compile-time, typed reference to a registered workflow.
 ///
@@ -762,6 +782,9 @@ pub struct DurableEngine {
     /// Required-roles declarations keyed by workflow name; see
     /// [`require_roles`](Self::require_roles).
     required_roles: HashMap<String, Vec<String>>,
+    /// Per-workflow recovery-attempt caps keyed by workflow name; see
+    /// [`max_recovery_attempts_for`](Self::max_recovery_attempts_for).
+    recovery_caps: Arc<std::sync::RwLock<HashMap<String, i32>>>,
     /// Cancelled by [`shutdown`](Self::shutdown) to stop the background loops.
     /// [`launch`](Self::launch) installs a fresh token after a shutdown, since a
     /// cancelled token can't be reset.
@@ -801,6 +824,7 @@ pub struct DurableEngineBuilder {
     listen_filter: Option<std::collections::HashSet<String>>,
     max_recovery_attempts: i32,
     required_roles: HashMap<String, Vec<String>>,
+    recovery_caps: HashMap<String, i32>,
 }
 
 impl DurableEngineBuilder {
@@ -898,6 +922,14 @@ impl DurableEngineBuilder {
         self
     }
 
+    /// Cap recovery attempts for workflow `name` alone, overriding
+    /// [`max_recovery_attempts`](Self::max_recovery_attempts). See
+    /// [`DurableEngine::max_recovery_attempts_for`].
+    pub fn max_recovery_attempts_for(&mut self, name: impl Into<String>, max: i32) -> &mut Self {
+        self.recovery_caps.insert(name.into(), max);
+        self
+    }
+
     /// Initialize the backend and build the engine, collecting every
     /// `#[durare::workflow]` in the binary plus the explicit registrations into
     /// one registry. Errors with [`Error::ConflictingRegistration`] if any name
@@ -917,6 +949,7 @@ impl DurableEngineBuilder {
             erase(crate::debounce::internal_debouncer),
         );
         // Auto-registered `#[durare::workflow]`s.
+        let mut recovery_caps = HashMap::new();
         for reg in inventory::iter::<WorkflowRegistration> {
             if workflows
                 .insert(reg.name.to_string(), (reg.builder)())
@@ -928,6 +961,11 @@ impl DurableEngineBuilder {
                 scheduled.push((reg.name.to_string(), spec.to_string()));
             }
         }
+        for cap in inventory::iter::<WorkflowRecoveryCap> {
+            recovery_caps.insert(cap.name.to_string(), cap.max_recovery_attempts);
+        }
+        // An explicit cap overrides the attribute's.
+        recovery_caps.extend(self.recovery_caps);
         // Explicit registrations — strict: no silent overwrite.
         for (key, f) in self.workflows {
             if workflows.insert(key.clone(), f).is_some() {
@@ -935,12 +973,10 @@ impl DurableEngineBuilder {
             }
         }
 
-        // A required-roles declaration must name a registered workflow.
-        for name in self.required_roles.keys() {
-            let configured_prefix = format!("{name}/");
-            if !workflows.contains_key(name)
-                && !workflows.keys().any(|k| k.starts_with(&configured_prefix))
-            {
+        // A required-roles declaration or a recovery cap must name a
+        // registered workflow.
+        for name in self.required_roles.keys().chain(recovery_caps.keys()) {
+            if !is_registered(&workflows, name) {
                 return Err(Error::UnknownWorkflow(name.clone()));
             }
         }
@@ -972,6 +1008,7 @@ impl DurableEngineBuilder {
             recover_on_launch: self.config.resolve_recover_on_launch(),
             retention: self.config.retention,
             required_roles: self.required_roles,
+            recovery_caps: Arc::new(std::sync::RwLock::new(recovery_caps)),
             shutdown_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             deactivated: Arc::new(AtomicBool::new(false)),
             automatic_recovery_stop: CancellationToken::new(),
@@ -1023,11 +1060,15 @@ impl DurableEngine {
         provider.init().await?;
         let mut workflows = HashMap::new();
         let mut scheduled = Vec::new();
+        let mut recovery_caps = HashMap::new();
         for reg in inventory::iter::<WorkflowRegistration> {
             workflows.insert(reg.name.to_string(), (reg.builder)());
             if let Some(spec) = reg.schedule {
                 scheduled.push((reg.name.to_string(), spec.to_string()));
             }
+        }
+        for cap in inventory::iter::<WorkflowRecoveryCap> {
+            recovery_caps.insert(cap.name.to_string(), cap.max_recovery_attempts);
         }
         // The internal debouncer workflow is always available (operates over
         // JSON, so one registration serves every debounced target).
@@ -1051,6 +1092,7 @@ impl DurableEngine {
             recover_on_launch: config.resolve_recover_on_launch(),
             retention: config.retention,
             required_roles: HashMap::new(),
+            recovery_caps: Arc::new(std::sync::RwLock::new(recovery_caps)),
             shutdown_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             deactivated: Arc::new(AtomicBool::new(false)),
             automatic_recovery_stop: CancellationToken::new(),
@@ -1090,6 +1132,7 @@ impl DurableEngine {
             listen_filter: None,
             max_recovery_attempts: 100,
             required_roles: HashMap::new(),
+            recovery_caps: HashMap::new(),
         }
     }
 
@@ -1150,6 +1193,7 @@ impl DurableEngine {
                     workflows: self.workflows.clone(),
                     queue_config: self.queue_config.clone(),
                     required_roles: self.required_roles.clone(),
+                    recovery_caps: self.recovery_caps.clone(),
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
                     tasks: self.tasks.clone(),
@@ -1247,6 +1291,25 @@ impl DurableEngine {
     {
         self.required_roles
             .insert(name.into(), roles.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Cap recovery attempts for workflow `name` alone: its runs are parked in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED` after `max` recovery claims, whatever
+    /// the engine-wide [`max_recovery_attempts`](DurableEngineBuilder::max_recovery_attempts)
+    /// says. The cap belongs to the registration, not the stored workflow, so
+    /// a process that does not register `name` applies its own default to that
+    /// workflow's queued runs. It applies to every configured instance of
+    /// `name`, and overrides a `#[workflow(max_recovery_attempts = N)]`
+    /// attribute on the definition.
+    ///
+    /// Must be called before [`launch`](Self::launch), which validates that
+    /// `name` is a registered workflow.
+    pub fn max_recovery_attempts_for(&mut self, name: impl Into<String>, max: i32) -> &mut Self {
+        self.recovery_caps
+            .write()
+            .expect("recovery caps poisoned")
+            .insert(name.into(), max);
         self
     }
 
@@ -1557,16 +1620,16 @@ impl DurableEngine {
                 ));
             }
         }
-        // A required-roles declaration for an unregistered workflow is a typo
-        // that would silently enforce nothing — reject it up front.
-        for name in self.required_roles.keys() {
-            let configured_prefix = format!("{name}/");
-            if !self.workflows.contains_key(name)
-                && !self
-                    .workflows
-                    .keys()
-                    .any(|k| k.starts_with(&configured_prefix))
-            {
+        // A required-roles declaration or a recovery cap for an unregistered
+        // workflow is a typo that would silently enforce nothing — reject it
+        // up front.
+        for name in self.required_roles.keys().chain(
+            self.recovery_caps
+                .read()
+                .expect("recovery caps poisoned")
+                .keys(),
+        ) {
+            if !is_registered(&self.workflows, name) {
                 return Err(Error::UnknownWorkflow(name.clone()));
             }
         }
@@ -1688,10 +1751,9 @@ impl DurableEngine {
         // dispatcher lock above across it is fine.)
         if !to_recover.is_empty() {
             let rt = rt.clone();
-            let max = self.max_recovery_attempts;
             let cancel = cancel.clone();
             self.tasks.spawn(async move {
-                match dispatch_pending_workflows(&rt, max, to_recover, &cancel).await {
+                match dispatch_pending_workflows(&rt, to_recover, &cancel).await {
                     Ok(ids) => {
                         tracing::info!(count = ids.len(), "recovered pending workflows on launch")
                     }
@@ -2740,8 +2802,9 @@ impl DurableEngine {
     /// the DBOS SDKs hand back handles — so a recovered run parked on `recv`
     /// or a durable timer never stalls the caller or the runs behind it.
     /// Workflows of a different version are left alone (version-gated
-    /// recovery), and a workflow recovered more than `max_recovery_attempts`
-    /// times is parked in `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Queued workflows
+    /// recovery), and a workflow recovered more than its cap allows (its own
+    /// or the engine's `max_recovery_attempts`) is parked in
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`. Queued workflows
     /// are returned to their queue for re-dispatch.
     ///
     /// This is the primary recovery entry point: call it on startup (or on
@@ -2778,13 +2841,7 @@ impl DurableEngine {
             .lock()
             .expect("shutdown token poisoned")
             .clone();
-        recover_pending_workflows(
-            &self.runtime(),
-            self.max_recovery_attempts,
-            executor_ids,
-            &cancel,
-        )
-        .await
+        recover_pending_workflows(&self.runtime(), executor_ids, &cancel).await
     }
 }
 
@@ -2799,12 +2856,11 @@ impl DurableEngine {
 /// (the engine itself is not `Clone`, but the [`Runtime`] behind it is `Arc`).
 pub(crate) async fn recover_pending_workflows(
     rt: &Arc<Runtime>,
-    max_recovery_attempts: i32,
     executor_ids: &[String],
     cancel: &CancellationToken,
 ) -> Result<Vec<String>> {
     let pending = list_pending_workflows(rt, executor_ids).await?;
-    dispatch_pending_workflows(rt, max_recovery_attempts, pending, cancel).await
+    dispatch_pending_workflows(rt, pending, cancel).await
 }
 
 /// The `PENDING` workflows of this app version owned by the given executors
@@ -2847,7 +2903,6 @@ pub(crate) async fn list_pending_workflows(
 /// deliberate, since the admin recovery endpoint exists to re-dispatch work.
 pub(crate) async fn dispatch_pending_workflows(
     rt: &Arc<Runtime>,
-    max_recovery_attempts: i32,
     pending: Vec<WorkflowStatus>,
     cancel: &CancellationToken,
 ) -> Result<Vec<String>> {
@@ -2905,7 +2960,7 @@ pub(crate) async fn dispatch_pending_workflows(
                 expected_executor: &record.executor_id,
                 expected_attempts: record.recovery_attempts,
                 new_executor: &rt.executor_id,
-                max_attempts: max_recovery_attempts,
+                max_attempts: rt.recovery_cap(&record.name),
                 requeue,
             })
             .await?;
@@ -2970,7 +3025,7 @@ async fn recover_interrupted_run(
     // A workflow panic has no automatic body retry budget. Reuse the atomic
     // parking transition without inventing a business failure.
     let max_attempts = match disposition {
-        RecoveryDisposition::Retry => rt.max_recovery_attempts,
+        RecoveryDisposition::Retry => rt.recovery_cap(&record.name),
         RecoveryDisposition::ParkAfterPanic => record.recovery_attempts,
     };
     // Deactivation stops taking work, not settling an execution that stopped.
@@ -3076,6 +3131,8 @@ pub(crate) struct Runtime {
     /// Required-roles declarations keyed by workflow name; enforced before a
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
+    /// Per-workflow recovery-attempt caps; see [`Runtime::recovery_cap`].
+    recovery_caps: Arc<std::sync::RwLock<HashMap<String, i32>>>,
     executor_id: String,
     app_version: String,
     tasks: TaskTracker,
@@ -3097,6 +3154,17 @@ pub(crate) struct EngineCounters {
 }
 
 impl Runtime {
+    /// The recovery-attempt cap for runs of workflow `name`: its own, or the
+    /// engine's default.
+    fn recovery_cap(&self, name: &str) -> i32 {
+        self.recovery_caps
+            .read()
+            .expect("recovery caps poisoned")
+            .get(name)
+            .copied()
+            .unwrap_or(self.max_recovery_attempts)
+    }
+
     fn is_producer_only(&self, queue: &str) -> bool {
         self.queue_config
             .read()

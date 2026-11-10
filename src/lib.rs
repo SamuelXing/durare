@@ -238,7 +238,7 @@ pub use engine::WorkflowResult;
 pub use engine::{
     erase, DeduplicationPolicy, DurableEngine, DurableEngineBuilder, EngineConfig, EngineMetrics,
     HealthReport, RegisteredWorkflow, RetentionPolicy, SendMessage, WorkflowDef, WorkflowFn,
-    WorkflowOptions, WorkflowRegistration,
+    WorkflowOptions, WorkflowRecoveryCap, WorkflowRegistration,
 };
 pub use error::{Error, ErrorCode, RecordedError, Result};
 /// Re-exported so callers can consume the asynchronous stream returned by

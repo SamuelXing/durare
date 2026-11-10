@@ -59,6 +59,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   body, stamped with the step's position and taking no position of their own,
   as the reference SDKs allow. They are at-least-once across retries and
   recovery; the workflow body's checkpointed writes are unchanged (#173).
+- Per-workflow recovery caps: `#[workflow(max_recovery_attempts = N)]` and
+  `max_recovery_attempts_for` on the engine and its builder park one workflow
+  after its own number of recovery claims, overriding the engine-wide cap, as
+  the other SDKs' registration options do. The attribute submits a
+  `WorkflowRecoveryCap` next to the workflow's registration (#188).
 - `PostgresProvider::connect` honours `pool_max_conns` in the database URL,
   the pool-size parameter the Go SDK's driver reads, in place of the fixed
   default of eight connections, and logs the size it opens. Other `pool_*`
