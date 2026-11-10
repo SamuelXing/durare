@@ -2897,7 +2897,7 @@ impl StateProvider for PostgresProvider {
         rows.into_iter()
             .map(|(topic, message, fmt, created_at_ms, consumed)| {
                 Ok(NotificationInfo {
-                    topic: (!topic.is_empty()).then_some(topic),
+                    topic: Some(topic),
                     message: serialize::decode(&self.serializer, fmt.as_deref(), &message)?,
                     created_at_ms,
                     consumed,
