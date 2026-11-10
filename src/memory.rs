@@ -1,11 +1,12 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, encode_roles, is_terminal, CancelOptions,
-    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep,
-    RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery,
-    StepInfo, StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
+    DebounceOutcome, DebounceRequest, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
+    NotificationInfo, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::tx::TxBody;
@@ -105,19 +106,42 @@ impl StateProvider for InMemoryProvider {
         Ok((row, created))
     }
 
+    async fn debounce_delayed_workflow(
+        &self,
+        req: &DebounceRequest<'_>,
+    ) -> Result<DebounceOutcome> {
+        let mut g = self.inner.lock().await;
+        let Some(holder) = dedup_holder(&mut g, req.queue_name, req.dedup_id) else {
+            return Ok(DebounceOutcome::Unheld);
+        };
+        if holder.name != req.workflow_name
+            || holder.status != STATUS_DELAYED
+            || !holder.is_debounced
+        {
+            return Ok(DebounceOutcome::Held {
+                workflow_name: holder.name.clone(),
+                is_debounced: holder.is_debounced,
+            });
+        }
+        holder.delay_until_ms = Some(
+            holder
+                .debounce_deadline_ms
+                .map_or(req.delay_until_ms, |deadline| {
+                    deadline.min(req.delay_until_ms)
+                }),
+        );
+        holder.input = req.input.clone();
+        holder.updated_at = Utc::now();
+        Ok(DebounceOutcome::Bounced(holder.id.clone()))
+    }
+
     async fn get_deduplicated_workflow(
         &self,
         queue_name: &str,
         dedup_id: &str,
     ) -> Result<Option<String>> {
-        let g = self.inner.lock().await;
-        Ok(g.workflows
-            .values()
-            .find(|w| {
-                w.queue_name.as_deref() == Some(queue_name)
-                    && w.dedup_id.as_deref() == Some(dedup_id)
-            })
-            .map(|w| w.id.clone()))
+        let mut g = self.inner.lock().await;
+        Ok(dedup_holder(&mut g, queue_name, dedup_id).map(|w| w.id.clone()))
     }
 
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
@@ -1759,6 +1783,17 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
     m.insert("is_debounced".into(), json!(w.is_debounced));
     m.insert("serialization".into(), Value::Null);
     m
+}
+
+/// The run holding the deduplication slot `(queue_name, dedup_id)`, if any.
+fn dedup_holder<'g>(
+    g: &'g mut Inner,
+    queue_name: &str,
+    dedup_id: &str,
+) -> Option<&'g mut WorkflowStatus> {
+    g.workflows.values_mut().find(|w| {
+        w.queue_name.as_deref() == Some(queue_name) && w.dedup_id.as_deref() == Some(dedup_id)
+    })
 }
 
 /// Rebuild a [`WorkflowStatus`] from a portable `workflow_status` row.

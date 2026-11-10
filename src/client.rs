@@ -84,8 +84,8 @@ impl Client {
 
     /// Debounce a target workflow from out of process — coalesce rapid repeated
     /// triggers (grouped by key) into a single delayed run with the latest input.
-    /// A launched engine elsewhere (which auto-registers the internal debouncer
-    /// and has the target registered) executes the coalesced run.
+    /// A launched engine elsewhere, with the target registered and dispatching
+    /// the queue the run waits on, executes the coalesced run.
     pub fn debouncer(&self, target_workflow: &str) -> crate::debounce::DebouncerClient<'_> {
         crate::debounce::DebouncerClient::new(self, target_workflow)
     }
@@ -118,19 +118,19 @@ impl Client {
     where
         I: Serialize,
     {
-        self.enqueue_with(queue_name, workflow_name, input, opts, None)
+        self.enqueue_with(queue_name, workflow_name, input, opts, |_| {})
             .await
     }
 
-    /// [`enqueue`](Self::enqueue), stamping the schedule that created the run
-    /// when a schedule is the caller.
-    async fn enqueue_with<I, O>(
+    /// [`enqueue`](Self::enqueue), letting `stamp` set on the row what options
+    /// cannot carry: the schedule that created the run, a debounce marker.
+    pub(crate) async fn enqueue_with<I, O>(
         &self,
         queue_name: &str,
         workflow_name: &str,
         input: I,
         opts: WorkflowOptions,
-        schedule_name: Option<&str>,
+        stamp: impl FnOnce(&mut WorkflowStatus),
     ) -> Result<WorkflowHandle<O>>
     where
         I: Serialize,
@@ -143,10 +143,7 @@ impl Client {
         }
         opts.validate_deduplication(Some(queue_name))?;
 
-        let id = opts
-            .workflow_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = opts.id_or_fresh();
         let now_ms = Utc::now().timestamp_millis();
         let status = if opts.delay.is_some() {
             STATUS_DELAYED
@@ -175,10 +172,10 @@ impl Client {
         row.authenticated_roles = opts.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
-        row.schedule_name = schedule_name.map(str::to_string);
         row.attributes = crate::engine::attributes_for_row(&opts);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
+        stamp(&mut row);
 
         let canonical = retry_dedup(|| async {
             match self.provider.insert_workflow_status(row.clone()).await {
@@ -694,7 +691,7 @@ impl Client {
             &schedule.workflow_name,
             schedule.tick_input(now),
             WorkflowOptions::with_id(id),
-            Some(schedule_name),
+            |row| row.schedule_name = Some(schedule_name.to_string()),
         )
         .await
     }
@@ -727,7 +724,7 @@ impl Client {
                 &schedule.workflow_name,
                 schedule.tick_input(instant),
                 WorkflowOptions::with_id(id.clone()),
-                Some(schedule_name),
+                |row| row.schedule_name = Some(schedule_name.to_string()),
             )
             .await?;
             ids.push(id);
