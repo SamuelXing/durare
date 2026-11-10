@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StepOutcome::from_columns` public constructor rebuilds a recorded step
+  outcome from an `operation_outputs` row's columns and serialization format,
+  so external `StateProvider` implementations can decode step rows exactly
+  like the built-in SQL backends.
 - `DurableContext::enqueue_workflow` enqueues named children without a local
   workflow registration, preserving child checkpoints and identity inheritance.
   Remote targets require an explicit target application version. Same-version
@@ -55,6 +59,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   body, stamped with the step's position and taking no position of their own,
   as the reference SDKs allow. They are at-least-once across retries and
   recovery; the workflow body's checkpointed writes are unchanged (#173).
+- `PostgresProvider::connect` honours `pool_max_conns` in the database URL,
+  the pool-size parameter the Go SDK's driver reads, in place of the fixed
+  default of eight connections, and logs the size it opens. Other `pool_*`
+  parameters are not applied; build the pool and use `from_pool` for those
+  (#201).
 - `otel` feature with `WorkflowOptions::propagate_trace_context`: the caller's
   W3C trace context travels in the workflow's attributes under
   `dbos.otelContext`, the key the Python SDK uses, so queued and recovered
@@ -104,6 +113,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A message sent or received with an empty topic uses the `__null__topic__`
+  mailbox every DBOS SDK stores a topic-less message in, so a durare `recv`
+  takes delivery of another SDK's topic-less send and the other way round.
+  Listings surface the sentinel as no topic. A topic-less message an earlier
+  durare stored under the empty string is listed as `Some("")` and is not
+  delivered to a topic-less `recv` after upgrading (#185).
 - `send`, `send_bulk`, `write_stream` and `close_stream` commit their side
   effect and their checkpoint together. A second execution of a workflow
   reaching the same position used to deliver or append again, and a second
@@ -144,6 +159,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Engine and client enqueue paths share deduplication validation. Partition
   keys cannot be combined with deduplication ids, and a non-default collision
   policy requires both a deduplication id and a queue.
+- `RecordedStep`, `StepOutcome`, and `NotificationInfo` are exported from the
+  crate root. They appear in the required `StateProvider` methods
+  `get_step_result`, `record_step_result`, and `list_workflow_notifications`,
+  so a provider implemented in another crate could not compile.
 
 ## [0.5.0] - 2026-10-06
 

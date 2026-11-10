@@ -191,9 +191,7 @@ impl Client {
         message: T,
         topic: &str,
     ) -> Result<()> {
-        self.provider
-            .insert_notification(destination_id, topic, serde_json::to_value(message)?, None)
-            .await
+        crate::engine::send_one(self.provider.as_ref(), destination_id, message, topic, None).await
     }
 
     /// Like [`send`](Self::send) but idempotent: the message is delivered **at
@@ -207,14 +205,14 @@ impl Client {
         topic: &str,
         idempotency_key: &str,
     ) -> Result<()> {
-        self.provider
-            .insert_notification(
-                destination_id,
-                topic,
-                serde_json::to_value(message)?,
-                Some(idempotency_key),
-            )
-            .await
+        crate::engine::send_one(
+            self.provider.as_ref(),
+            destination_id,
+            message,
+            topic,
+            Some(idempotency_key),
+        )
+        .await
     }
 
     /// Send many messages in one call — the fan-out counterpart of

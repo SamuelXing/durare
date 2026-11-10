@@ -1,8 +1,8 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
-    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
+    is_terminal, nonexistent_or, workflow_agg_selects, CancelOptions, DequeueRequest,
+    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
     RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
     StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
     WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
@@ -347,7 +347,7 @@ impl SqliteProvider {
                 stored_name,
             ));
         }
-        step_outcome_from(
+        StepOutcome::from_columns(
             &self.serializer,
             fmt.as_deref(),
             output.as_deref(),
@@ -965,7 +965,7 @@ impl StateProvider for SqliteProvider {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some(r) => Ok(step_outcome_from(
+            Some(r) => Ok(StepOutcome::from_columns(
                 &self.serializer,
                 r.get::<Option<String>, _>("serialization").as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
@@ -1042,7 +1042,7 @@ impl StateProvider for SqliteProvider {
             }
             // Winning means the stored row is exactly this write — no
             // read-back.
-            return Ok(step_outcome_from(
+            return Ok(StepOutcome::from_columns(
                 &self.serializer,
                 Some(self.serializer.name()),
                 output_col.as_deref(),
@@ -1074,7 +1074,7 @@ impl StateProvider for SqliteProvider {
         if !same_write {
             return Err(Error::WorkflowConflict(workflow_id.to_string()));
         }
-        Ok(step_outcome_from(
+        Ok(StepOutcome::from_columns(
             &self.serializer,
             row.get::<Option<String>, _>("serialization").as_deref(),
             row.get::<Option<String>, _>("output").as_deref(),
@@ -1113,7 +1113,7 @@ impl StateProvider for SqliteProvider {
         .await?
         {
             let fmt: Option<String> = r.get("serialization");
-            if let Some(so) = step_outcome_from(
+            if let Some(so) = StepOutcome::from_columns(
                 &self.serializer,
                 fmt.as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
@@ -2419,7 +2419,7 @@ impl StateProvider for SqliteProvider {
         rows.into_iter()
             .map(|(topic, message, fmt, created_at_ms, consumed)| {
                 Ok(NotificationInfo {
-                    topic: (!topic.is_empty()).then_some(topic),
+                    topic: Some(topic),
                     message: serialize::decode(&self.serializer, fmt.as_deref(), &message)?,
                     created_at_ms,
                     consumed,

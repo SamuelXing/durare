@@ -103,6 +103,25 @@ pub const STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED: &str = "MAX_RECOVERY_ATTEMPTS_E
 /// names. User values are serializer-encoded, so they never collide with it.
 pub(crate) const STREAM_CLOSED_SENTINEL: &str = "__DBOS_STREAM_CLOSED__";
 
+/// What every DBOS SDK stores in `topic` for a message sent with no topic.
+/// durare spells "no topic" as the empty string and maps it here, so the
+/// mailbox is shared with the other SDKs.
+pub(crate) const NULL_TOPIC: &str = "__null__topic__";
+
+/// The topic as the `notifications` table stores it.
+pub(crate) fn wire_topic(topic: &str) -> &str {
+    if topic.is_empty() {
+        NULL_TOPIC
+    } else {
+        topic
+    }
+}
+
+/// A stored topic as the API surfaces it: the sentinel reads back as no topic.
+pub(crate) fn surface_topic(topic: String) -> Option<String> {
+    (topic != NULL_TOPIC).then_some(topic)
+}
+
 /// `LISTEN`/`NOTIFY` channel a new `notifications` row is announced on (the
 /// `dbos_notifications_trigger` payload is `destination_uuid::topic`). Shared
 /// verbatim with the other SDKs and the schema trigger.
@@ -1001,7 +1020,9 @@ pub struct StepAggregate {
 /// [`StateProvider::list_workflow_notifications`].
 #[derive(Clone, Debug)]
 pub struct NotificationInfo {
-    /// The topic it was sent on, or `None` when sent without one.
+    /// The topic it was sent on, or `None` when sent without one. Providers
+    /// return the stored column value; [`DurableEngine::list_workflow_notifications`](crate::DurableEngine::list_workflow_notifications)
+    /// maps the cross-SDK no-topic sentinel to `None`.
     pub topic: Option<String>,
     /// The decoded message payload.
     pub message: Value,
@@ -1025,6 +1046,24 @@ pub struct NotificationInsert {
     /// Optional at-most-once key, scoped per destination (see
     /// [`StateProvider::insert_notification`]).
     pub idempotency_key: Option<String>,
+}
+
+impl NotificationInsert {
+    /// A row for `message` to `destination_id` on `topic` as the API spells it,
+    /// an empty topic being the shared topic-less mailbox.
+    pub(crate) fn new(
+        destination_id: &str,
+        topic: &str,
+        message: Value,
+        idempotency_key: Option<&str>,
+    ) -> Self {
+        Self {
+            destination_id: destination_id.to_owned(),
+            topic: wire_topic(topic).to_owned(),
+            message,
+            idempotency_key: idempotency_key.map(str::to_owned),
+        }
+    }
 }
 
 /// Options for listing a workflow's recorded operations in ascending step order.
@@ -1093,6 +1132,34 @@ pub enum StepOutcome {
 }
 
 impl StepOutcome {
+    /// Rebuild a recorded outcome from a step row's columns.
+    ///
+    /// The arguments map directly to the `operation_outputs` table: `format` is
+    /// the `serialization` column, `output` the successful value, and `error`
+    /// the failure text. A non-null `error` is decoded as a failure; otherwise
+    /// `output` is the success value. Both null (an impossible row) yields
+    /// `None`.
+    ///
+    /// External [`StateProvider`] implementations can use this to decode step
+    /// rows exactly like the built-in SQL backends.
+    pub fn from_columns(
+        serializer: &crate::serialize::Serializer,
+        format: Option<&str>,
+        output: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<Self>> {
+        if let Some(err) = error {
+            let (message, info) = crate::serialize::decode_error(format, err);
+            return Ok(Some(StepOutcome::Failure { message, info }));
+        }
+        match output {
+            Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(
+                serializer, format, o,
+            )?))),
+            None => Ok(None),
+        }
+    }
+
     /// The value this outcome represents: a recorded `Output` is returned as
     /// `Ok`, a recorded `Failure` as the reconstructed `Err`. Versioned records
     /// restore built-in variants; legacy text remains an application error.
@@ -1116,29 +1183,6 @@ pub struct RecordedStep {
     pub name: String,
     /// The recorded outcome (output or failure).
     pub outcome: StepOutcome,
-}
-
-/// Build a [`StepOutcome`] from an `operation_outputs` row's `output`/`error`
-/// columns and recorded serialization format. A non-null `error` is a failure
-/// (decoded with [`crate::serialize::decode_error`]); otherwise the `output` is
-/// the success value. Both null (an impossible row) yields `None`. Shared by the
-/// SQL backends' `get_step_result`/`record_step_result`.
-pub(crate) fn step_outcome_from(
-    serializer: &crate::serialize::Serializer,
-    fmt: Option<&str>,
-    output: Option<&str>,
-    error: Option<&str>,
-) -> Result<Option<StepOutcome>> {
-    if let Some(err) = error {
-        let (message, info) = crate::serialize::decode_error(fmt, err);
-        return Ok(Some(StepOutcome::Failure { message, info }));
-    }
-    match output {
-        Some(o) => Ok(Some(StepOutcome::Output(crate::serialize::decode(
-            serializer, fmt, o,
-        )?))),
-        None => Ok(None),
-    }
 }
 
 /// A registered application version (a row of `application_versions`). The
@@ -1676,8 +1720,10 @@ pub trait StateProvider: Send + Sync {
     /// dequeues each partition independently.
     async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>>;
 
-    /// Append a message for `destination_id` on `topic`. Errors if the
-    /// destination workflow does not exist (FK violation in the SQL backends).
+    /// Append a message for `destination_id` on `topic`, the stored form: the
+    /// engine and client map a topic-less send to the cross-SDK sentinel before
+    /// calling. Errors if the destination workflow does not exist (FK violation
+    /// in the SQL backends).
     ///
     /// When `idempotency_key` is `Some`, the row's primary key is derived from it
     /// (`{key}::{destination_id}`) and a repeated insert is a silent no-op, so a

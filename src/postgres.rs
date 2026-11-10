@@ -1,15 +1,14 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    is_terminal, nonexistent_or, step_outcome_from, workflow_agg_selects, CancelOptions,
-    ChangeWait, ChangeWatch, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
-    NotificationInfo, NotificationInsert, RecordedColumns, RecordedStep, RecoveryClaim,
-    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL,
-    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
+    is_terminal, nonexistent_or, workflow_agg_selects, CancelOptions, ChangeWait, ChangeWatch,
+    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
+    RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
+    EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -109,6 +108,48 @@ const DEFAULT_SCHEMA: &str = "dbos";
 
 /// The system schema's migrations, embedded at compile time.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+
+/// Pool size when the URL names none.
+const DEFAULT_POOL_SIZE: u32 = 8;
+
+/// Take `pool_max_conns`, the pool-size parameter the Go SDK's driver reads,
+/// out of a connection URL: sqlx does not know it and would warn and drop it.
+/// Other `pool_*` parameters are not applied, as in the Go SDK, which sets
+/// them itself; build the pool and use [`PostgresProvider::from_pool`] to
+/// control them.
+fn take_pool_max_conns(database_url: &str) -> Result<(String, Option<u32>)> {
+    const KEY: &str = "pool_max_conns";
+    let Some((base, query)) = database_url.split_once('?') else {
+        return Ok((database_url.to_owned(), None));
+    };
+    let mut size = None;
+    let mut kept = Vec::new();
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some((key, value)) if key == KEY => {
+                // The LISTEN/NOTIFY listener holds one connection for the
+                // provider's lifetime, so one alone would starve every query.
+                size = Some(match value.parse::<u32>() {
+                    Ok(n) if n >= 2 => n,
+                    _ => {
+                        return Err(Error::app(format!(
+                            "invalid {KEY}={value:?} in the database URL: expected an \
+                             integer of at least 2, one connection being held by the \
+                             notification listener"
+                        )))
+                    }
+                });
+            }
+            _ => kept.push(pair),
+        }
+    }
+    let url = if kept.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((url, size))
+}
 
 /// A schema name safe to interpolate into `CREATE SCHEMA` and `search_path`
 /// without quoting games: `[A-Za-z_][A-Za-z0-9_]*`.
@@ -419,14 +460,17 @@ impl PostgresProvider {
             )));
         }
         use std::str::FromStr as _;
-        let opts = sqlx::postgres::PgConnectOptions::from_str(database_url)?
+        let (database_url, max_connections) = take_pool_max_conns(database_url)?;
+        let opts = sqlx::postgres::PgConnectOptions::from_str(&database_url)?
             .options([("search_path", schema)]);
         // One of these is held by the LISTEN/NOTIFY listener for its lifetime
         // (see `notify_hub`), leaving the rest for workflow/app queries.
+        let max_connections = max_connections.unwrap_or(DEFAULT_POOL_SIZE);
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(max_connections)
             .connect_with(opts)
             .await?;
+        tracing::info!(max_connections, schema, "opened the system database pool");
         let mut provider = Self::from_pool(pool);
         provider.schema = schema.to_string();
         provider.tables = SystemTables::new(schema);
@@ -1007,7 +1051,7 @@ impl PostgresProvider {
                 stored_name,
             ));
         }
-        step_outcome_from(
+        StepOutcome::from_columns(
             &self.serializer,
             fmt.as_deref(),
             output.as_deref(),
@@ -1437,7 +1481,7 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some(r) => Ok(step_outcome_from(
+            Some(r) => Ok(StepOutcome::from_columns(
                 &self.serializer,
                 r.get::<Option<String>, _>("serialization").as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
@@ -1535,7 +1579,7 @@ impl StateProvider for PostgresProvider {
 
         // Winning means the stored row is exactly this write — no read-back.
         if won {
-            return Ok(step_outcome_from(
+            return Ok(StepOutcome::from_columns(
                 &self.serializer,
                 Some(self.serializer.name()),
                 output_col.as_deref(),
@@ -1568,7 +1612,7 @@ impl StateProvider for PostgresProvider {
         if !same_write {
             return Err(Error::WorkflowConflict(workflow_id.to_string()));
         }
-        Ok(step_outcome_from(
+        Ok(StepOutcome::from_columns(
             &self.serializer,
             row.get::<Option<String>, _>("serialization").as_deref(),
             row.get::<Option<String>, _>("output").as_deref(),
@@ -1606,7 +1650,7 @@ impl StateProvider for PostgresProvider {
         .await?
         {
             let fmt: Option<String> = r.get("serialization");
-            if let Some(so) = step_outcome_from(
+            if let Some(so) = StepOutcome::from_columns(
                 &self.serializer,
                 fmt.as_deref(),
                 r.get::<Option<String>, _>("output").as_deref(),
@@ -3014,7 +3058,7 @@ impl StateProvider for PostgresProvider {
         rows.into_iter()
             .map(|(topic, message, fmt, created_at_ms, consumed)| {
                 Ok(NotificationInfo {
-                    topic: (!topic.is_empty()).then_some(topic),
+                    topic: Some(topic),
                     message: serialize::decode(&self.serializer, fmt.as_deref(), &message)?,
                     created_at_ms,
                     consumed,
@@ -4017,5 +4061,31 @@ mod migration_set_tests {
     #[test]
     fn embedded_migrations_are_plain_and_uniquely_versioned() {
         crate::migrate::check_embedded(&super::MIGRATOR);
+    }
+}
+
+#[cfg(test)]
+mod pool_size_tests {
+    use super::take_pool_max_conns;
+
+    #[test]
+    fn taken_from_the_query_and_stripped() {
+        let (url, size) =
+            take_pool_max_conns("postgres://u:p@h/db?sslmode=require&pool_max_conns=20").unwrap();
+        assert_eq!(url, "postgres://u:p@h/db?sslmode=require");
+        assert_eq!(size, Some(20));
+        let (url, size) = take_pool_max_conns("postgres://u:p@h/db?pool_max_conns=3").unwrap();
+        assert_eq!(url, "postgres://u:p@h/db");
+        assert_eq!(size, Some(3));
+        let (url, size) = take_pool_max_conns("postgres://u:p@h/db").unwrap();
+        assert_eq!(url, "postgres://u:p@h/db");
+        assert_eq!(size, None);
+    }
+
+    #[test]
+    fn rejects_a_bad_size() {
+        for bad in ["0", "1", "many"] {
+            assert!(take_pool_max_conns(&format!("postgres://h/db?pool_max_conns={bad}")).is_err());
+        }
     }
 }
