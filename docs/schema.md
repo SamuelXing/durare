@@ -9,6 +9,21 @@ There are ten tables, built up over the 40 migrations in
 column-for-column, which is what lets a workflow written by one SDK be read or
 recovered by another.
 
+The schema's version lives in `dbos_migrations`, a one-row table every DBOS SDK
+reads and writes the same way. A process starting against the database reads
+the row, applies the migrations newer than it, each together with its ledger
+update in one transaction, and leaves a database a newer peer has already moved
+ahead untouched. That is what lets processes written in different languages
+share one schema. A database durare created before it kept this ledger carries
+sqlx's `_sqlx_migrations` instead; the first newer durare process adopts the
+newest version recorded there into `dbos_migrations` and leaves the old table
+in place. Run that durare process before pointing another SDK at such a
+database: a peer that finds tables but no ledger starts from migration 1 and
+fails on the first table. SQLite adoption repairs the timestamp defaults
+older durare databases omitted before publishing the shared version, so peer
+writers can omit those columns. The repair and ledger update commit together;
+legacy migration files and their checksums remain unchanged.
+
 Most of it revolves around a single table, `workflow_status`, which has one row
 per workflow run. The tables that record side effects (steps, messages, events,
 streams) all point back at it and are deleted along with it. A few others

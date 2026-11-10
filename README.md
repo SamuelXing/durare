@@ -211,7 +211,9 @@ DBOS system schema. On Postgres the tables live in the `dbos` schema — the sam
 schema, tables, and columns the DBOS Transact SDKs for Python, Go, and
 TypeScript use: `workflow_status`, `operation_outputs`, `workflow_events`,
 `notifications`, `streams`, `workflow_schedules`, `queues`, and the version
-registry, applied through embedded per-dialect migrations.
+registry, applied through embedded per-dialect migrations and recorded in the
+shared `dbos_migrations` ledger, so a schema one SDK migrated is picked up where
+it stands by the next.
 
 In practice this means:
 

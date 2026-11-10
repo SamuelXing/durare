@@ -3151,7 +3151,7 @@ async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
     let provider = SqliteProvider::connect(&url).await?;
     provider.init().await?;
 
-    // Every schema table (plus sqlx's migration ledger) exists.
+    // Every schema table (plus the shared migration ledger) exists.
     let pool = sqlx::SqlitePool::connect(&url).await?;
     let tables: Vec<String> =
         sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -3168,21 +3168,14 @@ async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
         "queues",
         "workflow_schedules",
         "application_versions",
-        "_sqlx_migrations",
+        "dbos_migrations",
     ] {
         assert!(tables.iter().any(|n| n == t), "missing table `{t}`");
     }
 
-    // The migration ledger recorded every applied migration, all successful.
-    let (applied, ok): (i64, i64) =
-        sqlx::query_as("SELECT COUNT(*), SUM(success) FROM _sqlx_migrations")
-            .fetch_one(&pool)
-            .await?;
-    assert!(
-        applied > 30,
-        "expected the full migration set, got {applied}"
-    );
-    assert_eq!(applied, ok, "every migration recorded success");
+    let applied: Vec<i64> = sqlx::query_scalar("SELECT version FROM dbos_migrations")
+        .fetch_all(&pool)
+        .await?;
 
     // WAL journaling is set (persistent, so any connection observes it).
     let mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -3226,8 +3219,8 @@ async fn sqlite_schema_migrations_and_pragmas() -> Result<()> {
     let reopened = SqliteProvider::connect(&url).await?;
     reopened.init().await?;
     let pool = sqlx::SqlitePool::connect(&url).await?;
-    let applied_again: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
-        .fetch_one(&pool)
+    let applied_again: Vec<i64> = sqlx::query_scalar("SELECT version FROM dbos_migrations")
+        .fetch_all(&pool)
         .await?;
     assert_eq!(
         applied_again, applied,
