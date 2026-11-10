@@ -19,7 +19,10 @@ sqlx's `_sqlx_migrations` instead; the first newer durare process adopts the
 newest version recorded there into `dbos_migrations` and leaves the old table
 in place. Run that durare process before pointing another SDK at such a
 database: a peer that finds tables but no ledger starts from migration 1 and
-fails on the first table.
+fails on the first table. SQLite adoption repairs the timestamp defaults
+older durare databases omitted before publishing the shared version, so peer
+writers can omit those columns. The repair and ledger update commit together;
+legacy migration files and their checksums remain unchanged.
 
 Most of it revolves around a single table, `workflow_status`, which has one row
 per workflow run. The tables that record side effects (steps, messages, events,

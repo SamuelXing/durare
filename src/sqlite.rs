@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::Executor as _;
+use sqlx::{Connection as _, Executor as _};
 use sqlx::{QueryBuilder, Row};
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -603,6 +603,101 @@ impl SqliteProvider {
 /// The system schema's migrations, embedded at compile time.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
+// A cancelled or failed migration must not return a connection with foreign
+// keys disabled to the pool. Successful migrations restore its pragmas first.
+struct MigrationConnection(Option<sqlx::pool::PoolConnection<Sqlite>>);
+
+impl Drop for MigrationConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.as_mut() {
+            conn.close_on_drop();
+        }
+    }
+}
+
+/// Old durare SQLite schemas omitted defaults that peer writers rely on.
+/// Repair them before publishing the shared version, without changing the
+/// checksums of the legacy migrations or allocating a peer's migration number.
+async fn repair_timestamp_defaults(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    const NOW: &str = "(CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))";
+    for (table, columns) in [
+        ("workflow_status", &["created_at", "updated_at"][..]),
+        ("notifications", &["created_at_epoch_ms"][..]),
+        (
+            "application_versions",
+            &["version_timestamp", "created_at"][..],
+        ),
+        ("queues", &["created_at", "updated_at"][..]),
+    ] {
+        let info = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+            .fetch_all(&mut *conn)
+            .await?;
+        let missing: Vec<&str> = columns
+            .iter()
+            .copied()
+            .filter(|column| {
+                info.iter().any(|row| {
+                    row.get::<String, _>("name") == *column
+                        && row.get::<Option<String>, _>("dflt_value").is_none()
+                })
+            })
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut ddl: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE type='table' AND name=?")
+                .bind(table)
+                .fetch_one(&mut *conn)
+                .await?;
+        for column in missing {
+            // Match the exact declaration written by our unchanged migration
+            // files. Refuse unfamiliar DDL rather than guessing how to edit it.
+            let old = format!("{column} INTEGER NOT NULL");
+            if !ddl.contains(&old) {
+                return Err(Error::app(format!("cannot add the shared timestamp default to {table}.{column}: unexpected column declaration")));
+            }
+            ddl = ddl.replacen(&old, &format!("{old} DEFAULT {NOW}"), 1);
+        }
+        let objects: Vec<String> = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE tbl_name=? AND type IN ('index', 'trigger') AND sql IS NOT NULL")
+            .bind(table).fetch_all(&mut *conn).await?;
+        let body = ddl
+            .split_once('(')
+            .ok_or_else(|| Error::app("invalid table definition"))?
+            .1;
+        let temporary = format!("__durare_defaults_{table}");
+        conn.execute(format!("CREATE TABLE \"{temporary}\" ({body}").as_str())
+            .await?;
+        let names = info
+            .iter()
+            .map(|row| format!("\"{}\"", row.get::<String, _>("name").replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            format!("INSERT INTO \"{temporary}\" ({names}) SELECT {names} FROM \"{table}\"")
+                .as_str(),
+        )
+        .await?;
+        conn.execute(format!("DROP TABLE \"{table}\"").as_str())
+            .await?;
+        conn.execute(format!("ALTER TABLE \"{temporary}\" RENAME TO \"{table}\"").as_str())
+            .await?;
+        for sql in objects {
+            conn.execute(sql.as_str()).await?;
+        }
+    }
+    if sqlx::query("PRAGMA foreign_key_check")
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some()
+    {
+        return Err(Error::app(
+            "foreign key violation while adopting the shared SQLite schema",
+        ));
+    }
+    Ok(())
+}
+
 /// The version the shared ledger records; `None` before it exists or has its
 /// row.
 async fn ledger_version(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>> {
@@ -694,10 +789,22 @@ impl StateProvider for SqliteProvider {
         {
             return Ok(());
         }
-        drop(conn);
         // Everything else happens in one `BEGIN IMMEDIATE` transaction, so two
         // processes starting together apply the pending set once.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut guarded = MigrationConnection(Some(conn));
+        let conn = guarded.0.as_mut().expect("migration connection");
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut **conn)
+            .await?;
+        let legacy_alter: i64 = sqlx::query_scalar("PRAGMA legacy_alter_table")
+            .fetch_one(&mut **conn)
+            .await?;
+        // SQLite's create/copy/drop/rename procedure preserves dependent rows.
+        // Legacy rename handling leaves views and foreign-key references at the
+        // final table name while that name is temporarily absent.
+        conn.execute("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
+            .await?;
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(&format!(
             "CREATE TABLE IF NOT EXISTS {ledger} (version BIGINT NOT NULL PRIMARY KEY)",
             ledger = crate::migrate::LEDGER
@@ -742,11 +849,20 @@ impl StateProvider for SqliteProvider {
                 "applied system schema migration"
             );
         }
+        repair_timestamp_defaults(&mut tx).await?;
         let reached = applied.max(latest);
         if recorded != Some(reached) {
             record_schema_version(&mut tx, reached).await?;
         }
         tx.commit().await?;
+        conn.execute(
+            format!(
+                "PRAGMA foreign_keys = {foreign_keys}; PRAGMA legacy_alter_table = {legacy_alter}"
+            )
+            .as_str(),
+        )
+        .await?;
+        drop(guarded.0.take());
         Ok(())
     }
 

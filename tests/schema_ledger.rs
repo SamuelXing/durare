@@ -163,3 +163,76 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     common::remove_sqlite_files(&path);
     Ok(())
 }
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_legacy_adoption_preserves_data_and_adds_peer_defaults() -> Result<()> {
+    let owned_pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+    let provider = durare::SqliteProvider::from_pool(owned_pool.clone());
+    let pool = &owned_pool;
+    sqlx::migrate!("./migrations/sqlite").run(pool).await?;
+    sqlx::raw_sql("INSERT INTO workflow_status (workflow_uuid, name, status, created_at, updated_at)
+        VALUES ('parent', 'wf', 'PENDING', 123, 456);
+        INSERT INTO notifications (message_uuid, destination_uuid, topic, message, created_at_epoch_ms)
+        VALUES ('message', 'parent', 'topic', 'payload', 789);
+        CREATE VIEW workflow_names AS SELECT name FROM workflow_status;
+        CREATE TABLE audit (id TEXT);
+        CREATE TRIGGER version_audit AFTER INSERT ON application_versions
+        BEGIN INSERT INTO audit VALUES (NEW.version_id); END;")
+        .execute(pool).await?;
+    provider.init().await?;
+    provider.init().await?;
+    let times: (i64, i64) = sqlx::query_as(
+        "SELECT created_at, updated_at FROM workflow_status WHERE workflow_uuid='parent'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(times, (123, 456));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notifications")
+            .fetch_one(pool)
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT name FROM workflow_names")
+            .fetch_one(pool)
+            .await?,
+        "wf"
+    );
+    // Python's version registration omits these timestamps, relying on defaults.
+    sqlx::query(
+        "INSERT INTO application_versions (version_id, version_name) VALUES ('peer', 'peer')",
+    )
+    .execute(pool)
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT id FROM audit")
+            .fetch_one(pool)
+            .await?,
+        "peer"
+    );
+    sqlx::query("INSERT INTO workflow_status (workflow_uuid, name, status) VALUES ('peer', 'wf', 'PENDING')").execute(pool).await?;
+    sqlx::query("INSERT INTO notifications (message_uuid, destination_uuid, message) VALUES ('peer', 'peer', 'payload')").execute(pool).await?;
+    sqlx::query("INSERT INTO queues (queue_id, name) VALUES ('peer', 'peer')")
+        .execute(pool)
+        .await?;
+    assert!(sqlx::query("INSERT INTO notifications (message_uuid, destination_uuid, message) VALUES ('bad', 'missing', 'payload')").execute(pool).await.is_err());
+    assert!(sqlx::query(
+        "INSERT INTO application_versions (version_id, version_name) VALUES ('duplicate', 'peer')"
+    )
+    .execute(pool)
+    .await
+    .is_err());
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_optional(pool)
+        .await?
+        .is_none());
+    let ts: i64 = sqlx::query_scalar(
+        "SELECT version_timestamp FROM application_versions WHERE version_id='peer'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert!(ts > 0);
+    Ok(())
+}
