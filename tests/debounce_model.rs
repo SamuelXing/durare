@@ -27,6 +27,13 @@ async fn engine(db: Arc<dyn StateProvider>) -> Result<DurableEngine> {
     engine.register("a-b", |_ctx: DurableContext, msg: String| async move {
         Ok::<_, Error>(msg)
     });
+    for config in ["tenant-a", "tenant-b"] {
+        engine.register_configured(
+            "notify",
+            config,
+            |_ctx: DurableContext, msg: String| async move { Ok::<_, Error>(msg) },
+        );
+    }
     engine.launch().await?;
     Ok(engine)
 }
@@ -38,6 +45,93 @@ fn code(result: Result<WorkflowHandle<String>>) -> Option<ErrorCode> {
 async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
     let engine = engine(db.clone()).await?;
     let long = Duration::from_secs(600);
+
+    // A pinned id must not adopt another workflow's result on either API.
+    let existing: WorkflowHandle<String> = engine
+        .start(
+            "a",
+            "original".to_string(),
+            WorkflowOptions::with_id("existing-target"),
+        )
+        .await?;
+    assert_eq!(existing.result().await?, "original");
+    assert_eq!(
+        code(
+            engine
+                .debouncer("notify")
+                .options(WorkflowOptions::with_id("existing-target"))
+                .debounce("pinned", long, "replacement".to_string())
+                .await
+        ),
+        Some(ErrorCode::WorkflowTargetConflict)
+    );
+    let client = Client::new(db.clone());
+    assert_eq!(
+        code(
+            client
+                .debouncer("notify")
+                .options(WorkflowOptions::with_id("existing-target"))
+                .debounce("pinned", long, "replacement".to_string())
+                .await
+        ),
+        Some(ErrorCode::WorkflowTargetConflict)
+    );
+
+    // Configured handlers debounce independently; either API can bounce them.
+    let mut instances = Vec::new();
+    for config in ["tenant-a", "tenant-b"] {
+        let opts = WorkflowOptions {
+            config_name: Some(config.into()),
+            ..Default::default()
+        };
+        let first: WorkflowHandle<String> = engine
+            .debouncer("notify")
+            .options(opts.clone())
+            .debounce("shared", long, "initial")
+            .await?;
+        let second: WorkflowHandle<String> = client
+            .debouncer("notify")
+            .options(opts)
+            .debounce("shared", long, config)
+            .await?;
+        assert_eq!(first.id(), second.id());
+        let row = first.get_status().await?;
+        assert_eq!(row.config_name.as_deref(), Some(config));
+        assert_eq!(row.dedup_id, Some(format!("notify/{config}-shared")));
+        instances.push(first);
+    }
+    assert_ne!(instances[0].id(), instances[1].id());
+    assert_eq!(instances[0].get_status().await?.input, json!("tenant-a"));
+    assert_eq!(instances[1].get_status().await?.input, json!("tenant-b"));
+
+    // Even a peer-written key cannot bounce a different class or instance.
+    for (key, class, config) in [
+        ("wrong-class", Some("OtherClass"), None),
+        ("wrong-config", None, Some("another-instance")),
+    ] {
+        let mut peer =
+            WorkflowStatus::new(key, "notify", json!("untouched"), STATUS_DELAYED, "", "");
+        peer.queue_name = Some(INTERNAL_QUEUE.into());
+        peer.dedup_id = Some(format!("notify-{key}"));
+        peer.is_debounced = true;
+        peer.delay_until_ms = Some(chrono::Utc::now().timestamp_millis() + 600_000);
+        peer.class_name = class.map(str::to_string);
+        peer.config_name = config.map(str::to_string);
+        db.insert_workflow_status(peer).await?;
+        assert_eq!(
+            code(
+                client
+                    .debouncer("notify")
+                    .debounce(key, long, "replacement")
+                    .await
+            ),
+            Some(ErrorCode::QueueDeduplicated)
+        );
+        assert_eq!(
+            db.get_workflow_status(key).await?.unwrap().input,
+            json!("untouched")
+        );
+    }
 
     // The row a debounce creates: DELAYED on the internal queue, holding
     // `{workflow}-{key}`, marked, uncapped without a timeout.
@@ -163,6 +257,9 @@ async fn contract(db: Arc<dyn StateProvider>) -> Result<()> {
     peer.dedup_id = Some("notify-shared".into());
     peer.delay_until_ms = Some(chrono::Utc::now().timestamp_millis() + 600_000);
     peer.is_debounced = true;
+    // Peers may store absent identity fields as empty strings.
+    peer.class_name = Some(String::new());
+    peer.config_name = Some(String::new());
     db.insert_workflow_status(peer).await?;
     let client = Client::new(db.clone());
     let joined: WorkflowHandle<String> = client

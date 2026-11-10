@@ -92,7 +92,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The debouncer runs on the model the Go and Python SDKs use. A debounced
   workflow is the target itself, waiting `DELAYED` on its queue and holding
-  `{workflow}-{key}` as its deduplication id; each bounce is one atomic update
+  `{workflow}-{key}` (or `{workflow}/{config}-{key}` for configured instances)
+  as its deduplication id; each bounce is one atomic update
   that pushes the wake instant out, never past the deadline a `timeout` sets,
   and replaces the input. A durare debounce and a peer's debounce of the same
   workflow and key now coalesce into one run. The internal collector workflow
@@ -103,7 +104,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   identity, and the id of a fresh run); a deduplication id, delay, partition
   key or deduplication policy is refused, as the reference SDKs refuse them,
   and a key held by a run that is not a debounce of the same workflow is a
-  `QueueDeduplicated` error instead of a second collector.
+  `QueueDeduplicated` error instead of a second collector. Bounces also check
+  the class and configured instance before replacing input; reusing a workflow
+  id for another target returns `WorkflowTargetConflict` on both producer APIs.
 - `StateProvider::debounce_delayed_workflow` is a new provided method, the
   atomic bounce behind the debouncer, with `DebounceRequest` and
   `DebounceOutcome`. The built-in providers implement it; the default refuses,

@@ -114,12 +114,15 @@ impl StateProvider for InMemoryProvider {
         let Some(holder) = dedup_holder(&mut g, req.queue_name, req.dedup_id) else {
             return Ok(DebounceOutcome::Unheld);
         };
-        if holder.name != req.workflow_name
+        if crate::provider::check_target(holder, req.workflow_name, req.class_name, req.config_name)
+            .is_err()
             || holder.status != STATUS_DELAYED
             || !holder.is_debounced
         {
             return Ok(DebounceOutcome::Held {
                 workflow_name: holder.name.clone(),
+                class_name: holder.class_name.clone(),
+                config_name: holder.config_name.clone(),
                 is_debounced: holder.is_debounced,
             });
         }

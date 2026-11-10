@@ -2639,6 +2639,8 @@ impl StateProvider for PostgresProvider {
                  inputs = $2, serialization = $3, updated_at = $4
              WHERE name = $5 AND queue_name = $6 AND deduplication_id = $7
                AND status = $8 AND is_debounced = TRUE
+               AND COALESCE(class_name, '') = COALESCE($9, '')
+               AND COALESCE(config_name, '') = COALESCE($10, '')
              RETURNING workflow_uuid",
             workflow_status = self.tables.workflow_status
         ))
@@ -2650,14 +2652,16 @@ impl StateProvider for PostgresProvider {
         .bind(req.queue_name)
         .bind(req.dedup_id)
         .bind(STATUS_DELAYED)
+        .bind(req.class_name)
+        .bind(req.config_name)
         .fetch_optional(&self.pool)
         .await?;
         if let Some(id) = bounced {
             return Ok(DebounceOutcome::Bounced(id));
         }
         // The partial unique index admits at most one holder.
-        let holder: Option<(String, bool)> = sqlx::query_as(&format!(
-            "SELECT name, is_debounced FROM {workflow_status}
+        let holder = sqlx::query_as(&format!(
+            "SELECT name, is_debounced, class_name, config_name FROM {workflow_status}
              WHERE queue_name = $1 AND deduplication_id = $2",
             workflow_status = self.tables.workflow_status
         ))

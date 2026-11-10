@@ -1369,6 +1369,10 @@ pub struct DebounceRequest<'a> {
     /// The debounced workflow's registered name; a run of another workflow
     /// holding the same key is a collision, never extended.
     pub workflow_name: &'a str,
+    /// The target class; empty and absent names are equivalent.
+    pub class_name: Option<&'a str>,
+    /// The configured target instance; empty and absent names are equivalent.
+    pub config_name: Option<&'a str>,
     /// The queue the debounced run waits on.
     pub queue_name: &'a str,
     /// The debounce key as stored: the run's deduplication id.
@@ -1392,17 +1396,27 @@ pub enum DebounceOutcome {
     Held {
         /// The holder's workflow name.
         workflow_name: String,
+        /// The holder's target class.
+        class_name: Option<String>,
+        /// The holder's configured instance.
+        config_name: Option<String>,
         /// Whether the holder is itself a debounced run.
         is_debounced: bool,
     },
 }
 
 /// The outcome for the key's holder, if the bounce extended nothing: the row
-/// the SQL backends read as `(name, is_debounced)`.
-pub(crate) fn holder_outcome(holder: Option<(String, bool)>) -> DebounceOutcome {
+/// the SQL backends read with its target identity.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+type DebounceHolder = (String, bool, Option<String>, Option<String>);
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn holder_outcome(holder: Option<DebounceHolder>) -> DebounceOutcome {
     match holder {
-        Some((workflow_name, is_debounced)) => DebounceOutcome::Held {
+        Some((workflow_name, is_debounced, class_name, config_name)) => DebounceOutcome::Held {
             workflow_name,
+            class_name,
+            config_name,
             is_debounced,
         },
         None => DebounceOutcome::Unheld,
@@ -1664,8 +1678,8 @@ pub trait StateProvider: Send + Sync {
     /// Push back the debounced `DELAYED` run holding `req.dedup_id` on
     /// `req.queue_name`, in one atomic step: its `delay_until_ms` becomes
     /// `req.delay_until_ms`, capped at its `debounce_deadline_ms`, and its input
-    /// is replaced. Only a run of `req.workflow_name` that is debounced and
-    /// still `DELAYED` is extended; otherwise the outcome reports the holder,
+    /// is replaced. Only a run with the same workflow name, class and config
+    /// that is debounced and still `DELAYED` is extended; otherwise the outcome reports the holder,
     /// or that the key is free. Backs [`Debouncer`](crate::Debouncer).
     ///
     /// The default refuses: a provider that cannot do this atomically cannot

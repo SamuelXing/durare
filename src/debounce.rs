@@ -10,8 +10,10 @@
 //!
 //! The debounced run is an ordinary queued workflow waiting `DELAYED`. It holds
 //! its debounce key, `{workflow}-{key}`, as its queue deduplication id and is
-//! marked `is_debounced`. A bounce is one atomic update of that row: push its
-//! wake instant out, never past the deadline, and replace its input. When the
+//! marked `is_debounced`. Configured instances use `{workflow}/{config}-{key}`
+//! so separate handlers never coalesce. A bounce atomically checks the target
+//! identity, pushes its wake instant out (never past the deadline), and replaces
+//! its input. When the
 //! dispatcher promotes the run to `ENQUEUED` it releases the key, so a later
 //! call under the same key starts a fresh run. The Go and Python SDKs use the
 //! same rows, so a durare debounce and a peer's debounce of the same workflow
@@ -151,7 +153,11 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
         .queue
         .clone()
         .unwrap_or_else(|| INTERNAL_QUEUE.to_string());
-    let dedup_id = format!("{target}-{key}");
+    let prefix = match opts.config_name.as_deref().filter(|s| !s.is_empty()) {
+        Some(config) => format!("{target}/{config}"),
+        None => target.to_string(),
+    };
+    let dedup_id = format!("{prefix}-{key}");
     let delay_ms = delay.as_millis() as i64;
     // The first wait never outlasts the cap either.
     let first_wait = if timeout.is_zero() {
@@ -167,6 +173,8 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
             .provider()
             .debounce_delayed_workflow(&DebounceRequest {
                 workflow_name: target,
+                class_name: opts.class_name.as_deref().filter(|s| !s.is_empty()),
+                config_name: opts.config_name.as_deref().filter(|s| !s.is_empty()),
                 queue_name: &queue,
                 dedup_id: &dedup_id,
                 delay_until_ms: now + delay_ms,
@@ -181,8 +189,15 @@ pub(crate) async fn run_debounce<B: DebounceBackend>(
             DebounceOutcome::Held {
                 workflow_name,
                 is_debounced,
-                ..
-            } if !is_debounced || workflow_name != target => {
+                class_name,
+                config_name,
+            } if !is_debounced
+                || workflow_name != target
+                || class_name.as_deref().filter(|s| !s.is_empty())
+                    != opts.class_name.as_deref().filter(|s| !s.is_empty())
+                || config_name.as_deref().filter(|s| !s.is_empty())
+                    != opts.config_name.as_deref().filter(|s| !s.is_empty()) =>
+            {
                 return Err(Error::queue_deduplicated(queue, dedup_id));
             }
             // Our own debounced run left DELAYED between the bounce and the

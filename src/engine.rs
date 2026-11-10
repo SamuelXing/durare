@@ -3444,6 +3444,7 @@ impl Runtime {
         let (mut row, queued) = self.build_run(&id, name, input, opts, None, &auth)?;
         stamp(&mut row);
         let (canonical, created) = self.insert_row(row).await?;
+        check_workflow_target(&canonical, name, opts)?;
         Ok((canonical, queued, created))
     }
 
