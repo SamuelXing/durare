@@ -54,8 +54,11 @@ async fn cron_fires_once_per_tick_across_executors() -> Result<()> {
         rows.len(),
         "each tick must run exactly once across both executors"
     );
-    // Every scheduled run is keyed by tick time.
+    // Every scheduled run is keyed by tick time and records its schedule.
     assert!(rows.iter().all(|r| r.id.starts_with("sched-cron_tick-")));
+    assert!(rows
+        .iter()
+        .all(|r| r.schedule_name.as_deref() == Some("cron_tick")));
 
     // A `#[workflow(schedule)]` schedule is ephemeral (decorator-style): it
     // fires, but nothing is written to `workflow_schedules`. The managed/CRUD

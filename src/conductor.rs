@@ -1639,6 +1639,8 @@ impl ListBody {
             authenticated_users: self.authenticated_user.vec(),
             forked_from: self.forked_from.vec(),
             parent_workflow_ids: self.parent_workflow_id.vec(),
+            // Not part of the conductor's list protocol in any SDK.
+            schedule_name: Vec::new(),
             was_forked_from: self.was_forked_from,
             queue_name: self.queue_name.vec(),
             workflow_id_prefix: self.workflow_id_prefix.vec(),

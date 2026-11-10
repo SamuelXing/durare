@@ -33,7 +33,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at, attributes";
+     serialization, created_at, updated_at, attributes, schedule_name";
 
 /// Routes inbound `LISTEN`/`NOTIFY` notifications to the `recv`/`get_event`
 /// waiters parked on the matching payload. Waiters subscribe by payload; the
@@ -374,9 +374,10 @@ impl PostgresProvider {
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at, attributes, owner_xid)
+                  serialization, created_at, updated_at, attributes, schedule_name,
+                  owner_xid)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22, $23, gen_random_uuid()::TEXT)
+                     $17, $18, $19, $20, $21, $22, $23, $24, gen_random_uuid()::TEXT)
              {conflict}",
             workflow_status = self.tables.workflow_status
         ))
@@ -403,6 +404,7 @@ impl PostgresProvider {
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
         .bind(&s.attributes)
+        .bind(&s.schedule_name)
         .execute(&mut *connection)
         .await
         .map_err(|e| dedup_or(e, s))?
@@ -1014,6 +1016,7 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
         ),
         class_name: row.try_get("class_name").ok().flatten(),
         config_name: row.try_get("config_name").ok().flatten(),
+        schedule_name: row.try_get("schedule_name").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -3479,9 +3482,11 @@ impl StateProvider for PostgresProvider {
                       recovery_attempts, queue_name, workflow_timeout_ms,
                       workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
                       priority, queue_partition_key, forked_from, parent_workflow_id,
-                      delay_until_epoch_ms, serialization, was_forked_from, completed_at)
+                      delay_until_epoch_ms, serialization, was_forked_from, completed_at,
+                      schedule_name)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)",
+                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
+                         $31)",
                 workflow_status = self.tables.workflow_status
             ))
             .bind(col_str(s, "workflow_uuid"))
@@ -3520,6 +3525,7 @@ impl StateProvider for PostgresProvider {
             // older Rust ones). Never derived from this row's own `forked_from`.
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
             .bind(col_i64(s, "completed_at"))
+            .bind(col_str(s, "schedule_name"))
             .execute(&mut *tx)
             .await?;
 
@@ -3829,6 +3835,7 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, filter: &'a ListFi
     push_in(qb, "authenticated_user", &filter.authenticated_users);
     push_in(qb, "forked_from", &filter.forked_from);
     push_in(qb, "parent_workflow_id", &filter.parent_workflow_ids);
+    push_in(qb, "schedule_name", &filter.schedule_name);
     if !filter.workflow_id_prefix.is_empty() {
         clause(qb);
         let patterns: Vec<String> = filter

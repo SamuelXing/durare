@@ -118,6 +118,23 @@ impl Client {
     where
         I: Serialize,
     {
+        self.enqueue_with(queue_name, workflow_name, input, opts, None)
+            .await
+    }
+
+    /// [`enqueue`](Self::enqueue), stamping the schedule that created the run
+    /// when a schedule is the caller.
+    async fn enqueue_with<I, O>(
+        &self,
+        queue_name: &str,
+        workflow_name: &str,
+        input: I,
+        opts: WorkflowOptions,
+        schedule_name: Option<&str>,
+    ) -> Result<WorkflowHandle<O>>
+    where
+        I: Serialize,
+    {
         if queue_name.is_empty() {
             return Err(Error::app("queue name is required"));
         }
@@ -158,6 +175,7 @@ impl Client {
         row.authenticated_roles = opts.authenticated_roles.clone();
         row.class_name = opts.class_name.clone();
         row.config_name = opts.config_name.clone();
+        row.schedule_name = schedule_name.map(str::to_string);
         row.attributes = crate::engine::attributes_for_row(&opts);
         row.timeout_ms = opts.timeout.map(|d| d.as_millis() as i64);
         row.delay_until_ms = opts.delay.map(|d| now_ms + d.as_millis() as i64);
@@ -671,11 +689,12 @@ impl Client {
         let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let id = format!("sched-{schedule_name}-trigger-{stamp}");
         let queue = schedule.queue_name.as_deref().unwrap_or(INTERNAL_QUEUE);
-        self.enqueue(
+        self.enqueue_with(
             queue,
             &schedule.workflow_name,
             schedule.tick_input(now),
             WorkflowOptions::with_id(id),
+            Some(schedule_name),
         )
         .await
     }
@@ -703,11 +722,12 @@ impl Client {
         let mut ids = Vec::new();
         for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
             let id = format!("sched-{schedule_name}-{}", instant.to_rfc3339());
-            self.enqueue::<_, serde_json::Value>(
+            self.enqueue_with::<_, serde_json::Value>(
                 queue,
                 &schedule.workflow_name,
                 schedule.tick_input(instant),
                 WorkflowOptions::with_id(id.clone()),
+                Some(schedule_name),
             )
             .await?;
             ids.push(id);
