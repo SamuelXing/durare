@@ -164,8 +164,10 @@ impl ChangeWait<'_> {
         }
     }
 
-    /// The `NOTIFY` payload the schema trigger emits for this condition
-    /// (`workflow_uuid::topic` / `workflow_uuid::key`).
+    /// The `NOTIFY` payload for this condition, `workflow_uuid::topic` or
+    /// `workflow_uuid::key`: what the notifications trigger emits and what the
+    /// events notifier pushes, the one wire form every SDK's listener keys
+    /// its waiters by.
     #[cfg(feature = "postgres")]
     pub(crate) fn payload(&self) -> String {
         match self {

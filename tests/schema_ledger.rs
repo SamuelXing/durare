@@ -3,10 +3,10 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds, per dialect: 43 is Postgres-only
-/// (it drops a trigger SQLite never had), so SQLite stops one earlier, as the
-/// Go and Python SDKs' SQLite chains do.
-const PG_LATEST: i64 = 43;
+/// The newest migration this build embeds, per dialect: 43 and 44 are
+/// Postgres-only (they drop triggers SQLite never had), so SQLite stops at 42,
+/// as the Go and Python SDKs' SQLite chains do.
+const PG_LATEST: i64 = 44;
 const SQLITE_LATEST: i64 = 42;
 
 #[cfg(feature = "postgres")]
@@ -28,13 +28,12 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
                 .fetch_all(pool)
                 .await
         }
-        // The streams trigger migration 39 creates and migration 43 drops.
-        async fn streams_trigger(pool: &PgPool) -> sqlx::Result<bool> {
-            sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'dbos_streams_trigger')",
-            )
-            .fetch_one(pool)
-            .await
+        // The triggers migrations 1 and 39 create and migrations 43 and 44 drop.
+        async fn trigger_exists(pool: &PgPool, name: &str) -> sqlx::Result<bool> {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await
         }
 
         // One row, at the newest version; sqlx's ledger is no longer written.
@@ -45,6 +44,17 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
                 .await?;
         assert!(!legacy, "no sqlx ledger expected");
         provider.ping().await?;
+
+        // Migration 44 dropped the events trigger migration 1 created; a
+        // rollback below never reaches 1, so this is the one place to see it.
+        assert!(
+            !trigger_exists(&pool, "dbos_workflow_events_trigger").await?,
+            "migration 44 dropped the events trigger"
+        );
+        assert!(
+            trigger_exists(&pool, "dbos_notifications_trigger").await?,
+            "the notifications trigger stays"
+        );
 
         // A second initialisation changes nothing.
         provider.init().await?;
@@ -89,7 +99,11 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         .fetch_one(&pool)
         .await?;
         assert!(debounced, "migration 42 re-applied");
-        assert!(!streams_trigger(&pool).await?, "migration 43 re-applied");
+        assert!(
+            !trigger_exists(&pool, "dbos_streams_trigger").await?,
+            "migration 43 re-applied"
+        );
+
 
         // A database a newer peer moved ahead is healthy and left alone.
         sqlx::query("UPDATE dbos.dbos_migrations SET version = 125")
