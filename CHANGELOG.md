@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `StepOutcome::from_columns` public constructor rebuilds a recorded step
+  outcome from an `operation_outputs` row's columns and serialization format,
+  so external `StateProvider` implementations can decode step rows exactly
+  like the built-in SQL backends.
 - `DurableContext::enqueue_workflow` enqueues named children without a local
   workflow registration, preserving child checkpoints and identity inheritance.
   Remote targets require an explicit target application version. Same-version
