@@ -1641,6 +1641,7 @@ impl ListBody {
             parent_workflow_ids: self.parent_workflow_id.vec(),
             // Not part of the conductor's list protocol in any SDK.
             schedule_name: Vec::new(),
+            is_debounced: None,
             was_forked_from: self.was_forked_from,
             queue_name: self.queue_name.vec(),
             workflow_id_prefix: self.workflow_id_prefix.vec(),

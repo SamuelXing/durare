@@ -6,9 +6,9 @@ use crate::provider::{
     RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
     StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
     WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
-    EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL,
+    EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
+    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
+    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -29,7 +29,8 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at, attributes, schedule_name";
+     serialization, created_at, updated_at, attributes, schedule_name, \
+     debounce_deadline_epoch_ms, is_debounced";
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -69,8 +70,8 @@ impl SqliteProvider {
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
                   serialization, created_at, updated_at, attributes, schedule_name,
-                  owner_xid)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  debounce_deadline_epoch_ms, is_debounced, owner_xid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                      lower(hex(randomblob(16))))
              {conflict}",
         ))
@@ -98,6 +99,8 @@ impl SqliteProvider {
         .bind(s.updated_at.timestamp_millis())
         .bind(encode_attributes(&s.attributes)?)
         .bind(&s.schedule_name)
+        .bind(s.debounce_deadline_ms)
+        .bind(s.is_debounced)
         .execute(&mut *connection)
         .await
         .map_err(|e| dedup_or(e, s))?
@@ -314,6 +317,8 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
         class_name: row.try_get("class_name").ok().flatten(),
         config_name: row.try_get("config_name").ok().flatten(),
         schedule_name: row.try_get("schedule_name").ok().flatten(),
+        debounce_deadline_ms: row.try_get("debounce_deadline_epoch_ms").ok().flatten(),
+        is_debounced: row.try_get("is_debounced").unwrap_or(false),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -1479,7 +1484,8 @@ impl StateProvider for SqliteProvider {
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64> {
         let res = sqlx::query(
             "UPDATE workflow_status
-             SET status = ?, delay_until_epoch_ms = NULL, updated_at = ?
+             SET status = ?, delay_until_epoch_ms = NULL, updated_at = ?,
+                 deduplication_id = CASE WHEN is_debounced THEN NULL ELSE deduplication_id END
              WHERE status = ? AND delay_until_epoch_ms <= ?",
         )
         .bind(STATUS_ENQUEUED)
@@ -2811,9 +2817,9 @@ impl StateProvider for SqliteProvider {
                       workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
                       priority, queue_partition_key, forked_from, parent_workflow_id,
                       delay_until_epoch_ms, serialization, was_forked_from, completed_at,
-                      schedule_name)
+                      schedule_name, debounce_deadline_epoch_ms, is_debounced)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                         ?, ?, ?, ?, ?, ?)",
+                         ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(col_str(s, "workflow_uuid"))
             .bind(col_str(s, "status"))
@@ -2852,6 +2858,8 @@ impl StateProvider for SqliteProvider {
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
             .bind(col_i64(s, "completed_at"))
             .bind(col_str(s, "schedule_name"))
+            .bind(col_i64(s, "debounce_deadline_epoch_ms"))
+            .bind(col_bool(s, "is_debounced").unwrap_or(false))
             .execute(&mut *tx)
             .await?;
 
@@ -2969,12 +2977,9 @@ fn export_status_map(row: &sqlx::sqlite::SqliteRow) -> Map<String, Value> {
     // Not in the shared list: `priority` is INTEGER on Postgres and BIGINT
     // here, so each backend reads it at its own width.
     m.insert("priority".to_string(), i_col(row, "priority"));
-    // `was_forked_from` (0/1) — emitted as a bool so the flag round-trips across
-    // SDKs the way Python's portable format does (Go omits it).
-    m.insert(
-        "was_forked_from".to_string(),
-        bool_col(row, "was_forked_from"),
-    );
+    for &c in EXPORT_STATUS_BOOL_COLS {
+        m.insert(c.to_string(), bool_col(row, c));
+    }
     m
 }
 
@@ -3199,6 +3204,11 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
         } else {
             "was_forked_from = FALSE"
         });
+    }
+    if let Some(debounced) = filter.is_debounced {
+        // NOT NULL DEFAULT FALSE, so plain equality suffices.
+        clause(qb);
+        qb.push("is_debounced = ").push_bind(debounced);
     }
     if let Some(t) = filter.start_time_ms {
         clause(qb);

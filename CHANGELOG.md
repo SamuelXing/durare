@@ -8,6 +8,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Migration 42 adds `workflow_status.debounce_deadline_epoch_ms` and
+  `is_debounced`, as the Go and Python SDKs define them: a debounced run waits
+  `DELAYED` holding its debounce key as its deduplication id. `WorkflowStatus`
+  carries both columns, `ListFilter::is_debounced` filters by the marker, and
+  the dispatcher clears a debounced run's deduplication id when it moves to
+  `ENQUEUED`, so a peer's later debounce under the same key starts a fresh run.
+
 - `WorkflowStatus::schedule_name` records the schedule that created a run,
   on every path the scheduler creates runs by (cron ticks, including
   `#[workflow(schedule)]` ones, `trigger_schedule` and `backfill_schedule`,
@@ -83,8 +90,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- `WorkflowStatus` and `ListFilter` gain a `schedule_name` field, so code that
-  builds either with a struct literal must name it; `WorkflowStatus::new` and
+- `WorkflowStatus` gains `schedule_name`, `debounce_deadline_ms` and
+  `is_debounced`, and `ListFilter` gains `schedule_name` and `is_debounced`, so
+  code that builds either with a struct literal must name them; `WorkflowStatus::new` and
   `ListFilter::default` are unaffected. The crate version moves to 0.6.0 for it.
 - The system schema's version is recorded in the `dbos_migrations` ledger every
   DBOS SDK shares instead of sqlx's `_sqlx_migrations`, so durare and the other

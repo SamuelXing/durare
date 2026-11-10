@@ -6,9 +6,10 @@ use crate::provider::{
     RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
     StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
     WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
-    EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
+    EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -33,7 +34,8 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at, attributes, schedule_name";
+     serialization, created_at, updated_at, attributes, schedule_name, \
+     debounce_deadline_epoch_ms, is_debounced";
 
 /// Routes inbound `LISTEN`/`NOTIFY` notifications to the `recv`/`get_event`
 /// waiters parked on the matching payload. Waiters subscribe by payload; the
@@ -375,9 +377,9 @@ impl PostgresProvider {
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
                   serialization, created_at, updated_at, attributes, schedule_name,
-                  owner_xid)
+                  debounce_deadline_epoch_ms, is_debounced, owner_xid)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-                     $17, $18, $19, $20, $21, $22, $23, $24, gen_random_uuid()::TEXT)
+                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, gen_random_uuid()::TEXT)
              {conflict}",
             workflow_status = self.tables.workflow_status
         ))
@@ -405,6 +407,8 @@ impl PostgresProvider {
         .bind(s.updated_at.timestamp_millis())
         .bind(&s.attributes)
         .bind(&s.schedule_name)
+        .bind(s.debounce_deadline_ms)
+        .bind(s.is_debounced)
         .execute(&mut *connection)
         .await
         .map_err(|e| dedup_or(e, s))?
@@ -1017,6 +1021,8 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
         class_name: row.try_get("class_name").ok().flatten(),
         config_name: row.try_get("config_name").ok().flatten(),
         schedule_name: row.try_get("schedule_name").ok().flatten(),
+        debounce_deadline_ms: row.try_get("debounce_deadline_epoch_ms").ok().flatten(),
+        is_debounced: row.try_get("is_debounced").unwrap_or(false),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -2060,7 +2066,8 @@ impl StateProvider for PostgresProvider {
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64> {
         let res = sqlx::query(&format!(
             "UPDATE {workflow_status}
-             SET status = $1, delay_until_epoch_ms = NULL, updated_at = $2
+             SET status = $1, delay_until_epoch_ms = NULL, updated_at = $2,
+                 deduplication_id = CASE WHEN is_debounced THEN NULL ELSE deduplication_id END
              WHERE status = $3 AND delay_until_epoch_ms <= $2",
             workflow_status = self.tables.workflow_status
         ))
@@ -3483,10 +3490,10 @@ impl StateProvider for PostgresProvider {
                       workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
                       priority, queue_partition_key, forked_from, parent_workflow_id,
                       delay_until_epoch_ms, serialization, was_forked_from, completed_at,
-                      schedule_name)
+                      schedule_name, debounce_deadline_epoch_ms, is_debounced)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                          $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
-                         $31)",
+                         $31, $32, $33)",
                 workflow_status = self.tables.workflow_status
             ))
             .bind(col_str(s, "workflow_uuid"))
@@ -3526,6 +3533,8 @@ impl StateProvider for PostgresProvider {
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
             .bind(col_i64(s, "completed_at"))
             .bind(col_str(s, "schedule_name"))
+            .bind(col_i64(s, "debounce_deadline_epoch_ms"))
+            .bind(col_bool(s, "is_debounced").unwrap_or(false))
             .execute(&mut *tx)
             .await?;
 
@@ -3653,12 +3662,9 @@ fn export_status_map(row: &sqlx::postgres::PgRow) -> Map<String, Value> {
     // The one exported status integer that is not BIGINT here: INTEGER on
     // Postgres, BIGINT on SQLite, so it sits outside the shared list.
     m.insert("priority".to_string(), i32_col(row, "priority"));
-    // `was_forked_from` (BOOLEAN) — included so the flag round-trips across SDKs
-    // the way Python's portable format does (Go omits it).
-    m.insert(
-        "was_forked_from".to_string(),
-        bool_col(row, "was_forked_from"),
-    );
+    for &c in EXPORT_STATUS_BOOL_COLS {
+        m.insert(c.to_string(), bool_col(row, c));
+    }
     m
 }
 
@@ -3854,6 +3860,11 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, filter: &'a ListFi
         } else {
             "was_forked_from = FALSE"
         });
+    }
+    if let Some(debounced) = filter.is_debounced {
+        // NOT NULL DEFAULT FALSE, so plain equality suffices.
+        clause(qb);
+        qb.push("is_debounced = ").push_bind(debounced);
     }
     if let Some(t) = filter.start_time_ms {
         clause(qb);
