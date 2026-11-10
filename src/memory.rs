@@ -1335,7 +1335,7 @@ impl StateProvider for InMemoryProvider {
         Ok(rows
             .into_iter()
             .map(|n| NotificationInfo {
-                topic: (!n.topic.is_empty()).then(|| n.topic.clone()),
+                topic: Some(n.topic.clone()),
                 message: n.message.clone(),
                 created_at_ms: n.created_at_ms,
                 consumed: n.consumed,
@@ -1793,7 +1793,7 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
 
 /// The [`StepOutcome`] a recorded [`StepRow`] represents: a recorded `error` is a
 /// failure (legacy text or a versioned error), otherwise its `output`.
-/// Mirrors the SQL backends' `step_outcome_from`.
+/// Mirrors the SQL backends' [`StepOutcome::from_columns`].
 fn step_row_outcome(r: &StepRow) -> StepOutcome {
     match &r.error {
         Some(e) => {
