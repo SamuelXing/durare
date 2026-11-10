@@ -765,7 +765,7 @@ pub struct DurableEngine {
     required_roles: HashMap<String, Vec<String>>,
     /// Per-workflow recovery-attempt caps keyed by workflow name; see
     /// [`max_recovery_attempts_for`](Self::max_recovery_attempts_for).
-    recovery_caps: HashMap<String, i32>,
+    recovery_caps: Arc<std::sync::RwLock<HashMap<String, i32>>>,
     /// Cancelled by [`shutdown`](Self::shutdown) to stop the background loops.
     /// [`launch`](Self::launch) installs a fresh token after a shutdown, since a
     /// cancelled token can't be reset.
@@ -989,7 +989,7 @@ impl DurableEngineBuilder {
             recover_on_launch: self.config.resolve_recover_on_launch(),
             retention: self.config.retention,
             required_roles: self.required_roles,
-            recovery_caps,
+            recovery_caps: Arc::new(std::sync::RwLock::new(recovery_caps)),
             shutdown_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             deactivated: Arc::new(AtomicBool::new(false)),
             automatic_recovery_stop: CancellationToken::new(),
@@ -1073,7 +1073,7 @@ impl DurableEngine {
             recover_on_launch: config.resolve_recover_on_launch(),
             retention: config.retention,
             required_roles: HashMap::new(),
-            recovery_caps,
+            recovery_caps: Arc::new(std::sync::RwLock::new(recovery_caps)),
             shutdown_token: Arc::new(std::sync::Mutex::new(CancellationToken::new())),
             deactivated: Arc::new(AtomicBool::new(false)),
             automatic_recovery_stop: CancellationToken::new(),
@@ -1287,7 +1287,10 @@ impl DurableEngine {
     /// Must be called before [`launch`](Self::launch), which validates that
     /// `name` is a registered workflow.
     pub fn max_recovery_attempts_for(&mut self, name: impl Into<String>, max: i32) -> &mut Self {
-        self.recovery_caps.insert(name.into(), max);
+        self.recovery_caps
+            .write()
+            .expect("recovery caps poisoned")
+            .insert(name.into(), max);
         self
     }
 
@@ -1601,7 +1604,12 @@ impl DurableEngine {
         // A required-roles declaration or a recovery cap for an unregistered
         // workflow is a typo that would silently enforce nothing — reject it
         // up front.
-        for name in self.required_roles.keys().chain(self.recovery_caps.keys()) {
+        for name in self.required_roles.keys().chain(
+            self.recovery_caps
+                .read()
+                .expect("recovery caps poisoned")
+                .keys(),
+        ) {
             if !is_registered(&self.workflows, name) {
                 return Err(Error::UnknownWorkflow(name.clone()));
             }
@@ -3100,7 +3108,7 @@ pub(crate) struct Runtime {
     /// body runs, on every execution path. See [`DurableEngine::require_roles`].
     required_roles: HashMap<String, Vec<String>>,
     /// Per-workflow recovery-attempt caps; see [`Runtime::recovery_cap`].
-    recovery_caps: HashMap<String, i32>,
+    recovery_caps: Arc<std::sync::RwLock<HashMap<String, i32>>>,
     executor_id: String,
     app_version: String,
     tasks: TaskTracker,
@@ -3126,6 +3134,8 @@ impl Runtime {
     /// engine's default.
     fn recovery_cap(&self, name: &str) -> i32 {
         self.recovery_caps
+            .read()
+            .expect("recovery caps poisoned")
             .get(name)
             .copied()
             .unwrap_or(self.max_recovery_attempts)
