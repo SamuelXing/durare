@@ -228,6 +228,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `get_step_result`, `record_step_result`, and `list_workflow_notifications`,
   so a provider implemented in another crate could not compile.
 
+### Documentation
+
+- The README and crate introduction describe durare as an independent Rust
+  durable-execution library. DBOS storage and tooling details live in
+  `docs/dbos-compatibility.md`; the README keeps a short compatibility link
+  and explains explicit context without an SDK comparison. The first example
+  now states the idempotency requirement for external calls.
+
 ## [0.5.0] - 2026-10-06
 
 Durable semantics now survive code motion or fail loudly. Every durable call
