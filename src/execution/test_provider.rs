@@ -378,6 +378,12 @@ impl StateProvider for FaultProvider {
     async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
         self.inner.delete_workflows(ids, delete_children).await
     }
+    async fn debounce_delayed_workflow(
+        &self,
+        req: &crate::provider::DebounceRequest<'_>,
+    ) -> Result<crate::provider::DebounceOutcome> {
+        self.inner.debounce_delayed_workflow(req).await
+    }
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
         self.inner.set_workflow_delay(id, delay_until_ms).await
     }

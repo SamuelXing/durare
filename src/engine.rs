@@ -502,6 +502,15 @@ impl WorkflowOptions {
         Ok(())
     }
 
+    /// The id the run gets: the pinned one, or a fresh uuid. An explicit empty
+    /// id means "assign one for me", so an empty id is never persisted.
+    pub(crate) fn id_or_fresh(&self) -> String {
+        self.workflow_id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    }
+
     /// Convenience: options that only pin the workflow id.
     pub fn with_id(id: impl Into<String>) -> Self {
         Self {
@@ -1223,10 +1232,53 @@ impl DurableEngine {
 
     /// A [`Debouncer`](crate::Debouncer) for `target_workflow`: coalesce rapid
     /// repeated triggers (grouped by key) into a single delayed run with the
-    /// latest input. The target must be registered, and the engine must be
-    /// launched so the internal queue runs the collector.
+    /// latest input. The target must be registered, and a launched engine must
+    /// dispatch the queue the run waits on (the internal queue unless the
+    /// debouncer's options name another).
     pub fn debouncer(&self, target_workflow: &str) -> crate::debounce::Debouncer<'_> {
         crate::debounce::Debouncer::new(self, target_workflow)
+    }
+
+    /// Whether this engine can run `target` the way `opts` ask: registered
+    /// here, as for [`start`](Self::start), and on a queue it knows. Checked
+    /// before a debounce touches the database, since a bounce that lands on an
+    /// existing run would otherwise never reach the enqueue that reports it.
+    pub(crate) fn check_run_target(&self, target: &str, opts: &WorkflowOptions) -> Result<()> {
+        let rt = self.runtime();
+        if !rt
+            .workflows
+            .contains_key(&registry_key(target, opts.config_name.as_deref()))
+        {
+            return Err(Error::UnknownWorkflow(target.to_string()));
+        }
+        if let Some(queue) = &opts.queue {
+            if !rt
+                .queue_config
+                .read()
+                .expect("queue configuration lock poisoned")
+                .queues
+                .contains_key(queue)
+            {
+                return Err(Error::UnknownQueue(queue.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue a run of `name` from `opts`, letting `stamp` set on the row what
+    /// options cannot carry. Returns the run's id.
+    pub(crate) async fn enqueue_stamped(
+        &self,
+        name: &str,
+        input: Value,
+        opts: &WorkflowOptions,
+        stamp: impl FnOnce(&mut WorkflowStatus),
+    ) -> Result<String> {
+        let (row, _, _) = self
+            .runtime()
+            .insert_stamped_run(name, input, opts, stamp)
+            .await?;
+        Ok(row.id)
     }
 
     /// Register a workflow under `name`.
@@ -2090,13 +2142,7 @@ impl DurableEngine {
         I: Serialize,
     {
         let rt = self.runtime();
-        let id = opts
-            .workflow_id
-            .clone()
-            // An explicit empty id means "assign one for me": fall through to a
-            // fresh id so an empty id is never persisted.
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = opts.id_or_fresh();
         let input_json = serde_json::to_value(input)?;
         opts.validate_deduplication(opts.queue.as_deref())?;
         let handler = rt
@@ -2106,11 +2152,7 @@ impl DurableEngine {
             .ok_or_else(|| Error::UnknownWorkflow(name.to_string()))?;
 
         // A top-level run takes its identity from the options.
-        let auth = AuthContext {
-            authenticated_user: opts.authenticated_user.clone(),
-            assumed_role: opts.assumed_role.clone(),
-            authenticated_roles: opts.authenticated_roles.clone(),
-        };
+        let auth = AuthContext::from_options(&opts);
         let (canonical, queued, created) = rt
             .insert_run_with_dedup(&id, name, input_json, &opts, None, &auth)
             .await?;
@@ -3380,16 +3422,29 @@ impl Runtime {
             ..Default::default()
         };
         let input = serde_json::to_value(schedule.tick_input(instant))?;
-        let (mut row, queued) = self.build_run(
-            wf_id,
-            &schedule.workflow_name,
-            input,
-            &opts,
-            None,
-            &AuthContext::default(),
-        )?;
-        row.schedule_name = Some(schedule.schedule_name.clone());
+        self.insert_stamped_run(&schedule.workflow_name, input, &opts, |row| {
+            row.schedule_name = Some(schedule.schedule_name.clone());
+        })
+        .await
+    }
+
+    /// Build a top-level run of `name` from `opts`, let `stamp` set what
+    /// options cannot carry (the schedule that created the run, a debounce
+    /// marker), and persist it idempotently. Returns the canonical row,
+    /// whether it is queued, and whether this call created it.
+    pub(crate) async fn insert_stamped_run(
+        &self,
+        name: &str,
+        input: Value,
+        opts: &WorkflowOptions,
+        stamp: impl FnOnce(&mut WorkflowStatus),
+    ) -> Result<(WorkflowStatus, bool, bool)> {
+        let id = opts.id_or_fresh();
+        let auth = AuthContext::from_options(opts);
+        let (mut row, queued) = self.build_run(&id, name, input, opts, None, &auth)?;
+        stamp(&mut row);
         let (canonical, created) = self.insert_row(row).await?;
+        check_workflow_target(&canonical, name, opts)?;
         Ok((canonical, queued, created))
     }
 

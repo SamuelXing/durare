@@ -250,13 +250,13 @@ pub use memory::InMemoryProvider;
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 pub use postgres::PostgresProvider;
 pub use provider::{
-    is_terminal, CancelOptions, ChangeWait, ChangeWatch, ChildInsert, DequeueRequest,
-    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
-    ProviderIdentity, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS,
+    is_terminal, CancelOptions, ChangeWait, ChangeWatch, ChildInsert, DebounceOutcome,
+    DebounceRequest, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo,
+    NotificationInsert, ProviderIdentity, RecordedStep, RecoveryClaim, RecoveryClaimRequest,
+    StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome,
+    VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use replay::{Divergence, ReplayReport};

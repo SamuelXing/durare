@@ -1,14 +1,15 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    is_terminal, nonexistent_or, workflow_agg_selects, CancelOptions, DequeueRequest,
-    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
-    RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
-    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
-    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
-    EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS, STATUS_CANCELLED, STATUS_DELAYED,
-    STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING,
-    STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    holder_outcome, is_terminal, nonexistent_or, workflow_agg_selects, CancelOptions,
+    DebounceOutcome, DebounceRequest, DequeueRequest, ExportedWorkflow, ForkParams, ListFilter,
+    NotificationInfo, NotificationInsert, RecordedColumns, RecordedStep, RecoveryClaim,
+    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
+    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS,
+    STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
+    STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -2019,6 +2020,54 @@ impl StateProvider for SqliteProvider {
         .bind(threshold - 1)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    async fn debounce_delayed_workflow(
+        &self,
+        req: &DebounceRequest<'_>,
+    ) -> Result<DebounceOutcome> {
+        let inputs = serialize::encode_input(&self.serializer, req.input)?;
+        // The deadline caps the push-back: CASE rather than min() so the
+        // statement reads the same on both dialects. One statement, no
+        // transaction: a miss is re-read by the holder lookup, and the caller
+        // bounces again on anything that moved in between.
+        let bounced: Option<String> = sqlx::query_scalar(
+            "UPDATE workflow_status
+             SET delay_until_epoch_ms = CASE
+                   WHEN debounce_deadline_epoch_ms IS NOT NULL AND debounce_deadline_epoch_ms < ?1
+                   THEN debounce_deadline_epoch_ms ELSE ?1 END,
+                 inputs = ?2, serialization = ?3, updated_at = ?4
+             WHERE name = ?5 AND queue_name = ?6 AND deduplication_id = ?7
+               AND status = ?8 AND is_debounced = TRUE
+               AND COALESCE(class_name, '') = COALESCE(?9, '')
+               AND COALESCE(config_name, '') = COALESCE(?10, '')
+             RETURNING workflow_uuid",
+        )
+        .bind(req.delay_until_ms)
+        .bind(inputs)
+        .bind(self.serializer.name())
+        .bind(Utc::now().timestamp_millis())
+        .bind(req.workflow_name)
+        .bind(req.queue_name)
+        .bind(req.dedup_id)
+        .bind(STATUS_DELAYED)
+        .bind(req.class_name)
+        .bind(req.config_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(id) = bounced {
+            return Ok(DebounceOutcome::Bounced(id));
+        }
+        // The partial unique index admits at most one holder.
+        let holder = sqlx::query_as(
+            "SELECT name, is_debounced, class_name, config_name FROM workflow_status
+             WHERE queue_name = ?1 AND deduplication_id = ?2",
+        )
+        .bind(req.queue_name)
+        .bind(req.dedup_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(holder_outcome(holder))
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
