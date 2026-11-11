@@ -2624,6 +2624,44 @@ async fn pg_recv_wakes_via_listen_notify() -> Result<()> {
     Ok(())
 }
 
+/// The primitive under that: a change watch on one provider resolves when
+/// another provider writes the event, well inside the coalescing window plus
+/// the wire, with no engine involved.
+#[tokio::test]
+async fn pg_event_watch_resolves_from_another_providers_write() -> Result<()> {
+    use durare::ChangeWait;
+    let Some(url) = database_url() else {
+        eprintln!(
+            "skipping pg_event_watch_resolves_from_another_providers_write: DATABASE_URL unset"
+        );
+        return Ok(());
+    };
+    let id = format!("wf-notifier-{}", uuid::Uuid::new_v4());
+    let reader = PostgresProvider::connect(&url).await?;
+    let writer = PostgresProvider::connect(&url).await?;
+    reader.init().await?;
+    writer.init().await?;
+    common::seed_pending(&writer, &[id.as_str()]).await?;
+    // Let the reader's listener connect.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let watch = reader.watch_change(ChangeWait::Event {
+        workflow_id: &id,
+        key: "k",
+    });
+    writer
+        .upsert_event(&id, "k", serde_json::json!("v"))
+        .await?;
+    tokio::time::timeout(Duration::from_secs(2), watch)
+        .await
+        .expect("the writer's notifier pushed the event, the reader's listener delivered it");
+
+    writer
+        .delete_workflows(std::slice::from_ref(&id), false)
+        .await?;
+    Ok(())
+}
+
 /// A change watch taken before the database check keeps a NOTIFY delivered
 /// before anything awaits it: a message written in the gap between a waiter's
 /// check and its wait wakes the wait at once rather than at the backstop.
@@ -2719,8 +2757,11 @@ async fn pg_send_with_idempotency_key_delivers_once() -> Result<()> {
     Ok(())
 }
 
-/// A blocked get_event wakes via LISTEN/NOTIFY when another workflow sets the
-/// event, returning well within the backstop interval.
+/// A blocked get_event wakes via LISTEN/NOTIFY when a workflow in another
+/// process sets the event, returning well within the backstop interval: the
+/// writer's provider pushes the notification and the reader's listener
+/// delivers it. (A setter on the reader's own provider would wake it locally,
+/// with no wire involved.)
 #[tokio::test]
 async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
     let Some(url) = database_url() else {
@@ -2736,7 +2777,8 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
         let v: Option<String> = ctx.get_event(&target, "k", Duration::from_secs(10)).await?;
         Ok::<_, Error>(v.unwrap_or_default())
     });
-    engine.register("setter", |ctx: DurableContext, _: ()| async move {
+    let mut writer = DurableEngine::new(Arc::new(PostgresProvider::connect(&url).await?)).await?;
+    writer.register("setter", |ctx: DurableContext, _: ()| async move {
         ctx.set_event("k", "v").await?;
         Ok::<_, Error>(String::new())
     });
@@ -2752,7 +2794,7 @@ async fn pg_get_event_wakes_via_listen_notify() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let started = std::time::Instant::now();
-    engine
+    writer
         .start::<_, String>("setter", (), WorkflowOptions::with_id(&setter_id))
         .await?
         .result()

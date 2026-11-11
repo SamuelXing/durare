@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use sqlx::postgres::{PgListener, PgPool, PgPoolOptions, Postgres};
 use sqlx::{Connection as _, Executor as _, QueryBuilder, Row};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -338,11 +338,15 @@ pub struct PostgresProvider {
     /// Format used when *encoding* stored values. Decoding always follows each
     /// row's recorded format, so this only sets what new rows are written as.
     serializer: Serializer,
-    /// Wakes parked `recv`/`get_event` calls from the `LISTEN`/`NOTIFY` listener.
+    /// Wakes parked `recv`/`get_event` calls from the `LISTEN`/`NOTIFY` listener,
+    /// and queues the events this process writes for the notifier to push.
     /// Note: the listener (started in `init`) holds one pool connection for its
     /// lifetime, so the app effectively has `max_connections - 1` available.
     notify_hub: Arc<NotifyHub>,
-    /// Cancels the background listener task when the provider is dropped.
+    /// Pushes the events this process writes to the other processes.
+    notifier: Arc<EventNotifier>,
+    /// Cancels the background listener and notifier tasks when the provider is
+    /// dropped.
     listener_token: CancellationToken,
     /// This instance's identity; binds system data sources to it.
     identity: crate::provider::ProviderIdentity,
@@ -518,11 +522,13 @@ impl PostgresProvider {
     /// on `init`). To pin the system tables to a schema instead, use
     /// [`from_pool_with_schema`](Self::from_pool_with_schema).
     pub fn from_pool(pool: PgPool) -> Self {
+        let notify_hub = Arc::new(NotifyHub::default());
         Self {
             pool,
             schema: String::new(),
             serializer: Serializer::default(),
-            notify_hub: Arc::new(NotifyHub::default()),
+            notify_hub: Arc::clone(&notify_hub),
+            notifier: Arc::new(EventNotifier::new(notify_hub)),
             listener_token: CancellationToken::new(),
             listener_started: AtomicBool::new(false),
             identity: crate::provider::ProviderIdentity::new(),
@@ -927,6 +933,154 @@ async fn run_listener(pool: PgPool, hub: Arc<NotifyHub>, token: CancellationToke
 /// notification payload never collides with an identical-looking event payload).
 fn hub_key(channel: &str, payload: &str) -> String {
     format!("{channel}\u{0}{payload}")
+}
+
+/// How long a payload waits for company before it is pushed. A push per write
+/// would be one notifying transaction per write, the cost the dropped trigger
+/// had; ten milliseconds turns a burst of writes into one statement and bounds
+/// the rate of notifying commits however fast the application writes. Go's
+/// `DefaultNotificationCoalesceInterval` and Python's `notification_coalesce_sec`.
+const NOTIFY_COALESCE_INTERVAL: Duration = Duration::from_millis(10);
+/// Bounds the flush made after the provider is dropped, so a hung database
+/// cannot keep the detached task and its pool clone alive indefinitely.
+const NOTIFIER_FINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// One statement per flush, however many payloads the batch holds: the SQL text
+/// is the same for one payload and a thousand, and one round trip takes the
+/// async-notify queue lock once. The statement every reference SDK runs.
+const PUSH_BATCH: &str = "SELECT pg_notify($1, p) FROM unnest($2::text[]) AS p";
+
+/// The writer's half of the events wake-up path: what this process wrote,
+/// told to everyone else. Migration 44 dropped the trigger that notified from
+/// inside the writing transaction, taking the async-notify queue lock before
+/// every commit; pushing from here moves that lock off the write path and
+/// lets a burst of writes cost one notifying statement. Nothing here is
+/// load-bearing: every wait re-checks the database on its own interval, so
+/// without a push the same values are delivered, later.
+///
+/// `send` needs nothing from this type: the notifications trigger stays, so a
+/// message can be sent from a process with no notifier to flush it.
+struct EventNotifier {
+    hub: Arc<NotifyHub>,
+    /// Whether payloads are queued for other processes at all: off until the
+    /// flush loop runs, since nothing drains a queue no loop reads. The local
+    /// wake is not gated on this.
+    pushing: AtomicBool,
+    /// Distinct payloads written since the last flush: repeated writes to one
+    /// key within a window are one thing to look at, not one each.
+    pending: Mutex<HashSet<String>>,
+    /// Wakes the flush loop for the payload that opens a batch.
+    woken: Notify,
+}
+
+impl EventNotifier {
+    fn new(hub: Arc<NotifyHub>) -> Self {
+        Self {
+            hub,
+            pushing: AtomicBool::new(false),
+            pending: Mutex::default(),
+            woken: Notify::new(),
+        }
+    }
+
+    /// Start queueing payloads for the other processes; paired with spawning
+    /// [`run`](Self::run), one without the other is a leak or a silence.
+    fn enable(&self) {
+        self.pushing.store(true, Ordering::Relaxed);
+    }
+
+    /// An event this process just wrote. Call it after the write commits: a
+    /// waiter woken by this looks at the database, and one that looks before
+    /// the row is visible finds nothing and waits out its interval. Local
+    /// waiters are woken at once, with no round trip; the payload, the wire
+    /// form every SDK's listener keys its waiters by, is queued for a push.
+    fn signal(&self, workflow_id: &str, key: &str) {
+        let wait = ChangeWait::Event { workflow_id, key };
+        let payload = wait.payload();
+        self.hub.signal(&hub_key(wait.channel(), &payload));
+        if !self.pushing.load(Ordering::Relaxed) {
+            return;
+        }
+        let opens_batch = {
+            let mut pending = self.pending.lock().unwrap();
+            pending.insert(payload);
+            pending.len() == 1
+        };
+        // Only the payload that opens a batch wakes the loop; the rest ride
+        // along on the flush it already scheduled.
+        if opens_batch {
+            self.woken.notify_one();
+        }
+    }
+
+    /// Flush what has been signalled until `token` is cancelled, then once
+    /// more, so a value written just before the provider went away still
+    /// wakes readers elsewhere. Idle costs nothing: the loop sleeps until a
+    /// payload opens a batch, then holds the coalescing window and flushes,
+    /// which coalesces the same writes a periodic tick would, measured from
+    /// the first write.
+    async fn run(self: Arc<Self>, pool: PgPool, token: CancellationToken) {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = self.woken.notified() => {}
+            }
+            if !sleep_or_cancel(NOTIFY_COALESCE_INTERVAL, &token).await {
+                break;
+            }
+            self.flush(&pool).await;
+        }
+        let _ = tokio::time::timeout(NOTIFIER_FINAL_FLUSH_TIMEOUT, self.flush(&pool)).await;
+    }
+
+    /// One notifying statement for everything queued since the last flush. A
+    /// failure drops the batch rather than requeuing it: waiters elsewhere
+    /// make progress on their database re-check, and a database that is down
+    /// will not take a growing backlog later.
+    async fn flush(&self, pool: &PgPool) {
+        let payloads: Vec<String> = self.pending.lock().unwrap().drain().collect();
+        if payloads.is_empty() {
+            return;
+        }
+        if let Err(e) = sqlx::query(PUSH_BATCH)
+            .bind(WORKFLOW_EVENTS_CHANNEL)
+            .bind(&payloads)
+            .execute(pool)
+            .await
+        {
+            tracing::warn!(error = %e, count = payloads.len(), "failed to push event notifications");
+        }
+    }
+}
+
+#[cfg(test)]
+mod notifier_tests {
+    use super::*;
+
+    /// A signal wakes a local waiter at once and, once pushing, queues one
+    /// payload per distinct key for the flush; before that it queues nothing.
+    #[tokio::test]
+    async fn signal_wakes_locally_and_queues_once_pushing() {
+        let hub = Arc::new(NotifyHub::default());
+        let notifier = EventNotifier::new(Arc::clone(&hub));
+        let waiter = hub.subscribe(hub_key(WORKFLOW_EVENTS_CHANNEL, "wf::key"));
+
+        notifier.signal("wf", "key");
+        tokio::time::timeout(Duration::from_secs(1), waiter.notify.notified())
+            .await
+            .expect("woken without a round trip");
+        assert!(
+            notifier.pending.lock().unwrap().is_empty(),
+            "nothing drains yet"
+        );
+
+        notifier.enable();
+        notifier.signal("wf", "key");
+        notifier.signal("wf", "key");
+        notifier.signal("wf", "other");
+        let pending = notifier.pending.lock().unwrap();
+        assert_eq!(pending.len(), 2, "one payload per distinct key");
+        assert!(pending.contains("wf::key") && pending.contains("wf::other"));
+    }
 }
 
 /// Sleep for `dur`, returning `false` if cancelled first.
@@ -1372,6 +1526,10 @@ impl StateProvider for PostgresProvider {
                 self.notify_hub.clone(),
                 self.listener_token.clone(),
             ));
+            self.notifier.enable();
+            tokio::spawn(
+                Arc::clone(&self.notifier).run(self.pool.clone(), self.listener_token.clone()),
+            );
         }
         Ok(())
     }
@@ -2225,7 +2383,9 @@ impl StateProvider for PostgresProvider {
 
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
         self.upsert_event_on(&self.pool, workflow_id, key, value)
-            .await
+            .await?;
+        self.notifier.signal(workflow_id, key);
+        Ok(())
     }
 
     async fn set_event_from_workflow(
@@ -2243,6 +2403,7 @@ impl StateProvider for PostgresProvider {
         self.upsert_event_on(&mut *tx, workflow_id, key, value)
             .await?;
         tx.commit().await?;
+        self.notifier.signal(workflow_id, key);
         Ok(())
     }
 

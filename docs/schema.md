@@ -4,7 +4,7 @@ DBOS keeps all of its durable state in the database (Postgres, or SQLite for
 local use). If a process dies partway through a workflow, everything needed to
 resume it lives in these tables, so it's worth knowing how they fit together.
 
-There are ten tables, built up over the 43 migrations in
+There are ten tables, built up over the 44 migrations in
 [`migrations/`](../migrations). The layout matches the Go and Python SDKs
 column-for-column, which is what lets a workflow written by one SDK be read or
 recovered by another.
@@ -227,8 +227,9 @@ fires a Postgres `NOTIFY` on `dbos_notifications_channel`, so a workflow blocked
 in `recv` wakes up immediately instead of polling.
 
 **`workflow_events`** holds `set_event`/`get_event` values, keyed by
-`(workflow_uuid, key)`, with its own `NOTIFY` trigger on
-`dbos_workflow_events_channel`. **`workflow_events_history`** keeps the versioned
+`(workflow_uuid, key)`; the process that writes one pushes a `NOTIFY` on
+`dbos_workflow_events_channel` off the write path (migration 44 dropped the
+per-row trigger that used to). **`workflow_events_history`** keeps the versioned
 history of those events, keyed by `(workflow_uuid, function_id, key)` so replay
 is deterministic.
 
@@ -275,10 +276,13 @@ by another.
 **Cascade deletes** from `workflow_status` mean one delete cleans up a
 workflow's steps, events, streams, and messages together.
 
-On Postgres, the **`LISTEN`/`NOTIFY` triggers** on `notifications` and
-`workflow_events` turn polling into push, so blocked `recv`/`get_event` calls
-wake promptly. SQLite doesn't have that, so it polls instead. Stream reads poll
-on every backend (migration 43 dropped the `streams` trigger).
+On Postgres, **`LISTEN`/`NOTIFY`** turns polling into push, so blocked
+`recv`/`get_event` calls wake promptly: a trigger on `notifications` notifies
+from inside the sending transaction, while `set_event` notifications are
+coalesced in the writing process and pushed by its notifier every 10 ms, off
+the write path, since a notifying commit holds a global lock. SQLite doesn't
+have that, so it polls instead. Stream reads poll on every backend (migration
+43 dropped the `streams` trigger, 44 the `workflow_events` one).
 
 Finally, a lot of the later migrations (roughly 22 through 37) just drop full
 indexes and recreate them as **partial indexes** scoped to the rows the

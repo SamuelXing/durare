@@ -90,6 +90,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Migration 44 drops the per-row `workflow_events` NOTIFY trigger migration 1
+  created, as the Go and Python SDKs do at that index. A Postgres provider now
+  wakes its own `get_event` waiters the moment a `set_event` commits and pushes
+  the notification to other processes from a notifier task, coalesced every
+  10 ms into one statement, so event writes no longer serialize on the
+  notification queue's global lock. The `notifications` trigger stays, since a
+  message can be sent from a process with no notifier to flush it.
 - Migration 43 drops the per-row `streams` NOTIFY trigger migration 39
   created, as the Go and Python SDKs do at that index. durare never listened
   on its channel, stream reads poll, and the trigger serialized every SDK's
