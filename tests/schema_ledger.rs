@@ -3,8 +3,11 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds, on both dialects.
-const LATEST: i64 = 42;
+/// The newest migration this build embeds, per dialect: 43 is Postgres-only
+/// (it drops a trigger SQLite never had), so SQLite stops one earlier, as the
+/// Go and Python SDKs' SQLite chains do.
+const PG_LATEST: i64 = 43;
+const SQLITE_LATEST: i64 = 42;
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
@@ -25,9 +28,17 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
                 .fetch_all(pool)
                 .await
         }
+        // The streams trigger migration 39 creates and migration 43 drops.
+        async fn streams_trigger(pool: &PgPool) -> sqlx::Result<bool> {
+            sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'dbos_streams_trigger')",
+            )
+            .fetch_one(pool)
+            .await
+        }
 
         // One row, at the newest version; sqlx's ledger is no longer written.
-        assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+        assert_eq!(ledger_rows(&pool).await?, vec![PG_LATEST]);
         let legacy: bool =
             sqlx::query_scalar("SELECT to_regclass('dbos._sqlx_migrations') IS NOT NULL")
                 .fetch_one(&pool)
@@ -37,14 +48,13 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
 
         // A second initialisation changes nothing.
         provider.init().await?;
-        assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+        assert_eq!(ledger_rows(&pool).await?, vec![PG_LATEST]);
 
         // A database behind this binary is reported, then caught up: undo
-        // migrations 39 to 42 and roll the ledger back to 38.
+        // migrations 40 to 42 (43 left nothing to undo) and roll the ledger
+        // back to 38, so 39 recreates the trigger and 43 drops it again.
         sqlx::raw_sql(
-            "DROP TRIGGER dbos_streams_trigger ON dbos.streams;
-             DROP FUNCTION dbos.streams_function();
-             ALTER TABLE dbos.workflow_status DROP COLUMN attributes;
+            "ALTER TABLE dbos.workflow_status DROP COLUMN attributes;
              ALTER TABLE dbos.workflow_status DROP COLUMN schedule_name;
              ALTER TABLE dbos.workflow_status DROP COLUMN debounce_deadline_epoch_ms;
              ALTER TABLE dbos.workflow_status DROP COLUMN is_debounced;
@@ -55,7 +65,7 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         let behind = provider.ping().await.expect_err("schema at 38");
         assert!(behind.to_string().contains("behind"), "{behind}");
         provider.init().await?;
-        assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+        assert_eq!(ledger_rows(&pool).await?, vec![PG_LATEST]);
         let attributes: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.columns
              WHERE table_schema = 'dbos' AND table_name = 'workflow_status'
@@ -79,6 +89,7 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         .fetch_one(&pool)
         .await?;
         assert!(debounced, "migration 42 re-applied");
+        assert!(!streams_trigger(&pool).await?, "migration 43 re-applied");
 
         // A database a newer peer moved ahead is healthy and left alone.
         sqlx::query("UPDATE dbos.dbos_migrations SET version = 125")
@@ -95,13 +106,13 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         sqlx::raw_sql(&format!(
             "DROP TABLE dbos.dbos_migrations;
              CREATE TABLE dbos._sqlx_migrations (version BIGINT PRIMARY KEY, success BOOLEAN NOT NULL);
-             INSERT INTO dbos._sqlx_migrations VALUES ({LATEST}, TRUE)"
+             INSERT INTO dbos._sqlx_migrations VALUES ({PG_LATEST}, TRUE)"
         ))
         .execute(&pool)
         .await?;
         provider.ping().await?;
         provider.init().await?;
-        assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+        assert_eq!(ledger_rows(&pool).await?, vec![PG_LATEST]);
         let legacy: bool =
             sqlx::query_scalar("SELECT to_regclass('dbos._sqlx_migrations') IS NOT NULL")
                 .fetch_one(&pool)
@@ -137,7 +148,7 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
             .fetch_all(pool)
             .await
     }
-    assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+    assert_eq!(ledger_rows(&pool).await?, vec![SQLITE_LATEST]);
 
     // Behind, then caught up: undo migrations 40 to 42 and roll the ledger
     // back.
@@ -152,7 +163,7 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     .execute(&pool)
     .await?;
     provider.init().await?;
-    assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+    assert_eq!(ledger_rows(&pool).await?, vec![SQLITE_LATEST]);
 
     // Ahead: left alone.
     sqlx::query("UPDATE dbos_migrations SET version = 125")
@@ -165,12 +176,12 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     sqlx::raw_sql(&format!(
         "DROP TABLE dbos_migrations;
          CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, success BOOLEAN NOT NULL);
-         INSERT INTO _sqlx_migrations VALUES ({LATEST}, 1)"
+         INSERT INTO _sqlx_migrations VALUES ({SQLITE_LATEST}, 1)"
     ))
     .execute(&pool)
     .await?;
     provider.init().await?;
-    assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
+    assert_eq!(ledger_rows(&pool).await?, vec![SQLITE_LATEST]);
 
     // Tables with no ledger at all are refused rather than re-created.
     sqlx::raw_sql("DROP TABLE dbos_migrations; DROP TABLE _sqlx_migrations")
