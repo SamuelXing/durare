@@ -15,38 +15,13 @@ aligned by design with the DBOS Transact SDKs for Python, Go, TypeScript, and
 Rust: the same programming model, the same semantics, and the same system schema
 on the same database. There is no server to operate and no sidecar — the engine
 is a library inside your process that talks directly to Postgres or SQLite.
-See [DBOS compatibility](#dbos-compatibility). Full API documentation is on
-[docs.rs](https://docs.rs/durare).
-
 DBOS also publishes an official Rust SDK,
-[`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust). `durare` is
-community-maintained. Both use the DBOS system schema.
+[`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust); `durare`
+is community-maintained.
+[DBOS compatibility](https://github.com/SamuelXing/durare/blob/main/docs/dbos-compatibility.md)
+covers the shared schema and how the two SDKs differ.
 
-## Why the context is explicit
-
-Workflows in `durare` take a `DurableContext` argument and pass it to helpers
-that perform durable work. The official Rust SDK supplies context through
-task-local state instead, so its workflow functions need no context parameter.
-
-For step calls inline, in helpers, or as prebuilt `join!` arguments, both SDKs
-reserve positions at construction. Their placement rules differ:
-
-| Step placement | `durare` | Official Rust SDK |
-|---|---|---|
-| constructed inside a spawned task | rejected without claiming a position | runs without a checkpoint; repeats if the spawning code runs again |
-| constructed inside another step's body | rejected without claiming a position | runs as plain work within the enclosing body |
-| constructed in the workflow body, then polled inside a step body | rejected on poll; the reserved position stays spent | rejected on poll |
-
-These are step rules. Other upstream operations, such as `set_event` and
-`recv`, reject calls outside a workflow or inside a step.
-
-The context parameter lets `durare` reject step placements that would lose a
-checkpoint. Construction order still has to be deterministic, and patches
-must be awaited sequentially. The
-[`design` guide](https://docs.rs/durare/latest/durare/design/) covers the checks
-and caller rules; the
-[design note](https://github.com/SamuelXing/durare/blob/main/docs/design/explicit-context.md)
-explains the alternatives considered.
+Full API documentation is on [docs.rs](https://docs.rs/durare).
 
 ```rust
 use std::time::Duration;
@@ -203,34 +178,6 @@ The step caveat is the same one Temporal and the DBOS SDKs carry: a crash can
 land between an external call and its checkpoint. Transactions close that
 window for SQL against the workflow database, which is why they exist as a
 separate primitive.
-
-## DBOS compatibility
-
-`durare` implements the DBOS durable-execution model and stores its state in the
-DBOS system schema. On Postgres the tables live in the `dbos` schema — the same
-schema, tables, and columns the DBOS Transact SDKs for Python, Go, and
-TypeScript use: `workflow_status`, `operation_outputs`, `workflow_events`,
-`notifications`, `streams`, `workflow_schedules`, `queues`, and the version
-registry, applied through embedded per-dialect migrations and recorded in the
-shared `dbos_migrations` ledger, so a schema one SDK migrated is picked up where
-it stands by the next.
-
-In practice this means:
-
-- Workflow state is inspectable with plain SQL, and rows written by a `durare`
-  worker are legible to standard DBOS tooling pointed at the same database.
-- Arguments, outputs, and errors use the portable serialization envelope, with
-  a structured cross-SDK error format. Custom codecs can be installed through
-  `Serializer`.
-- The admin server (behind the `admin` feature) exposes the standard DBOS HTTP
-  endpoints (`/dbos-healthz`, `/workflows`, cancel/resume/fork, recovery, queue
-  metadata), and the Conductor client connects to DBOS Conductor for fleet
-  management.
-
-```sql
-SELECT workflow_uuid, name, status FROM dbos.workflow_status;
-SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_outputs;
-```
 
 ## Backends
 

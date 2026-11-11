@@ -228,6 +228,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `get_step_result`, `record_step_result`, and `list_workflow_notifications`,
   so a provider implemented in another crate could not compile.
 
+### Documentation
+
+- The README's "DBOS compatibility" and "Why the context is explicit"
+  sections moved to `docs/dbos-compatibility.md`; the README links to it.
+
 ## [0.5.0] - 2026-10-06
 
 Durable semantics now survive code motion or fail loudly. Every durable call

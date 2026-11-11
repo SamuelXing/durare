@@ -12,8 +12,8 @@
 //!
 //! There is **no separate server**: the engine is a library that runs inside
 //! your worker and talks directly to the database, using the same `dbos` system
-//! schema as the DBOS Transact SDKs for Python, Go, and TypeScript — the SDKs
-//! interoperate on one database.
+//! schema as the DBOS Transact SDKs for Python, Go, TypeScript, and Rust — the
+//! SDKs interoperate on one database.
 //!
 //! The problem this solves: any multi-step operation has crash windows — after
 //! the card is charged but before the receipt is sent, the process dies, and a
