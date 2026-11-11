@@ -4,7 +4,7 @@ DBOS keeps all of its durable state in the database (Postgres, or SQLite for
 local use). If a process dies partway through a workflow, everything needed to
 resume it lives in these tables, so it's worth knowing how they fit together.
 
-There are ten tables, built up over the 41 migrations in
+There are ten tables, built up over the 42 migrations in
 [`migrations/`](../migrations). The layout matches the Go and Python SDKs
 column-for-column, which is what lets a workflow written by one SDK be read or
 recovered by another.
@@ -59,6 +59,8 @@ erDiagram
         TEXT    deduplication_id
         BOOLEAN rate_limited
         BIGINT  delay_until_epoch_ms
+        BIGINT  debounce_deadline_epoch_ms
+        BOOLEAN is_debounced
         TEXT    schedule_name
         TEXT    parent_workflow_id
         TEXT    forked_from
@@ -190,6 +192,7 @@ and the management APIs need. Grouped by what they're for:
 | Execution state | `status`, `executor_id`, `recovery_attempts`, `owner_xid`, `application_version`, `application_id` |
 | Input and output | `inputs`, `output`, `error`, `serialization` |
 | Queueing | `queue_name`, `queue_partition_key`, `priority`, `deduplication_id`, `rate_limited`, `delay_until_epoch_ms` |
+| Debouncing | `is_debounced`, `debounce_deadline_epoch_ms` (migration 42) — a debounced run waits `DELAYED` holding its debounce key as `deduplication_id`; each bounce pushes `delay_until_epoch_ms` out, never past the deadline, and the key is cleared when the run becomes `ENQUEUED` |
 | Scheduling | `schedule_name` — the schedule that created the run (migration 41), stamped on every tick, trigger and backfill and on nothing else; a partial index serves filtering by it |
 | Timing | `created_at`, `updated_at`, `started_at_epoch_ms`, `completed_at`, `workflow_timeout_ms`, `workflow_deadline_epoch_ms` |
 | Auth and context | `authenticated_user`, `assumed_role`, `authenticated_roles`, `request` |

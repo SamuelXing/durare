@@ -4,7 +4,7 @@ use durare::{Result, StateProvider};
 mod common;
 
 /// The newest migration this build embeds, on both dialects.
-const LATEST: i64 = 41;
+const LATEST: i64 = 42;
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
@@ -40,12 +40,14 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
 
         // A database behind this binary is reported, then caught up: undo
-        // migrations 39 to 41 and roll the ledger back to 38.
+        // migrations 39 to 42 and roll the ledger back to 38.
         sqlx::raw_sql(
             "DROP TRIGGER dbos_streams_trigger ON dbos.streams;
              DROP FUNCTION dbos.streams_function();
              ALTER TABLE dbos.workflow_status DROP COLUMN attributes;
              ALTER TABLE dbos.workflow_status DROP COLUMN schedule_name;
+             ALTER TABLE dbos.workflow_status DROP COLUMN debounce_deadline_epoch_ms;
+             ALTER TABLE dbos.workflow_status DROP COLUMN is_debounced;
              UPDATE dbos.dbos_migrations SET version = 38",
         )
         .execute(&pool)
@@ -69,6 +71,14 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         .fetch_one(&pool)
         .await?;
         assert!(schedule_name, "migration 41 re-applied");
+        let debounced: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'dbos' AND table_name = 'workflow_status'
+               AND column_name = 'is_debounced')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(debounced, "migration 42 re-applied");
 
         // A database a newer peer moved ahead is healthy and left alone.
         sqlx::query("UPDATE dbos.dbos_migrations SET version = 125")
@@ -129,10 +139,12 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     }
     assert_eq!(ledger_rows(&pool).await?, vec![LATEST]);
 
-    // Behind, then caught up: undo migrations 40 and 41 and roll the ledger
+    // Behind, then caught up: undo migrations 40 to 42 and roll the ledger
     // back.
     sqlx::raw_sql(
-        "DROP INDEX idx_workflow_status_schedule_name;
+        "ALTER TABLE workflow_status DROP COLUMN is_debounced;
+         ALTER TABLE workflow_status DROP COLUMN debounce_deadline_epoch_ms;
+         DROP INDEX idx_workflow_status_schedule_name;
          ALTER TABLE workflow_status DROP COLUMN schedule_name;
          ALTER TABLE workflow_status DROP COLUMN attributes;
          UPDATE dbos_migrations SET version = 39",

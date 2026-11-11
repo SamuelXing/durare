@@ -1,9 +1,9 @@
 use crate::error::{Error, Result};
 use crate::provider::{
-    col_i64, col_str, decode_roles, encode_roles, is_terminal, CancelOptions, DequeueRequest,
-    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep, RecoveryClaim,
-    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
+    col_bool, col_i64, col_str, decode_roles, encode_roles, is_terminal, CancelOptions,
+    DequeueRequest, ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, RecordedStep,
+    RecoveryClaim, RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery,
+    StepInfo, StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
     WorkflowStatus, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
     STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STREAM_CLOSED_SENTINEL,
 };
@@ -381,6 +381,10 @@ impl StateProvider for InMemoryProvider {
             if w.status == STATUS_DELAYED && w.delay_until_ms.is_some_and(|t| t <= now_ms) {
                 w.status = STATUS_ENQUEUED.to_string();
                 w.delay_until_ms = None;
+                // A debounce key is held only while DELAYED.
+                if w.is_debounced {
+                    w.dedup_id = None;
+                }
                 w.updated_at = Utc::now();
                 n += 1;
             }
@@ -597,6 +601,7 @@ impl StateProvider for InMemoryProvider {
                     && filter
                         .has_parent
                         .is_none_or(|hp| w.parent_workflow_id.is_some() == hp)
+                    && filter.is_debounced.is_none_or(|d| w.is_debounced == d)
                     && (!filter.queues_only || w.queue_name.is_some())
             })
             .cloned()
@@ -1747,6 +1752,11 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
     m.insert("delay_until_epoch_ms".into(), json!(w.delay_until_ms));
     m.insert("completed_at".into(), json!(w.completed_at_ms));
     m.insert("schedule_name".into(), json!(w.schedule_name));
+    m.insert(
+        "debounce_deadline_epoch_ms".into(),
+        json!(w.debounce_deadline_ms),
+    );
+    m.insert("is_debounced".into(), json!(w.is_debounced));
     m.insert("serialization".into(), Value::Null);
     m
 }
@@ -1792,6 +1802,8 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
         class_name: col_str(s, "class_name"),
         config_name: col_str(s, "config_name"),
         schedule_name: col_str(s, "schedule_name"),
+        debounce_deadline_ms: col_i64(s, "debounce_deadline_epoch_ms"),
+        is_debounced: col_bool(s, "is_debounced").unwrap_or(false),
         created_at: ms_to_dt(col_i64(s, "created_at")),
         updated_at: ms_to_dt(col_i64(s, "updated_at")),
     }

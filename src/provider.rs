@@ -619,6 +619,13 @@ pub struct WorkflowStatus {
     /// stamps every tick, trigger and backfill with its schedule's name, and
     /// nothing else sets it. Served by [`ListFilter::schedule_name`].
     pub schedule_name: Option<String>,
+    /// For a debounced run, the latest instant a bounce may push
+    /// `delay_until_ms` to, epoch ms; `None` when uncapped or not debounced.
+    pub debounce_deadline_ms: Option<i64>,
+    /// Whether a debounce created this run: its `dedup_id` is then the debounce
+    /// key, held only while `DELAYED` and cleared when the run becomes
+    /// `ENQUEUED`, so a later debounce under the same key starts a fresh run.
+    pub is_debounced: bool,
     /// When the row was first created.
     pub created_at: DateTime<Utc>,
     /// When the row was last modified.
@@ -684,6 +691,8 @@ impl WorkflowStatus {
             class_name: None,
             config_name: None,
             schedule_name: None,
+            debounce_deadline_ms: None,
+            is_debounced: false,
             created_at: now,
             updated_at: now,
             attributes: None,
@@ -721,6 +730,9 @@ pub struct ListFilter {
     /// Match any workflow enqueued by one of these schedules (OR); only runs a
     /// schedule created match.
     pub schedule_name: Vec<String>,
+    /// `Some(true)` keeps only runs a debounce created; `Some(false)` only the
+    /// others; `None` does not filter on it.
+    pub is_debounced: Option<bool>,
     /// `Some(true)` keeps only workflows that were themselves created by a fork;
     /// `Some(false)` only those that were not; `None` does not filter on it.
     pub was_forked_from: Option<bool>,
@@ -777,6 +789,7 @@ impl Default for ListFilter {
             forked_from: Vec::new(),
             parent_workflow_ids: Vec::new(),
             schedule_name: Vec::new(),
+            is_debounced: None,
             was_forked_from: None,
             start_time_ms: None,
             end_time_ms: None,
@@ -1294,7 +1307,12 @@ pub(crate) const EXPORT_STATUS_BIGINT_COLS: &[&str] = &[
     "started_at_epoch_ms",
     "delay_until_epoch_ms",
     "completed_at",
+    "debounce_deadline_epoch_ms",
 ];
+/// The boolean columns of an exported `workflow_status` row (see
+/// [`EXPORT_STATUS_STR_COLS`]). `was_forked_from` marks a fork *source* and
+/// rides along so the flag round-trips the way Python's portable format does.
+pub(crate) const EXPORT_STATUS_BOOL_COLS: &[&str] = &["was_forked_from", "is_debounced"];
 
 /// A column's value pulled from an exported row as an owned `String` (`None` for
 /// JSON null or a missing/non-string key). Shared by the SQL providers' import.
