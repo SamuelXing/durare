@@ -42,7 +42,7 @@ change to any `pub` item must keep both green.
 - `src/provider.rs` — the `StateProvider` trait; `memory.rs`, `sqlite.rs`, `postgres.rs` implement it
 - `tests/` — integration tests; `tests/common/mod.rs` holds shared fixtures (`recorded`, `hermetic_pg_db`)
 - `docs/schema.md` — the system schema, table by table; `docs/dbos-compatibility.md`
-  — what sharing that schema with the DBOS SDKs means, and the official Rust SDK
+  — storage formats and DBOS tooling integrations
 - `docs/design/` — design notes: `execution-layers.md` (the two orchestration
   layers, the seam, and which side a new behavior belongs to),
   `explicit-context.md` (positions and concurrency inside a body)

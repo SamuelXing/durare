@@ -1,7 +1,6 @@
 //! # durare
 //!
-//! A [DBOS](https://docs.dbos.dev)-style **durable execution** library for
-//! Rust.
+//! An independent **durable execution** library for Rust.
 //!
 //! Write ordinary async code; wrap each side-effecting unit in a step. Every
 //! step's result is checkpointed to a [`StateProvider`] (Postgres, SQLite, or
@@ -11,9 +10,7 @@
 //! of re-running.
 //!
 //! There is **no separate server**: the engine is a library that runs inside
-//! your worker and talks directly to the database, using the same `dbos` system
-//! schema as the DBOS Transact SDKs for Python, Go, TypeScript, and Rust — the
-//! SDKs interoperate on one database.
+//! your worker and stores workflow state directly in Postgres or SQLite.
 //!
 //! The problem this solves: any multi-step operation has crash windows — after
 //! the card is charged but before the receipt is sent, the process dies, and a

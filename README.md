@@ -5,21 +5,13 @@
 [![CI](https://github.com/SamuelXing/durare/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durare/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-`durare` (Latin *durāre*, "to last") is a durable-execution library for Rust.
-Write ordinary async functions; `durare` checkpoints each step to your database
-and, after a crash, restart, or redeploy, resumes every unfinished workflow
-exactly where it stopped. Completed steps are never re-run.
+`durare` (Latin *durāre*, "to last") is an independent durable-execution library
+for Rust. Write ordinary async functions; `durare` checkpoints step results to
+your database. After a crash, restart, or redeploy, it replays recorded results
+and resumes unfinished work without re-running checkpointed steps.
 
-`durare` is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
-aligned by design with the DBOS Transact SDKs for Python, Go, TypeScript, and
-Rust: the same programming model, the same semantics, and the same system schema
-on the same database. There is no server to operate and no sidecar — the engine
-is a library inside your process that talks directly to Postgres or SQLite.
-DBOS also publishes an official Rust SDK,
-[`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust); `durare`
-is community-maintained.
-[DBOS compatibility](https://github.com/SamuelXing/durare/blob/main/docs/dbos-compatibility.md)
-covers the shared schema and how the two SDKs differ.
+The engine runs inside your application and stores workflow state directly in
+Postgres or SQLite. There is no separate workflow server or sidecar to operate.
 
 Full API documentation is on [docs.rs](https://docs.rs/durare).
 
@@ -30,7 +22,7 @@ use durare::{DurableContext, DurableEngine, Result, WorkflowOptions};
 #[durare::step]
 async fn charge_card(ctx: &DurableContext, order_id: String) -> Result<String> {
     // Any side effect: an HTTP call, an email, a write to another system.
-    // It runs once; the result is checkpointed and replayed thereafter.
+    // Use an idempotency key: a crash before checkpointing can retry this call.
     Ok(format!("ch_{order_id}"))
 }
 
@@ -56,8 +48,9 @@ async fn main() -> Result<()> {
 
 The workflow above sleeps for a day between charging and returning. Kill the
 process at any point — mid-sleep included — and the next `recover()` picks it
-up with the charge intact and only the remaining sleep to wait. The card is
-never charged twice.
+up from the recorded results with only the remaining sleep to wait. Make the
+charge request idempotent: a crash between charging and checkpointing can
+repeat the external call.
 
 ## Why the context is explicit
 
@@ -75,8 +68,7 @@ awaited sequentially.
 The [`design` guide](https://docs.rs/durare/latest/durare/design/) covers the
 checks and caller rules; the
 [design note](https://github.com/SamuelXing/durare/blob/main/docs/design/explicit-context.md)
-explains the alternatives considered and compares the placement rules with the
-official Rust SDK's.
+explains the alternatives considered and the trade-offs behind explicit context.
 
 ## Features
 
@@ -193,10 +185,9 @@ What the guarantees actually are:
 | `recv` message consumption | exactly once |
 | Cron tick | once per tick, across any number of executors |
 
-The step caveat is the same one Temporal and the DBOS SDKs carry: a crash can
-land between an external call and its checkpoint. Transactions close that
-window for SQL against the workflow database, which is why they exist as a
-separate primitive.
+A crash can land between an external call and its checkpoint, so external
+side effects must be safe to retry. Transactions close that window for SQL
+against the workflow database, which is why they exist as a separate primitive.
 
 ## Backends
 
@@ -214,15 +205,18 @@ against `InMemoryProvider` with no infrastructure at all; the crate's own test
 suite runs against all three backends on every commit, with Postgres against a
 live server in CI.
 
+## Compatibility
+
+`durare` uses the DBOS system schema and supports DBOS tooling integrations.
+See [DBOS compatibility](https://github.com/SamuelXing/durare/blob/main/docs/dbos-compatibility.md)
+for storage formats and integration details.
+
 ## Benchmarks
 
-[`durare-benchmarks/`](durare-benchmarks/) measures durare on the same
-workload the DBOS SDKs benchmark themselves with, plus the metrics where a
-compiled, GC-free runtime actually differs (tail latency under load, memory
-per in-flight workflow). Durable-execution throughput is dominated by
-database round-trips, so read the numbers with that framing — the harness
-README documents the methodology, and a nightly CI job keeps the workloads
-running.
+[`durare-benchmarks/`](durare-benchmarks/) measures workflow throughput,
+tail latency under load, and memory per in-flight workflow. Database
+round-trips are a major part of durable-execution cost; the harness README
+documents the workloads and measurement methodology.
 
 ## Minimum supported Rust version
 

@@ -1,7 +1,8 @@
 # DBOS compatibility
 
-`durare` implements the DBOS durable-execution model and stores its state in
-the DBOS system schema.
+`durare` is an independently developed Rust durable-execution library. Its
+storage formats and tooling integrations are designed for compatibility with
+DBOS.
 
 ## The system schema
 
@@ -29,23 +30,3 @@ This means:
 SELECT workflow_uuid, name, status FROM dbos.workflow_status;
 SELECT workflow_uuid, function_id, function_name, output FROM dbos.operation_outputs;
 ```
-
-## Compared with the official Rust SDK
-
-DBOS publishes an official Rust SDK,
-[`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust).
-`durare` is community-maintained. The visible difference is how a workflow
-reaches its context: `durare` workflows take a `DurableContext` argument and
-pass it to helpers that perform durable work, while the official SDK supplies
-context through task-local state, so its workflow functions need no context
-parameter.
-
-The context parameter lets `durare` reject step placements that would lose a
-checkpoint, such as a step constructed inside a spawned task or inside another
-step's body. Construction order still has to be deterministic, and patches
-must be awaited sequentially. The
-[explicit-context design note](design/explicit-context.md#comparison-with-dboss-rust-sdk)
-tabulates the placement rules of both SDKs against a pinned upstream commit and
-explains the alternatives considered; the
-[`design` guide](https://docs.rs/durare/latest/durare/design/) covers the
-checks and caller rules.

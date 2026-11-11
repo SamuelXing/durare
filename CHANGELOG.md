@@ -230,10 +230,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documentation
 
-- The README's "DBOS compatibility" section and the comparison with the
-  official Rust SDK moved to `docs/dbos-compatibility.md`; the README links
-  to it. "Why the context is explicit" stays, now after the first example
-  and without the comparison table.
+- The README and crate introduction describe durare as an independent Rust
+  durable-execution library. DBOS storage and tooling details live in
+  `docs/dbos-compatibility.md`; the README keeps a short compatibility link
+  and explains explicit context without an SDK comparison. The first example
+  now states the idempotency requirement for external calls.
 
 ## [0.5.0] - 2026-10-06
 
