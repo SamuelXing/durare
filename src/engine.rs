@@ -1559,15 +1559,17 @@ impl DurableEngine {
             .get_schedule(schedule_name)
             .await?
             .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
+        let rt = self.runtime();
+        let handler = rt
+            .workflows
+            .get(&registry_key(&schedule.workflow_name, None))
+            .cloned()
+            .ok_or_else(|| Error::UnknownWorkflow(schedule.workflow_name.clone()))?;
         let now = Utc::now();
         let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let opts = WorkflowOptions {
-            workflow_id: Some(format!("sched-{schedule_name}-trigger-{stamp}")),
-            queue: schedule.queue_name.clone(),
-            ..Default::default()
-        };
-        self.start(&schedule.workflow_name, schedule.tick_input(now), opts)
-            .await
+        let wf_id = format!("sched-{schedule_name}-trigger-{stamp}");
+        let (canonical, queued, created) = rt.persist_scheduled_run(&schedule, &wf_id, now).await?;
+        Ok(self.handle_for(&rt, canonical, queued, created, handler))
     }
 
     /// Every registered application version, newest first. Versions are recorded
@@ -2112,23 +2114,34 @@ impl DurableEngine {
         let (canonical, queued, created) = rt
             .insert_run_with_dedup(&id, name, input_json, &opts, None, &auth)
             .await?;
+        Ok(self.handle_for(&rt, canonical, queued, created, handler))
+    }
+
+    /// The handle for a run this call just persisted: over the task when the
+    /// call created a direct run that has not finished, else polling.
+    ///
+    /// Terminal already, owned by a queue, or created by an earlier call
+    /// (`created == false`): observe via polling. A live `PENDING` run is
+    /// never re-executed here — the workflow id is the idempotency key and
+    /// its one execution belongs to whoever created it (or to `recover`,
+    /// if that owner crashed). Spawning a second execution would race the
+    /// first step by step, and two attempts at the same in-progress step
+    /// is a doubled effect before either records. The scheduler's tick
+    /// path applies this exact guard too.
+    fn handle_for<O>(
+        &self,
+        rt: &Arc<Runtime>,
+        canonical: WorkflowStatus,
+        queued: bool,
+        created: bool,
+        handler: WorkflowFn,
+    ) -> WorkflowHandle<O> {
         let id = canonical.id.clone();
-
-        // Terminal already, owned by a queue, or created by an earlier call
-        // (`created == false`): observe via polling. A live `PENDING` run is
-        // never re-executed here — the workflow id is the idempotency key and
-        // its one execution belongs to whoever created it (or to `recover`,
-        // if that owner crashed). Spawning a second execution would race the
-        // first step by step, and two attempts at the same in-progress step
-        // is a doubled effect before either records. The scheduler's tick
-        // path has always applied this exact guard; the direct path now does
-        // too.
         if queued || !created || is_terminal(&canonical.status) {
-            return Ok(WorkflowHandle::polling(id, self.provider.clone()));
+            return WorkflowHandle::polling(id, self.provider.clone());
         }
-
         let join = rt.spawn_owned(canonical, handler);
-        Ok(WorkflowHandle::local(id, self.provider.clone(), join))
+        WorkflowHandle::local(id, self.provider.clone(), join)
     }
 
     /// Start a workflow from its typed [`WorkflowDef`] reference — the marker
@@ -3302,12 +3315,17 @@ impl Runtime {
         auth: &AuthContext,
     ) -> Result<(WorkflowStatus, bool, bool)> {
         let (row, queued) = self.build_run(id, name, input_json, opts, parent_id, auth)?;
-        let (canonical, created) = self
-            .provider
+        let (canonical, created) = self.insert_row(row).await?;
+        Ok((canonical, queued, created))
+    }
+
+    /// Persist a built row idempotently: the canonical row and whether this
+    /// call created it.
+    async fn insert_row(&self, row: WorkflowStatus) -> Result<(WorkflowStatus, bool)> {
+        self.provider
             .insert_workflow_status(row)
             .await
-            .map_err(crate::execution::observation_error)?;
-        Ok((canonical, queued, created))
+            .map_err(crate::execution::observation_error)
     }
 
     /// Spawn a run on a task this caller owns (for a local [`WorkflowHandle`]).
@@ -3340,17 +3358,39 @@ impl Runtime {
         instant: DateTime<Utc>,
     ) -> Result<(WorkflowStatus, bool, bool, String)> {
         let wf_id = format!("sched-{}-{}", schedule.schedule_name, instant.to_rfc3339());
+        let (canonical, queued, created) = self
+            .persist_scheduled_run(schedule, &wf_id, instant)
+            .await?;
+        Ok((canonical, queued, created, wf_id))
+    }
+
+    /// Persist a run of `schedule` for `instant` under `wf_id`: the tick input,
+    /// the schedule's queue, and the schedule's name on the row, which is the
+    /// only place a run gets one. Every run the scheduler creates, a cron tick,
+    /// a backfilled tick or a trigger, comes through here.
+    async fn persist_scheduled_run(
+        &self,
+        schedule: &WorkflowSchedule,
+        wf_id: &str,
+        instant: DateTime<Utc>,
+    ) -> Result<(WorkflowStatus, bool, bool)> {
         let opts = WorkflowOptions {
-            workflow_id: Some(wf_id.clone()),
+            workflow_id: Some(wf_id.to_string()),
             queue: schedule.queue_name.clone(),
             ..Default::default()
         };
-        let auth = AuthContext::default();
         let input = serde_json::to_value(schedule.tick_input(instant))?;
-        let (canonical, queued, created) = self
-            .insert_run(&wf_id, &schedule.workflow_name, input, &opts, None, &auth)
-            .await?;
-        Ok((canonical, queued, created, wf_id))
+        let (mut row, queued) = self.build_run(
+            wf_id,
+            &schedule.workflow_name,
+            input,
+            &opts,
+            None,
+            &AuthContext::default(),
+        )?;
+        row.schedule_name = Some(schedule.schedule_name.clone());
+        let (canonical, created) = self.insert_row(row).await?;
+        Ok((canonical, queued, created))
     }
 
     /// Run a freshly-persisted tick now if this executor's insert created it

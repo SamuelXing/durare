@@ -8,6 +8,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `WorkflowStatus::schedule_name` records the schedule that created a run,
+  on every path the scheduler creates runs by (cron ticks, including
+  `#[workflow(schedule)]` ones, `trigger_schedule` and `backfill_schedule`,
+  through the engine or a client) and on no other; `ListFilter::schedule_name`
+  filters by it. Migration 41 adds the column and its partial index on both
+  dialects, as the Go and Python SDKs define it.
+
 - `StepOutcome::from_columns` public constructor rebuilds a recorded step
   outcome from an `operation_outputs` row's columns and serialization format,
   so external `StateProvider` implementations can decode step rows exactly
@@ -76,6 +83,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `WorkflowStatus` and `ListFilter` gain a `schedule_name` field, so code that
+  builds either with a struct literal must name it; `WorkflowStatus::new` and
+  `ListFilter::default` are unaffected. The crate version moves to 0.6.0 for it.
 - The system schema's version is recorded in the `dbos_migrations` ledger every
   DBOS SDK shares instead of sqlx's `_sqlx_migrations`, so durare and the other
   SDKs can attach to a schema the other migrated and apply only what is pending.

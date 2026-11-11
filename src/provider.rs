@@ -615,6 +615,10 @@ pub struct WorkflowStatus {
     /// the *same* workflow name (one per configured instance), and is durably
     /// recorded so recovery re-dispatches to the same instance.
     pub config_name: Option<String>,
+    /// The schedule that enqueued this run, if a schedule did: the scheduler
+    /// stamps every tick, trigger and backfill with its schedule's name, and
+    /// nothing else sets it. Served by [`ListFilter::schedule_name`].
+    pub schedule_name: Option<String>,
     /// When the row was first created.
     pub created_at: DateTime<Utc>,
     /// When the row was last modified.
@@ -679,6 +683,7 @@ impl WorkflowStatus {
             authenticated_roles: Vec::new(),
             class_name: None,
             config_name: None,
+            schedule_name: None,
             created_at: now,
             updated_at: now,
             attributes: None,
@@ -713,6 +718,9 @@ pub struct ListFilter {
     pub forked_from: Vec<String>,
     /// Match any workflow whose parent is one of these ids (OR).
     pub parent_workflow_ids: Vec<String>,
+    /// Match any workflow enqueued by one of these schedules (OR); only runs a
+    /// schedule created match.
+    pub schedule_name: Vec<String>,
     /// `Some(true)` keeps only workflows that were themselves created by a fork;
     /// `Some(false)` only those that were not; `None` does not filter on it.
     pub was_forked_from: Option<bool>,
@@ -768,6 +776,7 @@ impl Default for ListFilter {
             authenticated_users: Vec::new(),
             forked_from: Vec::new(),
             parent_workflow_ids: Vec::new(),
+            schedule_name: Vec::new(),
             was_forked_from: None,
             start_time_ms: None,
             end_time_ms: None,
@@ -1262,6 +1271,7 @@ pub(crate) const EXPORT_STATUS_STR_COLS: &[&str] = &[
     "forked_from",
     "parent_workflow_id",
     "serialization",
+    "schedule_name",
 ];
 /// The 64-bit integer columns of an exported `workflow_status` row (see
 /// [`EXPORT_STATUS_STR_COLS`]). Shared by both SQL backends so a column added

@@ -29,7 +29,7 @@ const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, e
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
      authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at, attributes";
+     serialization, created_at, updated_at, attributes, schedule_name";
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -68,8 +68,9 @@ impl SqliteProvider {
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
                   workflow_timeout_ms, workflow_deadline_epoch_ms, delay_until_epoch_ms,
                   authenticated_user, assumed_role, authenticated_roles, class_name, config_name,
-                  serialization, created_at, updated_at, attributes, owner_xid)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                  serialization, created_at, updated_at, attributes, schedule_name,
+                  owner_xid)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                      lower(hex(randomblob(16))))
              {conflict}",
         ))
@@ -96,6 +97,7 @@ impl SqliteProvider {
         .bind(s.created_at.timestamp_millis())
         .bind(s.updated_at.timestamp_millis())
         .bind(encode_attributes(&s.attributes)?)
+        .bind(&s.schedule_name)
         .execute(&mut *connection)
         .await
         .map_err(|e| dedup_or(e, s))?
@@ -311,6 +313,7 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Work
         ),
         class_name: row.try_get("class_name").ok().flatten(),
         config_name: row.try_get("config_name").ok().flatten(),
+        schedule_name: row.try_get("schedule_name").ok().flatten(),
         created_at: ms_to_dt(row.get("created_at")),
         updated_at: ms_to_dt(row.get("updated_at")),
     }
@@ -2807,9 +2810,10 @@ impl StateProvider for SqliteProvider {
                       recovery_attempts, queue_name, workflow_timeout_ms,
                       workflow_deadline_epoch_ms, started_at_epoch_ms, deduplication_id, inputs,
                       priority, queue_partition_key, forked_from, parent_workflow_id,
-                      delay_until_epoch_ms, serialization, was_forked_from, completed_at)
+                      delay_until_epoch_ms, serialization, was_forked_from, completed_at,
+                      schedule_name)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                         ?, ?, ?, ?, ?)",
+                         ?, ?, ?, ?, ?, ?)",
             )
             .bind(col_str(s, "workflow_uuid"))
             .bind(col_str(s, "status"))
@@ -2847,6 +2851,7 @@ impl StateProvider for SqliteProvider {
             // older Rust ones). Never derived from this row's own `forked_from`.
             .bind(col_bool(s, "was_forked_from").unwrap_or(false))
             .bind(col_i64(s, "completed_at"))
+            .bind(col_str(s, "schedule_name"))
             .execute(&mut *tx)
             .await?;
 
@@ -3171,6 +3176,7 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
     push_in(qb, "authenticated_user", &filter.authenticated_users);
     push_in(qb, "forked_from", &filter.forked_from);
     push_in(qb, "parent_workflow_id", &filter.parent_workflow_ids);
+    push_in(qb, "schedule_name", &filter.schedule_name);
     if !filter.workflow_id_prefix.is_empty() {
         clause(qb);
         qb.push("(");

@@ -569,6 +569,10 @@ impl StateProvider for InMemoryProvider {
                         || w.parent_workflow_id
                             .as_deref()
                             .is_some_and(|p| filter.parent_workflow_ids.iter().any(|x| x == p)))
+                    && (filter.schedule_name.is_empty()
+                        || w.schedule_name
+                            .as_deref()
+                            .is_some_and(|s| filter.schedule_name.iter().any(|x| x == s)))
                     && filter
                         .was_forked_from
                         .is_none_or(|wf| fork_sources.contains(w.id.as_str()) == wf)
@@ -1742,6 +1746,7 @@ fn status_to_map(w: &WorkflowStatus) -> Map<String, Value> {
     m.insert("parent_workflow_id".into(), json!(w.parent_workflow_id));
     m.insert("delay_until_epoch_ms".into(), json!(w.delay_until_ms));
     m.insert("completed_at".into(), json!(w.completed_at_ms));
+    m.insert("schedule_name".into(), json!(w.schedule_name));
     m.insert("serialization".into(), Value::Null);
     m
 }
@@ -1786,6 +1791,7 @@ fn map_to_status(s: &Map<String, Value>) -> WorkflowStatus {
         authenticated_roles: decode_roles(col_str(s, "authenticated_roles").as_deref()),
         class_name: col_str(s, "class_name"),
         config_name: col_str(s, "config_name"),
+        schedule_name: col_str(s, "schedule_name"),
         created_at: ms_to_dt(col_i64(s, "created_at")),
         updated_at: ms_to_dt(col_i64(s, "updated_at")),
     }
