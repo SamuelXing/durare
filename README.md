@@ -5,15 +5,22 @@
 [![CI](https://github.com/SamuelXing/durare/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelXing/durare/actions/workflows/ci.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-`durare` (Latin *durāre*, "to last") is an independent durable-execution library
-for Rust. Write ordinary async functions; `durare` checkpoints step results to
-your database. After a crash, restart, or redeploy, it replays recorded results
-and resumes unfinished work without re-running checkpointed steps.
+`durare` (Latin *durāre*, "to last") is a durable-execution library for Rust.
+Write ordinary async functions; `durare` checkpoints each step to your database
+and, after a crash, restart, or redeploy, resumes every unfinished workflow
+exactly where it stopped. Completed steps are never re-run.
 
-The engine runs inside your application and stores workflow state directly in
-Postgres or SQLite. There is no separate workflow server or sidecar to operate.
+`durare` is a Rust SDK for [DBOS](https://docs.dbos.dev) durable execution,
+aligned by design with the DBOS Transact SDKs for Python, Go, TypeScript, and
+Rust: the same programming model, the same semantics, and the same system schema
+on the same database. There is no server to operate and no sidecar — the engine
+is a library inside your process that talks directly to Postgres or SQLite.
+See [DBOS compatibility](#dbos-compatibility). Full API documentation is on
+[docs.rs](https://docs.rs/durare).
 
-Full API documentation is on [docs.rs](https://docs.rs/durare).
+DBOS also publishes an official Rust SDK,
+[`dbos-transact-rust`](https://github.com/dbos-inc/dbos-transact-rust). `durare` is
+community-maintained. Both use the DBOS system schema.
 
 ```rust
 use std::time::Duration;
@@ -205,7 +212,7 @@ against `InMemoryProvider` with no infrastructure at all; the crate's own test
 suite runs against all three backends on every commit, with Postgres against a
 live server in CI.
 
-## Compatibility
+## DBOS compatibility
 
 `durare` uses the DBOS system schema and supports DBOS tooling integrations.
 See [DBOS compatibility](https://github.com/SamuelXing/durare/blob/main/docs/dbos-compatibility.md)
