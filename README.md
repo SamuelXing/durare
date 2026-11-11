@@ -59,6 +59,25 @@ process at any point — mid-sleep included — and the next `recover()` picks i
 up with the charge intact and only the remaining sleep to wait. The card is
 never charged twice.
 
+## Why the context is explicit
+
+Workflows take a `DurableContext` argument and pass it to helpers that perform
+durable work. Steps reserve their position in the workflow's history when they
+are constructed, inline, in a helper, or as a prebuilt `join!` argument, so
+poll order cannot move them.
+
+The context parameter is what lets `durare` reject step placements that would
+silently lose a checkpoint. A step constructed inside a spawned task, or inside
+another step's body, is an error rather than plain work that re-runs on
+recovery. Construction order still has to be deterministic, and patches must be
+awaited sequentially.
+
+The [`design` guide](https://docs.rs/durare/latest/durare/design/) covers the
+checks and caller rules; the
+[design note](https://github.com/SamuelXing/durare/blob/main/docs/design/explicit-context.md)
+explains the alternatives considered and compares the placement rules with the
+official Rust SDK's.
+
 ## Features
 
 - **Steps.** `#[durare::step]` functions or `ctx.step` closures. Per-step retry
