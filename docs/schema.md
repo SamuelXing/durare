@@ -4,7 +4,7 @@ DBOS keeps all of its durable state in the database (Postgres, or SQLite for
 local use). If a process dies partway through a workflow, everything needed to
 resume it lives in these tables, so it's worth knowing how they fit together.
 
-There are ten tables, built up over the 42 migrations in
+There are ten tables, built up over the 43 migrations in
 [`migrations/`](../migrations). The layout matches the Go and Python SDKs
 column-for-column, which is what lets a workflow written by one SDK be read or
 recovered by another.
@@ -275,10 +275,10 @@ by another.
 **Cascade deletes** from `workflow_status` mean one delete cleans up a
 workflow's steps, events, streams, and messages together.
 
-On Postgres, the **`LISTEN`/`NOTIFY` triggers** on `notifications`,
-`workflow_events`, and (since migration 39) `streams` turn polling into push,
-so blocked `recv`/`get_event`/stream-read calls wake promptly. SQLite doesn't
-have that, so it polls instead.
+On Postgres, the **`LISTEN`/`NOTIFY` triggers** on `notifications` and
+`workflow_events` turn polling into push, so blocked `recv`/`get_event` calls
+wake promptly. SQLite doesn't have that, so it polls instead. Stream reads poll
+on every backend (migration 43 dropped the `streams` trigger).
 
 Finally, a lot of the later migrations (roughly 22 through 37) just drop full
 indexes and recreate them as **partial indexes** scoped to the rows the

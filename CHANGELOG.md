@@ -90,6 +90,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Migration 43 drops the per-row `streams` NOTIFY trigger migration 39
+  created, as the Go and Python SDKs do at that index. durare never listened
+  on its channel, stream reads poll, and the trigger serialized every SDK's
+  stream writes on the notification queue's global lock. Postgres-only; the
+  SQLite chain stops at 42 until the next shared migration, as upstream's does.
 - The debouncer runs on the model the Go and Python SDKs use. A debounced
   workflow is the target itself, waiting `DELAYED` on its queue and holding
   `{workflow}-{key}` (or `{workflow}/{config}-{key}` for configured instances)
