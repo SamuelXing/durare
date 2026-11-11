@@ -95,19 +95,26 @@ async fn debounce_from_client_coalesces_to_latest_input() -> Result<()> {
 }
 
 /// The debounced target runs with the caller's `WorkflowOptions` — its
-/// authenticated identity and application version — not just an id.
+/// authenticated identity and application version — not just an id. The run
+/// is queued under the threaded version, so, as for any enqueue, only an
+/// executor on that version claims it: a second engine here.
 #[tokio::test]
 async fn debounce_threads_target_options() -> Result<()> {
-    let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
-    engine.register("notify", |ctx: DurableContext, msg: String| async move {
+    let provider = Arc::new(InMemoryProvider::new());
+    let notify = |ctx: DurableContext, msg: String| async move {
         // Echo the identity the target sees, proving auth threaded through.
         Ok::<_, Error>(format!(
             "{}:{}",
             ctx.authenticated_user().unwrap_or(""),
             msg
         ))
-    });
+    };
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("notify", notify);
     engine.launch().await?;
+    let mut runner = DurableEngine::new_with_version(provider, "9.9.9").await?;
+    runner.register("notify", notify);
+    runner.launch().await?;
 
     let opts = WorkflowOptions::default()
         .authenticated_user("alice")
@@ -130,5 +137,6 @@ async fn debounce_threads_target_options() -> Result<()> {
     assert_eq!(status.app_version, "9.9.9");
 
     engine.shutdown(Duration::from_secs(1)).await?;
+    runner.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }

@@ -579,6 +579,15 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// The identity a top-level run takes from its options.
+    pub(crate) fn from_options(opts: &crate::WorkflowOptions) -> Self {
+        Self {
+            authenticated_user: opts.authenticated_user.clone(),
+            assumed_role: opts.assumed_role.clone(),
+            authenticated_roles: opts.authenticated_roles.clone(),
+        }
+    }
+
     /// Lift the identity recorded on a persisted workflow row.
     pub(crate) fn from_status(s: &WorkflowStatus) -> Self {
         Self {

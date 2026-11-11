@@ -1361,6 +1361,68 @@ pub struct ForkParams {
     pub partition_key: Option<String>,
 }
 
+/// One bounce of a debounced workflow: push back the `DELAYED` run holding
+/// `dedup_id` on `queue_name`, if there is one and it is a debounced run of
+/// `workflow_name`, and give it `input`.
+#[derive(Clone, Debug)]
+pub struct DebounceRequest<'a> {
+    /// The debounced workflow's registered name; a run of another workflow
+    /// holding the same key is a collision, never extended.
+    pub workflow_name: &'a str,
+    /// The target class; empty and absent names are equivalent.
+    pub class_name: Option<&'a str>,
+    /// The configured target instance; empty and absent names are equivalent.
+    pub config_name: Option<&'a str>,
+    /// The queue the debounced run waits on.
+    pub queue_name: &'a str,
+    /// The debounce key as stored: the run's deduplication id.
+    pub dedup_id: &'a str,
+    /// The new wake instant, epoch ms; a stored `debounce_deadline_epoch_ms`
+    /// below it wins.
+    pub delay_until_ms: i64,
+    /// The input the run will start with.
+    pub input: &'a Value,
+}
+
+/// What a [`DebounceRequest`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DebounceOutcome {
+    /// The debounced run with this id was pushed back and given the input.
+    Bounced(String),
+    /// Nothing holds the key: the caller enqueues a fresh debounced run.
+    Unheld,
+    /// Another run holds the key and was not extended: one that is not
+    /// debounced, one of another workflow, or one that already left `DELAYED`.
+    Held {
+        /// The holder's workflow name.
+        workflow_name: String,
+        /// The holder's target class.
+        class_name: Option<String>,
+        /// The holder's configured instance.
+        config_name: Option<String>,
+        /// Whether the holder is itself a debounced run.
+        is_debounced: bool,
+    },
+}
+
+/// The outcome for the key's holder, if the bounce extended nothing: the row
+/// the SQL backends read with its target identity.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+type DebounceHolder = (String, bool, Option<String>, Option<String>);
+
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn holder_outcome(holder: Option<DebounceHolder>) -> DebounceOutcome {
+    match holder {
+        Some((workflow_name, is_debounced, class_name, config_name)) => DebounceOutcome::Held {
+            workflow_name,
+            class_name,
+            config_name,
+            is_debounced,
+        },
+        None => DebounceOutcome::Unheld,
+    }
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.
@@ -1612,6 +1674,26 @@ pub trait StateProvider: Send + Sync {
         queue_name: &str,
         dedup_id: &str,
     ) -> Result<Option<String>>;
+
+    /// Push back the debounced `DELAYED` run holding `req.dedup_id` on
+    /// `req.queue_name`, in one atomic step: its `delay_until_ms` becomes
+    /// `req.delay_until_ms`, capped at its `debounce_deadline_ms`, and its input
+    /// is replaced. Only a run with the same workflow name, class and config
+    /// that is debounced and still `DELAYED` is extended; otherwise the outcome reports the holder,
+    /// or that the key is free. Backs [`Debouncer`](crate::Debouncer).
+    ///
+    /// The default refuses: a provider that cannot do this atomically cannot
+    /// debounce, since a bounce racing a promotion must either extend the run
+    /// or see it gone, never update a run already committed to starting.
+    async fn debounce_delayed_workflow(
+        &self,
+        req: &DebounceRequest<'_>,
+    ) -> Result<DebounceOutcome> {
+        let _ = req;
+        Err(Error::app(
+            "this state provider does not support debouncing",
+        ))
+    }
 
     /// Fetch a workflow row by id, if it exists.
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>>;

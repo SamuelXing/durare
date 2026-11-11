@@ -95,6 +95,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   on its channel, stream reads poll, and the trigger serialized every SDK's
   stream writes on the notification queue's global lock. Postgres-only; the
   SQLite chain stops at 42 until the next shared migration, as upstream's does.
+- The debouncer runs on the model the Go and Python SDKs use. A debounced
+  workflow is the target itself, waiting `DELAYED` on its queue and holding
+  `{workflow}-{key}` (or `{workflow}/{config}-{key}` for configured instances)
+  as its deduplication id; each bounce is one atomic update
+  that pushes the wake instant out, never past the deadline a `timeout` sets,
+  and replaces the input. A durare debounce and a peer's debounce of the same
+  workflow and key now coalesce into one run. The internal collector workflow
+  and its ACK protocol are retired: nothing creates one, and its registration
+  stays for one release so collectors a 0.5 engine enqueued finish after an
+  upgrade. `Debouncer::options` now carries the full `WorkflowOptions` to the
+  run (queue, priority, version, timeout, attributes, class and config name,
+  identity, and the id of a fresh run); a deduplication id, delay, partition
+  key or deduplication policy is refused, as the reference SDKs refuse them,
+  and a key held by a run that is not a debounce of the same workflow is a
+  `QueueDeduplicated` error instead of a second collector. Bounces also check
+  the class and configured instance before replacing input; reusing a workflow
+  id for another target returns `WorkflowTargetConflict` on both producer APIs.
+- `StateProvider::debounce_delayed_workflow` is a new provided method, the
+  atomic bounce behind the debouncer, with `DebounceRequest` and
+  `DebounceOutcome`. The built-in providers implement it; the default refuses,
+  so a third-party provider must implement it to debounce.
 - `WorkflowStatus` gains `schedule_name`, `debounce_deadline_ms` and
   `is_debounced`, and `ListFilter` gains `schedule_name` and `is_debounced`, so
   code that builds either with a struct literal must name them; `WorkflowStatus::new` and
