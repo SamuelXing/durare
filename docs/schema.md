@@ -4,8 +4,10 @@ DBOS keeps all of its durable state in the database (Postgres, or SQLite for
 local use). If a process dies partway through a workflow, everything needed to
 resume it lives in these tables, so it's worth knowing how they fit together.
 
-There are ten tables, built up over the 47 migrations in
-[`migrations/`](../migrations). The layout matches the Go and Python SDKs
+There are ten tables, built up over the migrations in
+[`migrations/`](../migrations), which run from 1 to 47 and then from 100 on.
+Versions from 100 on are shared: every DBOS SDK defines the same migration at
+the same version. The layout matches the Go and Python SDKs
 column-for-column, which is what lets a workflow written by one SDK be read or
 recovered by another.
 
@@ -297,6 +299,16 @@ one seek per distinct key, so the listing costs as much as there are
 partitions, not as much as there is backlog. Migration 45 is a placeholder:
 peers build a first version of the index there and drop it in 47, and durare
 skips building what it would drop in the same transaction.
+
+**`application_name`** (migrations 100 to 107) lets several applications share
+one system database. Five tables carry it: `workflow_status`, `queues`,
+`workflow_schedules`, `application_versions`, and `operation_outputs`, where
+it is copied from the run so steps can be filtered without a join. NULL means
+unclaimed: any application may read and claim the row. `application_versions`
+is keyed by it, through one unique index on `(application_name, version_name)`
+for owned rows and one on `version_name` for unclaimed ones, and
+`enqueue_workflow()` takes it as a trailing argument. durare does not name
+itself yet: it writes every row unclaimed and reads rows whoever owns them.
 
 ## One table that lives elsewhere
 

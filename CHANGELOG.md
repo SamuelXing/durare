@@ -8,6 +8,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Migrations 100 to 107, the first of the history every DBOS SDK defines at
+  the same version: an `application_name` column on `workflow_status`,
+  `queues`, `workflow_schedules`, `application_versions` and
+  `operation_outputs`, a trailing `application_name` argument on the
+  `enqueue_workflow()` SQL function, and two unique indexes keying
+  `application_versions` by owner. This is schema only. durare leaves the
+  column NULL, which peers read as unclaimed, and does not filter by it, so
+  nothing changes for a database only durare uses (#179).
+
 - Migration 42 adds `workflow_status.debounce_deadline_epoch_ms` and
   `is_debounced`, as the Go and Python SDKs define them: a debounced run waits
   `DELAYED` holding its debounce key as its deduplication id. `WorkflowStatus`
