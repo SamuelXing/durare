@@ -3,11 +3,11 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds, per dialect: 43 and 44 are
-/// Postgres-only (they drop triggers SQLite never had), so SQLite stops at 42,
-/// as the Go and Python SDKs' SQLite chains do.
-const PG_LATEST: i64 = 44;
-const SQLITE_LATEST: i64 = 42;
+/// The newest migration this build embeds. Both dialects end at 47; SQLite
+/// skips 43 and 44, which drop triggers it never had, as the Go and Python
+/// SDKs' SQLite chains do.
+const PG_LATEST: i64 = 47;
+const SQLITE_LATEST: i64 = 47;
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
@@ -54,6 +54,18 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         assert!(
             trigger_exists(&pool, "dbos_notifications_trigger").await?,
             "the notifications trigger stays"
+        );
+
+        // Migrations 45 to 47 leave exactly one partition dequeue index.
+        let partition_indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = 'dbos'
+             AND indexname LIKE 'idx_workflow_status_partition_dequeue%'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            partition_indexes,
+            ["idx_workflow_status_partition_dequeue_v2"]
         );
 
         // A second initialisation changes nothing.
@@ -163,6 +175,17 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
             .await
     }
     assert_eq!(ledger_rows(&pool).await?, vec![SQLITE_LATEST]);
+    // Migrations 45 to 47 leave exactly one partition dequeue index.
+    let partition_indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index'
+         AND name LIKE 'idx_workflow_status_partition_dequeue%'",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        partition_indexes,
+        ["idx_workflow_status_partition_dequeue_v2"]
+    );
 
     // Behind, then caught up: undo migrations 40 to 42 and roll the ledger
     // back.

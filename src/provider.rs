@@ -1425,6 +1425,36 @@ pub(crate) fn holder_outcome(holder: Option<DebounceHolder>) -> DebounceOutcome 
     }
 }
 
+/// SQL listing the distinct partition keys with `ENQUEUED` work on the queue
+/// bound as `$1`, each key once.
+///
+/// A loose index scan: each step seeks the partition dequeue index for the
+/// smallest key above the previous one, where `SELECT DISTINCT` would read
+/// every enqueued row of the queue.
+///
+/// The status is a literal, and the index's own predicate is repeated, because
+/// a partial index is only chosen when the planner can prove the query implies
+/// its predicate: SQLite matches the terms textually, and Postgres cannot prove
+/// it from a bind parameter once a statement runs on a generic plan.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn queue_partitions_sql(workflow_status: &str) -> String {
+    let enqueued = format!(
+        "queue_name = $1 AND status = '{STATUS_ENQUEUED}' \
+         AND status IN ('{STATUS_ENQUEUED}', '{STATUS_PENDING}') \
+         AND queue_partition_key IS NOT NULL"
+    );
+    format!(
+        "WITH RECURSIVE partitions(pk) AS (
+             SELECT MIN(queue_partition_key) FROM {workflow_status} WHERE {enqueued}
+             UNION ALL
+             SELECT (SELECT MIN(queue_partition_key) FROM {workflow_status}
+                     WHERE {enqueued} AND queue_partition_key > partitions.pk)
+             FROM partitions WHERE partitions.pk IS NOT NULL
+         )
+         SELECT pk FROM partitions WHERE pk IS NOT NULL"
+    )
+}
+
 /// Parameters for one dequeue iteration, computed by the engine's dispatcher
 /// from a [`crate::WorkflowQueue`]'s configuration. Plain scalars so the storage
 /// layer stays decoupled from the queue type.
@@ -1869,8 +1899,8 @@ pub trait StateProvider: Send + Sync {
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64>;
 
     /// Distinct non-null partition keys among the `ENQUEUED` workflows on
-    /// `queue_name`. The dispatcher of a partitioned queue iterates these and
-    /// dequeues each partition independently.
+    /// `queue_name`, each key once. The dispatcher of a partitioned queue
+    /// iterates these and dequeues each partition independently.
     async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>>;
 
     /// Append a message for `destination_id` on `topic`, the stored form: the

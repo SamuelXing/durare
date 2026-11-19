@@ -1,15 +1,16 @@
 use crate::error::{Error, Result};
 use crate::provider::{
     col_bool, col_i64, col_str, decode_roles, dedup_or, encode_roles, group_stream_rows,
-    holder_outcome, is_terminal, nonexistent_or, workflow_agg_selects, CancelOptions, ChangeWait,
-    ChangeWatch, DebounceOutcome, DebounceRequest, DequeueRequest, ExportedWorkflow, ForkParams,
-    ListFilter, NotificationInfo, NotificationInsert, RecordedColumns, RecordedStep, RecoveryClaim,
-    RecoveryClaimRequest, StateProvider, StepAggregate, StepAggregateQuery, StepInfo,
-    StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
-    WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS,
-    NOTIFICATIONS_CHANNEL, STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL, WORKFLOW_EVENTS_CHANNEL,
+    holder_outcome, is_terminal, nonexistent_or, queue_partitions_sql, workflow_agg_selects,
+    CancelOptions, ChangeWait, ChangeWatch, DebounceOutcome, DebounceRequest, DequeueRequest,
+    ExportedWorkflow, ForkParams, ListFilter, NotificationInfo, NotificationInsert,
+    RecordedColumns, RecordedStep, RecoveryClaim, RecoveryClaimRequest, StateProvider,
+    StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome, VersionInfo,
+    WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
+    EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED,
+    STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
+    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -2238,15 +2239,11 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>> {
-        let keys: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT DISTINCT queue_partition_key FROM {workflow_status}
-             WHERE queue_name = $1 AND status = $2 AND queue_partition_key IS NOT NULL",
-            workflow_status = self.tables.workflow_status
-        ))
-        .bind(queue_name)
-        .bind(STATUS_ENQUEUED)
-        .fetch_all(&self.pool)
-        .await?;
+        let keys: Vec<String> =
+            sqlx::query_scalar(&queue_partitions_sql(&self.tables.workflow_status))
+                .bind(queue_name)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(keys)
     }
 
