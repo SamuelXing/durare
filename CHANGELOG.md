@@ -88,6 +88,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `dbos.otelContext`, the key the Python SDK uses, so queued and recovered
   runs join the caller's trace (#149).
 
+- Migrations 45 to 47 add `idx_workflow_status_partition_dequeue_v2`, the
+  partition dequeue index the Go and Python SDKs define, on both dialects.
+  A partitioned queue's dispatcher now lists its active partitions by
+  walking that index, one seek per distinct key, where it used to read every
+  enqueued row of the queue. In one local measurement on Postgres, 500,000
+  enqueued runs over 200 partitions, the listing went from 98 ms to 3.6 ms.
+  The index serves the listing only for now; the per-partition dequeue is
+  unchanged (#180).
+
 ### Changed
 
 - Migration 44 drops the per-row `workflow_events` NOTIFY trigger migration 1
