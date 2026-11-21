@@ -3,11 +3,11 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds. Both dialects end at 107; SQLite
+/// The newest migration this build embeds. Both dialects end at 109; SQLite
 /// skips 43, 44 and 105, which touch triggers and a function it never had, as
 /// the Go and Python SDKs' SQLite chains do. Versions 48 to 99 are unused.
-const PG_LATEST: i64 = 107;
-const SQLITE_LATEST: i64 = 107;
+const PG_LATEST: i64 = 109;
+const SQLITE_LATEST: i64 = 109;
 
 /// The tables migrations 100 to 104 add `application_name` to.
 const APPLICATION_NAME_TABLES: [&str; 5] = [

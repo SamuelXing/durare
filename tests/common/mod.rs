@@ -91,6 +91,15 @@ pub async fn hermetic_pg_db(base_url: &str, prefix: &str) -> (PgPool, String, St
     (admin, url, dbname)
 }
 
+/// A pool on the database at `url` that resolves the system tables by bare
+/// name, for seeding and inspecting rows behind the provider's back.
+#[allow(dead_code)]
+pub async fn pg_raw_pool(url: &str) -> PgPool {
+    PgPool::connect(&format!("{url}?options=-csearch_path%3Ddbos"))
+        .await
+        .expect("connect to the hermetic database")
+}
+
 /// Best-effort teardown; `FORCE` terminates any connection a pool has not
 /// finished closing yet (Postgres 13+).
 #[cfg(feature = "postgres")]

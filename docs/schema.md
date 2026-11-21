@@ -4,7 +4,7 @@ DBOS keeps all of its durable state in the database (Postgres, or SQLite for
 local use). If a process dies partway through a workflow, everything needed to
 resume it lives in these tables, so it's worth knowing how they fit together.
 
-There are ten tables, built up over the migrations in
+There are twelve tables, built up over the migrations in
 [`migrations/`](../migrations), which run from 1 to 47 and then from 100 on.
 Versions from 100 on are shared: every DBOS SDK defines the same migration at
 the same version. The layout matches the Go and Python SDKs
@@ -218,6 +218,14 @@ with it (`ON DELETE CASCADE`). That's why deleting a workflow cleans up all of
 its history in one statement. `operation_outputs` is the exception in a
 database another SDK has taken to shared migration 112, which drops its
 foreign key; durare deletes a run's steps by name, so it does not depend on it.
+
+Two more tables carry no foreign key at all: `workflow_input` and
+`workflow_output` (migration 109), keyed by `workflow_uuid`. The reference SDKs
+store a run's input and its outcome there, no longer in the `inputs`, `output`
+and `error` columns of `workflow_status`. Every read takes the row in these
+tables when there is one and the column otherwise, so runs written either way
+read the same. durare still writes the columns, replaces or removes a row a
+peer left when it writes a newer value, and deletes both rows with the run.
 
 **`operation_outputs`** is the important one — it's where steps are
 checkpointed. Each row is one step or one child-workflow call, keyed by
