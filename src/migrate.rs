@@ -29,11 +29,19 @@ pub(crate) const UNRECORDED_SCHEMA: &str = "dbos schema exists but records no mi
 /// Every migration is a plain up migration at its own version: the runner
 /// records one version per file, so a reversible pair or two files at one
 /// version (the layout the Go SDK uses for one of its migrations) would be
-/// misrecorded. Checked by each backend's unit tests.
+/// misrecorded. And no migration sits between durare's own history, which
+/// ended at 47, and the shared one, which starts at 100: a database already at
+/// 100 or later would skip it without an error. Checked by each backend's unit
+/// tests.
 #[cfg(test)]
 pub(crate) fn check_embedded(migrator: &Migrator) {
     let mut versions = std::collections::HashSet::new();
     for m in migrator.iter() {
+        assert!(
+            !(48..100).contains(&m.version),
+            "migration {} is in the unused range 48 to 99",
+            m.version
+        );
         assert!(
             matches!(m.migration_type, sqlx::migrate::MigrationType::Simple),
             "migration {} is not a plain up migration",

@@ -3,11 +3,25 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds. Both dialects end at 47; SQLite
-/// skips 43 and 44, which drop triggers it never had, as the Go and Python
-/// SDKs' SQLite chains do.
-const PG_LATEST: i64 = 47;
-const SQLITE_LATEST: i64 = 47;
+/// The newest migration this build embeds. Both dialects end at 107; SQLite
+/// skips 43, 44 and 105, which touch triggers and a function it never had, as
+/// the Go and Python SDKs' SQLite chains do. Versions 48 to 99 are unused.
+const PG_LATEST: i64 = 107;
+const SQLITE_LATEST: i64 = 107;
+
+/// The tables migrations 100 to 104 add `application_name` to.
+const APPLICATION_NAME_TABLES: [&str; 5] = [
+    "application_versions",
+    "operation_outputs",
+    "queues",
+    "workflow_schedules",
+    "workflow_status",
+];
+/// The keys migrations 106 and 107 put on `application_versions`.
+const VERSION_KEYS: [&str; 2] = [
+    "uq_application_versions_owner_version",
+    "uq_application_versions_unclaimed_version",
+];
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
@@ -67,6 +81,53 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
             partition_indexes,
             ["idx_workflow_status_partition_dequeue_v2"]
         );
+
+        let owned: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name::text FROM information_schema.columns
+             WHERE table_schema = 'dbos' AND column_name = 'application_name'
+             ORDER BY table_name",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(owned, APPLICATION_NAME_TABLES);
+        let keys: Vec<String> = sqlx::query_scalar(
+            "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'dbos'
+             AND indexname LIKE 'uq_application_versions_%' ORDER BY indexname",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(keys, VERSION_KEYS);
+
+        // Migration 105 leaves one enqueue_workflow, taking a trailing
+        // application_name: omitted, the run is unclaimed; given, it is owned.
+        let arities: Vec<i16> = sqlx::query_scalar(
+            "SELECT p.pronargs FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'dbos' AND p.proname = 'enqueue_workflow'",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(arities, [17]);
+        sqlx::raw_sql(
+            "SELECT dbos.enqueue_workflow('wf', 'q', workflow_id => 'unclaimed');
+             SELECT dbos.enqueue_workflow('wf', 'q', workflow_id => 'owned', application_name => 'app')",
+        )
+        .execute(&pool)
+        .await?;
+        let owners: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT workflow_uuid, application_name FROM dbos.workflow_status ORDER BY workflow_uuid",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            owners,
+            [
+                ("owned".to_owned(), Some("app".to_owned())),
+                ("unclaimed".to_owned(), None)
+            ]
+        );
+        sqlx::query("DELETE FROM dbos.workflow_status")
+            .execute(&pool)
+            .await?;
 
         // A second initialisation changes nothing.
         provider.init().await?;
@@ -187,20 +248,37 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         ["idx_workflow_status_partition_dequeue_v2"]
     );
 
-    // Behind, then caught up: undo migrations 40 to 42 and roll the ledger
-    // back.
-    sqlx::raw_sql(
-        "ALTER TABLE workflow_status DROP COLUMN is_debounced;
-         ALTER TABLE workflow_status DROP COLUMN debounce_deadline_epoch_ms;
-         DROP INDEX idx_workflow_status_schedule_name;
-         ALTER TABLE workflow_status DROP COLUMN schedule_name;
-         ALTER TABLE workflow_status DROP COLUMN attributes;
-         UPDATE dbos_migrations SET version = 39",
+    let owned: Vec<String> = sqlx::query_scalar(
+        "SELECT m.name FROM sqlite_master m JOIN pragma_table_info(m.name) c
+         ON c.name = 'application_name' WHERE m.type = 'table' ORDER BY m.name",
     )
-    .execute(&pool)
+    .fetch_all(&pool)
     .await?;
-    provider.init().await?;
-    assert_eq!(ledger_rows(&pool).await?, vec![SQLITE_LATEST]);
+    assert_eq!(owned, APPLICATION_NAME_TABLES);
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index'
+         AND name LIKE 'uq_application_versions_%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(keys, VERSION_KEYS);
+
+    // Behind, then caught up: a database left at 47 crosses the unused
+    // versions to the newest one.
+    let behind = SqlitePool::connect("sqlite::memory:").await?;
+    let embedded = sqlx::migrate!("./migrations/sqlite");
+    for m in embedded.iter().filter(|m| m.version <= 47) {
+        sqlx::raw_sql(&m.sql).execute(&behind).await?;
+    }
+    sqlx::raw_sql(
+        "CREATE TABLE dbos_migrations (version BIGINT NOT NULL PRIMARY KEY);
+         INSERT INTO dbos_migrations VALUES (47)",
+    )
+    .execute(&behind)
+    .await?;
+    SqliteProvider::from_pool(behind.clone()).init().await?;
+    assert_eq!(ledger_rows(&behind).await?, vec![SQLITE_LATEST]);
+    behind.close().await;
 
     // Ahead: left alone.
     sqlx::query("UPDATE dbos_migrations SET version = 125")
