@@ -215,7 +215,9 @@ active, not to completed ones.
 
 These five each have a foreign key back to `workflow_status` and are deleted
 with it (`ON DELETE CASCADE`). That's why deleting a workflow cleans up all of
-its history in one statement.
+its history in one statement. `operation_outputs` is the exception in a
+database another SDK has taken to shared migration 112, which drops its
+foreign key; durare deletes a run's steps by name, so it does not depend on it.
 
 **`operation_outputs`** is the important one — it's where steps are
 checkpointed. Each row is one step or one child-workflow call, keyed by
@@ -276,7 +278,8 @@ Because it travels with the data, an SDK in one language can decode rows written
 by another.
 
 **Cascade deletes** from `workflow_status` mean one delete cleans up a
-workflow's steps, events, streams, and messages together.
+workflow's events, streams, and messages together; its steps are deleted
+alongside, by name.
 
 On Postgres, **`LISTEN`/`NOTIFY`** turns polling into push, so blocked
 `recv`/`get_event` calls wake promptly: a trigger on `notifications` notifies

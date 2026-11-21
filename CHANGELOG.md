@@ -187,6 +187,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `delete_workflows` and `garbage_collect` delete a run's steps themselves on
+  Postgres and SQLite. They used to rely on the foreign key from
+  `operation_outputs` to `workflow_status`, which the reference SDKs drop in
+  shared migration 112: on a database a peer had migrated that far, a deleted
+  run left its step checkpoints behind, where a later run with the same
+  workflow id would find them.
+
 - Step timing matches the reference SDKs: a child workflow's checkpoint
   records when the child was started (on the built-in providers), a durable
   timer's `DBOS.sleep` row (`sleep`, and the `recv`/`get_event` deadlines)

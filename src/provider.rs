@@ -2116,8 +2116,8 @@ pub trait StateProvider: Send + Sync {
     /// returns an empty vec.
     async fn resume_workflows(&self, ids: &[String]) -> Result<Vec<String>>;
 
-    /// Delete workflows and (via `ON DELETE CASCADE`) their step / event / stream
-    /// rows, regardless of state. When `delete_children`, every descendant by
+    /// Delete workflows and their step / event / stream rows, regardless of
+    /// state. When `delete_children`, every descendant by
     /// `parent_workflow_id` (transitively) is deleted too. Missing ids are
     /// skipped. An empty slice is a no-op.
     async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()>;

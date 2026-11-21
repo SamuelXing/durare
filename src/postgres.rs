@@ -2692,31 +2692,37 @@ impl StateProvider for PostgresProvider {
         if ids.is_empty() {
             return Ok(());
         }
-        // ON DELETE CASCADE removes each workflow's step / event / stream rows.
-        if delete_children {
-            sqlx::query(&format!(
+        // ON DELETE CASCADE removes each workflow's event / stream rows. Steps
+        // are deleted by name in the same statement: a peer past shared
+        // migration 112 has dropped their foreign key.
+        let sql = if delete_children {
+            format!(
                 "WITH RECURSIVE targets AS (
                      SELECT workflow_uuid FROM {workflow_status} WHERE workflow_uuid = ANY($1)
                      UNION
                      SELECT w.workflow_uuid FROM {workflow_status} w
                        JOIN targets t ON w.parent_workflow_id = t.workflow_uuid
+                 ),
+                 steps AS (
+                     DELETE FROM {operation_outputs}
+                     WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)
                  )
                  DELETE FROM {workflow_status}
                  WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
+                operation_outputs = self.tables.operation_outputs,
                 workflow_status = self.tables.workflow_status
-            ))
-            .bind(ids)
-            .execute(&self.pool)
-            .await?;
+            )
         } else {
-            sqlx::query(&format!(
-                "DELETE FROM {workflow_status} WHERE workflow_uuid = ANY($1)",
+            format!(
+                "WITH steps AS (
+                     DELETE FROM {operation_outputs} WHERE workflow_uuid = ANY($1)
+                 )
+                 DELETE FROM {workflow_status} WHERE workflow_uuid = ANY($1)",
+                operation_outputs = self.tables.operation_outputs,
                 workflow_status = self.tables.workflow_status
-            ))
-            .bind(ids)
-            .execute(&self.pool)
-            .await?;
-        }
+            )
+        };
+        sqlx::query(&sql).bind(ids).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -2732,9 +2738,10 @@ impl StateProvider for PostgresProvider {
         };
         // The canonical DBOS GC delete: rows that *finished* before the cutoff
         // go; in-flight work survives regardless of age, because it has no
-        // `completed_at` for the bound to select. Children cascade. Batched so a
-        // large backlog is many short transactions, not one long delete pinning
-        // the MVCC horizon of the hottest table.
+        // `completed_at` for the bound to select. Events and streams cascade;
+        // steps go by name, as in `delete_workflows`. Batched so a large
+        // backlog is many short transactions, not one long delete pinning the
+        // MVCC horizon of the hottest table.
         //
         // The status list is redundant given the `completed_at` bound and kept
         // as a second line of defence: a stray row with both a terminal-looking
@@ -2742,11 +2749,18 @@ impl StateProvider for PostgresProvider {
         let mut total = 0u64;
         loop {
             let res = sqlx::query(&format!(
-                "DELETE FROM {workflow_status}
-                 WHERE workflow_uuid IN (
+                "WITH targets AS (
                      SELECT workflow_uuid FROM {workflow_status}
                      WHERE completed_at < $1 AND status NOT IN ($2, $3, $4)
-                     LIMIT $5)",
+                     LIMIT $5
+                 ),
+                 steps AS (
+                     DELETE FROM {operation_outputs}
+                     WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)
+                 )
+                 DELETE FROM {workflow_status}
+                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
+                operation_outputs = self.tables.operation_outputs,
                 workflow_status = self.tables.workflow_status
             ))
             .bind(cutoff)
