@@ -346,8 +346,7 @@ impl Client {
             .await
     }
 
-    /// Delete many workflows and (via `ON DELETE CASCADE`) their step / event /
-    /// stream rows. When `delete_children`, every descendant by
+    /// Delete many workflows and their step / event / stream rows. When `delete_children`, every descendant by
     /// `parent_workflow_id` is removed too. Missing ids are skipped.
     pub async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()> {
         self.provider.delete_workflows(ids, delete_children).await

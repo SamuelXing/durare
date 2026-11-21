@@ -1935,7 +1935,9 @@ impl StateProvider for SqliteProvider {
         if ids.is_empty() {
             return Ok(());
         }
-        // ON DELETE CASCADE removes each workflow's step / event / stream rows.
+        // ON DELETE CASCADE removes each workflow's event / stream rows. Steps
+        // are deleted by name in the same transaction: a peer past shared
+        // migration 112 has dropped their foreign key.
         let mut qb: QueryBuilder<Sqlite> = if delete_children {
             let mut qb = QueryBuilder::new(
                 "WITH RECURSIVE targets AS (
@@ -1958,7 +1960,11 @@ impl StateProvider for SqliteProvider {
             qb.push(")");
             qb
         };
-        qb.build().execute(&self.pool).await?;
+        qb.push(" RETURNING workflow_uuid");
+        let mut tx = self.pool.begin().await?;
+        let deleted: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+        delete_steps(&mut tx, &deleted).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1974,31 +1980,36 @@ impl StateProvider for SqliteProvider {
         };
         // The canonical DBOS GC delete: rows that *finished* before the cutoff
         // go; in-flight work survives regardless of age, because it has no
-        // `completed_at` for the bound to select. Children cascade. Batched so a
-        // large backlog is many short write transactions — under WAL, long
-        // writes starve every other writer in the process.
+        // `completed_at` for the bound to select. Events and streams cascade;
+        // steps go by name, as in `delete_workflows`. Batched so a large
+        // backlog is many short write transactions — under WAL, long writes
+        // starve every other writer in the process.
         //
         // The status list is redundant given the `completed_at` bound and kept
         // as a second line of defence: a stray row with both a terminal-looking
         // `completed_at` and a live status must never be collected.
         let mut total = 0u64;
         loop {
-            let res = sqlx::query(
+            let mut tx = self.pool.begin().await?;
+            let deleted: Vec<String> = sqlx::query_scalar(
                 "DELETE FROM workflow_status
                  WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM workflow_status
                      WHERE completed_at < ? AND status NOT IN (?, ?, ?)
-                     LIMIT ?)",
+                     LIMIT ?)
+                 RETURNING workflow_uuid",
             )
             .bind(cutoff)
             .bind(STATUS_PENDING)
             .bind(STATUS_ENQUEUED)
             .bind(STATUS_DELAYED)
             .bind(crate::provider::GC_BATCH)
-            .execute(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
-            total += res.rows_affected();
-            if res.rows_affected() < crate::provider::GC_BATCH as u64 {
+            delete_steps(&mut tx, &deleted).await?;
+            tx.commit().await?;
+            total += deleted.len() as u64;
+            if deleted.len() < crate::provider::GC_BATCH as usize {
                 return Ok(total);
             }
         }
@@ -3186,6 +3197,23 @@ fn row_to_step(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Result
             .flatten()
             .map(ms_to_dt),
     })
+}
+
+/// Deletes the steps of the runs `ids` names, for a caller that has deleted
+/// the runs in `tx`. The ids travel as one JSON array, so the statement is the
+/// same text for any number of them and stays under the bound-parameter limit.
+async fn delete_steps(tx: &mut sqlx::Transaction<'_, Sqlite>, ids: &[String]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "DELETE FROM operation_outputs
+         WHERE workflow_uuid IN (SELECT value FROM json_each(?))",
+    )
+    .bind(serde_json::to_string(ids)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Append the WHERE clause shared by `list_workflows` (SQLite dialect).
