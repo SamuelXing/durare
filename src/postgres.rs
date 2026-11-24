@@ -363,17 +363,73 @@ impl SystemTables {
         format!("{inputs}, {output}, {error}, {STATUS_COLS}")
     }
 
-    /// The deletes for what hangs off the runs `predicate` selects without a
-    /// foreign key, as data-modifying CTEs: their steps and payload rows.
-    fn delete_dependents(&self, predicate: &str) -> String {
-        format!(
-            "steps AS (DELETE FROM {} WHERE {predicate}),
-             inputs AS (DELETE FROM {} WHERE {predicate}),
-             outputs AS (DELETE FROM {} WHERE {predicate})",
-            self.operation_outputs, self.workflow_input, self.workflow_output
+    /// [`insert_step`] over this schema's tables.
+    fn insert_step(&self, columns: &str, refresh: bool) -> String {
+        insert_step(
+            &self.workflow_status,
+            &self.operation_outputs,
+            columns,
+            refresh,
         )
     }
 }
+
+/// A step insert into `columns` of `operation_outputs` for the run `$1`, which
+/// must still exist in `workflow_status`; the values are `$1` onwards, one per
+/// column. The run's row is locked against deletion until the insert commits,
+/// as the foreign key did before peers dropped it, so a delete either sees the
+/// step or stops it. With `refresh`, an insert that lands also sets the run's
+/// `executor_id` to the parameter after the values. The statement yields NULL
+/// when the run is gone and otherwise whether the insert landed; read it with
+/// [`step_inserted`].
+pub(crate) fn insert_step(
+    workflow_status: &str,
+    operation_outputs: &str,
+    columns: &str,
+    refresh: bool,
+) -> String {
+    let count = columns.split(',').count();
+    let values: Vec<String> = (1..=count).map(|n| format!("${n}")).collect();
+    let refresh = if refresh {
+        format!(
+            ", refresh AS (
+                 UPDATE {workflow_status} SET executor_id = ${executor}
+                 WHERE workflow_uuid = $1 AND EXISTS (SELECT 1 FROM ins)
+                   AND executor_id IS DISTINCT FROM ${executor}
+             )",
+            executor = count + 1
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "WITH run AS (
+             SELECT 1 FROM {workflow_status} WHERE workflow_uuid = $1 FOR KEY SHARE
+         ),
+         ins AS (
+             INSERT INTO {operation_outputs} ({columns})
+             SELECT {values} FROM run
+             ON CONFLICT (workflow_uuid, function_id) DO NOTHING
+             RETURNING 1
+         ){refresh}
+         SELECT CASE WHEN EXISTS (SELECT 1 FROM run)
+                     THEN EXISTS (SELECT 1 FROM ins) END",
+        values = values.join(", "),
+    )
+}
+
+/// Whether an [`insert_step`] statement's insert
+/// landed; `false` means a row already holds the position. A run that no
+/// longer exists is [`Error::NonExistentWorkflow`].
+pub(crate) fn step_inserted(workflow_id: &str, won: Option<bool>) -> Result<bool> {
+    won.ok_or_else(|| Error::nonexistent_workflow(workflow_id))
+}
+
+/// Opens the transaction that deletes runs. Its second statement must see
+/// what committed while the first waited (see
+/// [`delete_dependents`](PostgresProvider::delete_dependents)), which a
+/// server defaulting to a stricter level would not give it.
+const DELETE_BEGIN: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
 
 /// Postgres-backed [`StateProvider`], built on sqlx and the canonical DBOS
 /// schema (`workflow_status` / `operation_outputs`).
@@ -1232,6 +1288,29 @@ fn row_to_status(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Workfl
 }
 
 impl PostgresProvider {
+    /// Delete what hangs off the deleted runs `ids` without a foreign key,
+    /// their steps and payload rows, in the transaction that deleted their
+    /// status rows. Events and streams cascade. The status rows go first and
+    /// in a statement of their own: that delete waits out a step write holding
+    /// a run's row, and this one, taking its snapshot afterwards as a
+    /// `READ COMMITTED` statement does, then sees the step.
+    async fn delete_dependents(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        ids: &[String],
+    ) -> Result<()> {
+        sqlx::query(&format!(
+            "WITH steps AS (DELETE FROM {} WHERE workflow_uuid = ANY($1)),
+                  inputs AS (DELETE FROM {} WHERE workflow_uuid = ANY($1))
+             DELETE FROM {} WHERE workflow_uuid = ANY($1)",
+            self.tables.operation_outputs, self.tables.workflow_input, self.tables.workflow_output
+        ))
+        .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// The outcome already recorded at `(workflow_id, seq)`, read on
     /// `executor`: what a `recv` there serves instead of consuming (a recorded
     /// timeout is `Value::Null`), and how a lost checkpoint is classified. A
@@ -1285,13 +1364,10 @@ impl PostgresProvider {
         output: &str,
         serialization: Option<&str>,
     ) -> Result<bool> {
-        let inserted = sqlx::query(&format!(
-            "INSERT INTO {operation_outputs}
-                 (workflow_uuid, function_id, function_name, output, serialization,
-                  completed_at_epoch_ms)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            operation_outputs = self.tables.operation_outputs
+        let won = sqlx::query_scalar(&self.tables.insert_step(
+            "workflow_uuid, function_id, function_name, output, serialization,
+             completed_at_epoch_ms",
+            false,
         ))
         .bind(workflow_id)
         .bind(seq)
@@ -1299,10 +1375,9 @@ impl PostgresProvider {
         .bind(output)
         .bind(serialization)
         .bind(Utc::now().timestamp_millis())
-        .execute(executor)
-        .await?
-        .rows_affected();
-        Ok(inserted == 1)
+        .fetch_one(executor)
+        .await?;
+        step_inserted(workflow_id, won)
     }
 
     /// [`checkpoint_on`](Self::checkpoint_on) with a null output: the record a
@@ -1769,69 +1844,32 @@ impl StateProvider for PostgresProvider {
             None => (Some(self.serializer.encode(&value)?), None),
         };
         // One round trip covers the whole common case: the checkpoint insert
-        // and — when it wins and an executor is given — the executor refresh,
+        // and, for a caller that names its executor, the executor refresh,
         // since winning the checkpoint proves this executor is the one
         // actually running the workflow. The refresh is gated on the insert
         // through the CTE (a data-modifying CTE's RETURNING is visible to its
         // siblings even though the table change is not), grants no
         // exclusivity, and updates zero rows when the insert lost or the id
         // already matches.
-        let won = match executor_id {
-            Some(executor) => {
-                sqlx::query_scalar::<_, bool>(&format!(
-                    "WITH ins AS (
-                     INSERT INTO {operation_outputs}
-                         (workflow_uuid, function_id, function_name, output, error, serialization,
-                          started_at_epoch_ms, completed_at_epoch_ms)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                     ON CONFLICT (workflow_uuid, function_id) DO NOTHING
-                     RETURNING 1
-                 ),
-                 refresh AS (
-                     UPDATE {workflow_status} SET executor_id = $9
-                     WHERE workflow_uuid = $1 AND EXISTS (SELECT 1 FROM ins)
-                       AND (executor_id IS NULL OR executor_id <> $9)
-                     RETURNING 1
-                 )
-                 SELECT EXISTS (SELECT 1 FROM ins)",
-                    operation_outputs = self.tables.operation_outputs,
-                    workflow_status = self.tables.workflow_status
-                ))
-                .bind(workflow_id)
-                .bind(seq)
-                .bind(name)
-                .bind(&output_col)
-                .bind(&error_col)
-                .bind(self.serializer.name())
-                .bind(started_at_ms)
-                .bind(completed_at_ms)
-                .bind(executor)
-                .fetch_one(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(&format!(
-                    "INSERT INTO {operation_outputs}
-                         (workflow_uuid, function_id, function_name, output, error, serialization,
-                          started_at_epoch_ms, completed_at_epoch_ms)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                     ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-                    operation_outputs = self.tables.operation_outputs
-                ))
-                .bind(workflow_id)
-                .bind(seq)
-                .bind(name)
-                .bind(&output_col)
-                .bind(&error_col)
-                .bind(self.serializer.name())
-                .bind(started_at_ms)
-                .bind(completed_at_ms)
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-                    > 0
-            }
-        };
+        let sql = self.tables.insert_step(
+            "workflow_uuid, function_id, function_name, output, error, serialization,
+             started_at_epoch_ms, completed_at_epoch_ms",
+            executor_id.is_some(),
+        );
+        let mut insert = sqlx::query_scalar(&sql)
+            .bind(workflow_id)
+            .bind(seq)
+            .bind(name)
+            .bind(&output_col)
+            .bind(&error_col)
+            .bind(self.serializer.name())
+            .bind(started_at_ms)
+            .bind(completed_at_ms);
+        if let Some(executor) = executor_id {
+            insert = insert.bind(executor);
+        }
+        let won = insert.fetch_one(&self.pool).await?;
+        let won = step_inserted(workflow_id, won)?;
 
         // Winning means the stored row is exactly this write — no read-back.
         if won {
@@ -1987,12 +2025,11 @@ impl StateProvider for PostgresProvider {
                         // the body's writes and the checkpoint commit atomically.
                         Ok(value) => {
                             let encoded = self.serializer.encode(&value)?;
-                            let won = sqlx::query(&format!("INSERT INTO {operation_outputs}
-                                     (workflow_uuid, function_id, function_name, output, serialization,
-                                      started_at_epoch_ms, completed_at_epoch_ms)
-                                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                                 ON CONFLICT (workflow_uuid, function_id) DO NOTHING", operation_outputs = self.tables.operation_outputs),
-                            )
+                            let won = sqlx::query_scalar(&self.tables.insert_step(
+                                "workflow_uuid, function_id, function_name, output, serialization,
+                                 started_at_epoch_ms, completed_at_epoch_ms",
+                                false,
+                            ))
                             .bind(workflow_id)
                             .bind(seq)
                             .bind(name)
@@ -2000,11 +2037,9 @@ impl StateProvider for PostgresProvider {
                             .bind(self.serializer.name())
                             .bind(started_at_ms)
                             .bind(Utc::now().timestamp_millis())
-                            .execute(&mut *tx)
-                            .await?
-                            .rows_affected()
-                                > 0;
-                            if !won {
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            if !step_inserted(workflow_id, won)? {
                                 // Another execution checkpointed this step while
                                 // this transaction was open. Committing would
                                 // apply the body's writes a second time: roll
@@ -2087,13 +2122,10 @@ impl StateProvider for PostgresProvider {
                 continue;
             }
             let encoded_err = serialize::encode_error(&self.serializer, &body_err)?;
-            let won = sqlx::query(&format!(
-                "INSERT INTO {operation_outputs}
-                     (workflow_uuid, function_id, function_name, error, serialization,
-                      started_at_epoch_ms, completed_at_epoch_ms)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-                operation_outputs = self.tables.operation_outputs
+            let won = sqlx::query_scalar(&self.tables.insert_step(
+                "workflow_uuid, function_id, function_name, error, serialization,
+                 started_at_epoch_ms, completed_at_epoch_ms",
+                false,
             ))
             .bind(workflow_id)
             .bind(seq)
@@ -2102,11 +2134,9 @@ impl StateProvider for PostgresProvider {
             .bind(self.serializer.name())
             .bind(started_at_ms)
             .bind(Utc::now().timestamp_millis())
-            .execute(&self.pool)
-            .await?
-            .rows_affected()
-                > 0;
-            if !won {
+            .fetch_one(&self.pool)
+            .await?;
+            if !step_inserted(workflow_id, won)? {
                 // Another execution recorded this step first — commonly its
                 // success. An identical recorded failure still surfaces
                 // `body_err`; anything else is the rival's outcome, and this
@@ -2758,9 +2788,6 @@ impl StateProvider for PostgresProvider {
         if ids.is_empty() {
             return Ok(());
         }
-        // ON DELETE CASCADE removes each workflow's event / stream rows. Steps
-        // and payload rows are deleted by name in the same statement: neither
-        // has a foreign key in a database a peer has migrated.
         let sql = if delete_children {
             format!(
                 "WITH RECURSIVE targets AS (
@@ -2768,24 +2795,28 @@ impl StateProvider for PostgresProvider {
                      UNION
                      SELECT w.workflow_uuid FROM {workflow_status} w
                        JOIN targets t ON w.parent_workflow_id = t.workflow_uuid
-                 ),
-                 {dependents}
+                 )
                  DELETE FROM {workflow_status}
-                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
-                dependents = self
-                    .tables
-                    .delete_dependents("workflow_uuid IN (SELECT workflow_uuid FROM targets)"),
+                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)
+                 RETURNING workflow_uuid",
                 workflow_status = self.tables.workflow_status
             )
         } else {
             format!(
-                "WITH {dependents}
-                 DELETE FROM {workflow_status} WHERE workflow_uuid = ANY($1)",
-                dependents = self.tables.delete_dependents("workflow_uuid = ANY($1)"),
+                "DELETE FROM {workflow_status} WHERE workflow_uuid = ANY($1)
+                 RETURNING workflow_uuid",
                 workflow_status = self.tables.workflow_status
             )
         };
-        sqlx::query(&sql).bind(ids).execute(&self.pool).await?;
+        let mut tx = self.pool.begin_with(DELETE_BEGIN).await?;
+        let mut gone: Vec<String> = sqlx::query_scalar(&sql)
+            .bind(ids)
+            .fetch_all(&mut *tx)
+            .await?;
+        // The ids asked for go too, so a run already gone leaves nothing.
+        gone.extend_from_slice(ids);
+        self.delete_dependents(&mut tx, &gone).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2811,18 +2842,15 @@ impl StateProvider for PostgresProvider {
         // `completed_at` and a live status must never be collected.
         let mut total = 0u64;
         loop {
-            let res = sqlx::query(&format!(
-                "WITH targets AS (
+            let mut tx = self.pool.begin_with(DELETE_BEGIN).await?;
+            let gone: Vec<String> = sqlx::query_scalar(&format!(
+                "DELETE FROM {workflow_status}
+                 WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM {workflow_status}
                      WHERE completed_at < $1 AND status NOT IN ($2, $3, $4)
                      LIMIT $5
-                 ),
-                 {dependents}
-                 DELETE FROM {workflow_status}
-                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
-                dependents = self
-                    .tables
-                    .delete_dependents("workflow_uuid IN (SELECT workflow_uuid FROM targets)"),
+                 )
+                 RETURNING workflow_uuid",
                 workflow_status = self.tables.workflow_status
             ))
             .bind(cutoff)
@@ -2830,10 +2858,12 @@ impl StateProvider for PostgresProvider {
             .bind(STATUS_ENQUEUED)
             .bind(STATUS_DELAYED)
             .bind(crate::provider::GC_BATCH)
-            .execute(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
-            total += res.rows_affected();
-            if res.rows_affected() < crate::provider::GC_BATCH as u64 {
+            self.delete_dependents(&mut tx, &gone).await?;
+            tx.commit().await?;
+            total += gone.len() as u64;
+            if gone.len() < crate::provider::GC_BATCH as usize {
                 return Ok(total);
             }
         }
@@ -3196,19 +3226,17 @@ impl StateProvider for PostgresProvider {
         name: &str,
         child_id: &str,
     ) -> Result<()> {
-        sqlx::query(&format!(
-            "INSERT INTO {operation_outputs}
-                 (workflow_uuid, function_id, function_name, child_workflow_id)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            operation_outputs = self.tables.operation_outputs
+        let won = sqlx::query_scalar(&self.tables.insert_step(
+            "workflow_uuid, function_id, function_name, child_workflow_id",
+            false,
         ))
         .bind(parent_id)
         .bind(seq)
         .bind(name)
         .bind(child_id)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
+        step_inserted(parent_id, won)?;
         Ok(())
     }
 
@@ -3279,17 +3307,17 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()> {
-        sqlx::query(&format!(
-            "INSERT INTO {operation_outputs} (workflow_uuid, function_id, function_name)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            operation_outputs = self.tables.operation_outputs
-        ))
+        let won = sqlx::query_scalar(
+            &self
+                .tables
+                .insert_step("workflow_uuid, function_id, function_name", false),
+        )
         .bind(workflow_id)
         .bind(seq)
         .bind(name)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
+        step_inserted(workflow_id, won)?;
         Ok(())
     }
 

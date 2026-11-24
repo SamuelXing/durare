@@ -197,6 +197,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   peers read. Migration 108 adds the per-partition queue limit columns, unused
   so far (#274).
 
+- A step is no longer recorded for a run that has been deleted. The foreign
+  key from `operation_outputs` to `workflow_status` used to refuse it, and the
+  reference SDKs drop that key in shared migration 112: in such a database a
+  worker still executing a deleted run kept writing its steps, and a later run
+  of the same id replayed them. Every step write now takes the run's row and
+  fails with `Error::NonExistentWorkflow` when it is gone, on Postgres, SQLite
+  and the in-memory backend, whether or not the key exists, and that includes
+  the checkpoint of a transaction on the system data source, whose writes roll
+  back with it. The execution stops there with `Error::RecoveryRequired`, as
+  it did on the foreign key violation, even if the workflow body ignores the
+  error. `delete_workflows` and `garbage_collect` delete the status rows
+  first, so a delete racing a step write waits for it and removes its step,
+  and `delete_workflows` also clears steps left behind for an id whose run is
+  already gone (#279).
+
 - `delete_workflows` and `garbage_collect` delete a run's steps themselves on
   Postgres and SQLite. They used to rely on the foreign key from
   `operation_outputs` to `workflow_status`, which the reference SDKs drop in

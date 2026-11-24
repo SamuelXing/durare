@@ -67,9 +67,14 @@ impl Execution {
     /// Classify only a provider/storage result, never a user body result.
     /// Providers also return semantic rejections (missing destination, closed
     /// stream, unsupported operation); those remain ordinary catchable errors.
+    /// The exception is this execution's own run being gone: nothing it does
+    /// can be recorded any more, so it stops instead of running on.
     pub(crate) fn record(&self, error: Error) -> Error {
         match provider_error(error) {
             interruption @ Error::RecoveryRequired(_) => self.interrupt(interruption),
+            Error::NonExistentWorkflow(id) if id == self.0.workflow_id => {
+                self.interrupt(Error::NonExistentWorkflow(id))
+            }
             rejection => rejection,
         }
     }

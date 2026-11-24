@@ -217,7 +217,9 @@ These five each have a foreign key back to `workflow_status` and are deleted
 with it (`ON DELETE CASCADE`). That's why deleting a workflow cleans up all of
 its history in one statement. `operation_outputs` is the exception in a
 database another SDK has taken to shared migration 112, which drops its
-foreign key; durare deletes a run's steps by name, so it does not depend on it.
+foreign key; durare does not depend on it. It deletes a run's steps by name,
+and every step write checks that the run's row still exists, holding it
+against deletion until the step commits, so a deleted run gains no steps.
 
 Two more tables carry no foreign key at all: `workflow_input` and
 `workflow_output` (migration 109), keyed by `workflow_uuid`. The reference SDKs

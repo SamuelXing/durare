@@ -60,6 +60,17 @@ struct Inner {
     queues: HashMap<String, WorkflowQueue>,
 }
 
+impl Inner {
+    /// A step is recorded only for a run that still exists.
+    fn require_run(&self, workflow_id: &str) -> Result<()> {
+        if self.workflows.contains_key(workflow_id) {
+            Ok(())
+        } else {
+            Err(Error::nonexistent_workflow(workflow_id))
+        }
+    }
+}
+
 /// In-memory [`StateProvider`] for tests and quick starts (no database needed).
 ///
 /// State lives only in this process, so it demonstrates step idempotency and
@@ -252,6 +263,7 @@ impl StateProvider for InMemoryProvider {
             Some(e) => (None, Some(e.to_string())),
             None => (Some(value), None),
         };
+        g.require_run(workflow_id)?;
         let key = (workflow_id.to_string(), seq);
         if let Some(row) = g.steps.get(&key) {
             // Someone else's row is already at this position. Identical content
@@ -441,9 +453,7 @@ impl StateProvider for InMemoryProvider {
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
         // Mirror the SQL backends' FK on destination_uuid → workflow_status.
-        if !g.workflows.contains_key(destination_id) {
-            return Err(Error::nonexistent_workflow(destination_id));
-        }
+        g.require_run(destination_id)?;
         // A keyed send derives its primary key so a retry is a no-op
         // (at-most-once); an unkeyed send gets a fresh id every time.
         let message_uuid = match idempotency_key {
@@ -1203,6 +1213,7 @@ impl StateProvider for InMemoryProvider {
         child_id: &str,
     ) -> Result<()> {
         let mut g = self.inner.lock().await;
+        g.require_run(parent_id)?;
         g.steps
             .entry((parent_id.to_string(), seq))
             .or_insert_with(|| StepRow {
@@ -1283,6 +1294,7 @@ impl StateProvider for InMemoryProvider {
 
     async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()> {
         let mut g = self.inner.lock().await;
+        g.require_run(workflow_id)?;
         g.steps
             .entry((workflow_id.to_string(), seq))
             .or_insert_with(|| StepRow {
@@ -1861,13 +1873,15 @@ fn step_row_outcome(r: &StepRow) -> StepOutcome {
 }
 
 /// The step already recorded at `(workflow_id, seq)`, if any; a different
-/// name there is a divergent replay.
+/// name there is a divergent replay. Every write that checkpoints itself
+/// asks this first, so this is also where a run that is gone refuses it.
 fn recorded_at<'g>(
     g: &'g Inner,
     workflow_id: &str,
     seq: i32,
     step_name: &str,
 ) -> Result<Option<&'g StepRow>> {
+    g.require_run(workflow_id)?;
     let Some(recorded) = g.steps.get(&(workflow_id.to_string(), seq)) else {
         return Ok(None);
     };

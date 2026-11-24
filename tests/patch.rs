@@ -3,6 +3,7 @@
 
 use durare::{
     DurableContext, DurableEngine, InMemoryProvider, Result, StateProvider, WorkflowOptions,
+    WorkflowStatus, STATUS_PENDING,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -32,25 +33,32 @@ async fn patch_new_workflow_takes_new_path() -> Result<()> {
 }
 
 /// A workflow that already executed past this point before the patch existed
-/// (a different step occupies the slot) takes the old path.
+/// (a different step occupies the slot) takes the old path when it resumes.
 #[tokio::test]
 async fn patch_pre_patch_workflow_takes_old_path() -> Result<()> {
     let provider = Arc::new(InMemoryProvider::new());
-    // Seed a non-patch step at seq 0, as if the pre-patch code had run it there.
-    provider
-        .record_step_result("old", 0, "legacy_step", Value::from(1), None, None, None)
-        .await?;
-
-    let mut engine = DurableEngine::new(provider).await?;
+    let mut engine = DurableEngine::new(provider.clone()).await?;
     engine.register("wf", |ctx: DurableContext, _: ()| async move {
         ctx.patch("feature").await
     });
 
-    let patched: bool = engine
-        .start::<_, bool>("wf", (), WorkflowOptions::with_id("old"))
-        .await?
-        .result()
+    // An interrupted run of the pre-patch code, with a non-patch step at seq 0.
+    provider
+        .insert_workflow_status(WorkflowStatus::new(
+            "old",
+            "wf",
+            Value::Null,
+            STATUS_PENDING,
+            "stopped",
+            engine.app_version(),
+        ))
         .await?;
+    provider
+        .record_step_result("old", 0, "legacy_step", Value::from(1), None, None, None)
+        .await?;
+
+    assert_eq!(engine.recover().await?, 1);
+    let patched: bool = engine.retrieve_workflow("old").await?.result().await?;
     assert!(
         !patched,
         "a workflow past this point pre-patch uses the old code"

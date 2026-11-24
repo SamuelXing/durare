@@ -185,6 +185,8 @@ pub struct PgDataSource {
     /// Where the fast path writes its checkpoint: schema-qualified when the
     /// minting provider's schema is known, immune to `search_path` changes.
     checkpoint_table: String,
+    /// The table of the runs those checkpoints belong to, named the same way.
+    status_table: String,
 }
 
 #[cfg(feature = "postgres")]
@@ -230,6 +232,7 @@ impl PgDataSource {
             table,
             kind: DataSourceKind::External,
             checkpoint_table: "operation_outputs".to_string(),
+            status_table: "workflow_status".to_string(),
         })
     }
 
@@ -247,15 +250,18 @@ impl PgDataSource {
     ) -> Self {
         // Unquoted on purpose: the provider's `CREATE SCHEMA` and `search_path`
         // see the name unquoted, so quoting here would case-fold differently.
-        let checkpoint_table = if schema.is_empty() {
-            "operation_outputs".to_string()
-        } else {
-            format!("{schema}.operation_outputs")
+        let qualified = |table: &str| {
+            if schema.is_empty() {
+                table.to_string()
+            } else {
+                format!("{schema}.{table}")
+            }
         };
         Self {
             pool,
             table: "transaction_completion".to_string(),
-            checkpoint_table,
+            checkpoint_table: qualified("operation_outputs"),
+            status_table: qualified("workflow_status"),
             kind: DataSourceKind::System(identity),
         }
     }
@@ -392,12 +398,12 @@ impl sealed::Backend for PgDataSource {
     ) -> Result<bool> {
         // Fully qualified (when the minting provider's schema is known), so
         // nothing the body does to `search_path` can redirect the checkpoint.
-        let res = sqlx::query(&format!(
-            "INSERT INTO {} (workflow_uuid, function_id, function_name, output, serialization,
-                             started_at_epoch_ms, completed_at_epoch_ms)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            self.checkpoint_table
+        let won = sqlx::query_scalar(&crate::postgres::insert_step(
+            &self.status_table,
+            &self.checkpoint_table,
+            "workflow_uuid, function_id, function_name, output, serialization,
+             started_at_epoch_ms, completed_at_epoch_ms",
+            false,
         ))
         .bind(workflow_id)
         .bind(step_id)
@@ -406,9 +412,9 @@ impl sealed::Backend for PgDataSource {
         .bind(serialization)
         .bind(started_at_ms)
         .bind(chrono::Utc::now().timestamp_millis())
-        .execute(conn)
+        .fetch_one(conn)
         .await?;
-        Ok(res.rows_affected() == 1)
+        crate::postgres::step_inserted(workflow_id, won)
     }
 }
 
@@ -586,13 +592,10 @@ impl sealed::Backend for SqliteDataSource {
         serialization: &str,
         started_at_ms: i64,
     ) -> Result<bool> {
-        let res = sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization,
-                  started_at_epoch_ms, completed_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
+        let rows = sqlx::query(&crate::sqlite::insert_step(
+            "workflow_uuid, function_id, function_name, output, serialization,
+             started_at_epoch_ms, completed_at_epoch_ms",
+        ))
         .bind(workflow_id)
         .bind(step_id)
         .bind(name)
@@ -600,8 +603,9 @@ impl sealed::Backend for SqliteDataSource {
         .bind(serialization)
         .bind(started_at_ms)
         .bind(chrono::Utc::now().timestamp_millis())
-        .execute(conn)
-        .await?;
-        Ok(res.rows_affected() == 1)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        crate::sqlite::step_inserted(conn, workflow_id, rows).await
     }
 }

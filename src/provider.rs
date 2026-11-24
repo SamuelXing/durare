@@ -1770,6 +1770,16 @@ pub trait StateProvider: Send + Sync {
     /// (stored in the `error` column, output left null). A step records exactly
     /// one of the two.
     ///
+    /// A step belongs to a run: when `workflow_id` has no status row, because
+    /// the run was deleted, nothing is written and the call fails with
+    /// [`Error::NonExistentWorkflow`](crate::Error::NonExistentWorkflow). This
+    /// holds for every method that writes a step row, and an implementation
+    /// must enforce it itself: the system schema's foreign key is absent from
+    /// a database another SDK has migrated. A method that pairs a step with
+    /// another write (a send, an event, a stream entry) must refuse both; the
+    /// default bodies of those methods write the other row first and so leave
+    /// it behind, which is one reason to override them.
+    ///
     /// Returns the **canonical** stored outcome. If a row is already recorded
     /// at this position, what happens depends on how it compares to this write:
     ///
@@ -2118,8 +2128,10 @@ pub trait StateProvider: Send + Sync {
 
     /// Delete workflows and their step / event / stream rows, regardless of
     /// state. When `delete_children`, every descendant by
-    /// `parent_workflow_id` (transitively) is deleted too. Missing ids are
-    /// skipped. An empty slice is a no-op.
+    /// `parent_workflow_id` (transitively) is deleted too. A missing id has no
+    /// run to delete, and any steps left behind under it are removed. An empty
+    /// slice is a no-op. A step write in flight for a deleted run is waited
+    /// for and deleted with it.
     async fn delete_workflows(&self, ids: &[String], delete_children: bool) -> Result<()>;
 
     /// The `completed_at` (epoch ms) of the `threshold`-th newest **completed**
