@@ -25,13 +25,47 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
-     application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
-     parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
-     started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
-     authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
-     serialization, created_at, updated_at, attributes, schedule_name, \
-     debounce_deadline_epoch_ms, is_debounced";
+/// A run's payload column: the row in the payload table `$table` when there
+/// is one (the reference SDKs write there since shared migration 109), and
+/// the `workflow_status` column otherwise.
+/// The `workflow_status` columns [`row_to_status`] reads besides the three
+/// payload columns.
+macro_rules! status_cols {
+    () => {
+        "workflow_uuid, name, status, executor_id, \
+         application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
+         parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
+         started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
+         authenticated_user, assumed_role, authenticated_roles, class_name, config_name, \
+         serialization, created_at, updated_at, attributes, schedule_name, \
+         debounce_deadline_epoch_ms, is_debounced"
+    };
+}
+
+macro_rules! payload_col {
+    ($table:literal, $col:literal) => {
+        concat!(
+            "COALESCE((SELECT p.",
+            $col,
+            " FROM ",
+            $table,
+            " p WHERE p.workflow_uuid = workflow_status.workflow_uuid), workflow_status.",
+            $col,
+            ") AS ",
+            $col
+        )
+    };
+}
+
+const SELECT_COLS: &str = concat!(
+    payload_col!("workflow_input", "inputs"),
+    ", ",
+    payload_col!("workflow_output", "output"),
+    ", ",
+    payload_col!("workflow_output", "error"),
+    ", ",
+    status_cols!()
+);
 
 /// SQLite-backed [`StateProvider`].
 ///
@@ -942,6 +976,11 @@ impl StateProvider for SqliteProvider {
         };
         // Reaching a terminal state frees the queue-scoped deduplication slot so
         // the same deduplication id can be enqueued again.
+        //
+        // An outcome recorded here lives in the status columns. A payload row
+        // an earlier execution by a peer left for the run would be read in
+        // its place, so it goes in the same transaction.
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(&format!(
             "UPDATE workflow_status
              SET status = ?,
@@ -953,15 +992,23 @@ impl StateProvider for SqliteProvider {
              WHERE workflow_uuid = ?{guard}",
         ))
         .bind(status)
-        .bind(output_str)
+        .bind(&output_str)
         .bind(error)
         .bind(completed)
         .bind(terminal)
         .bind(now)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        let updated = res.rows_affected() > 0;
+        if updated && (output_str.is_some() || error.is_some()) {
+            sqlx::query("DELETE FROM workflow_output WHERE workflow_uuid = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
     }
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
@@ -1936,8 +1983,8 @@ impl StateProvider for SqliteProvider {
             return Ok(());
         }
         // ON DELETE CASCADE removes each workflow's event / stream rows. Steps
-        // are deleted by name in the same transaction: a peer past shared
-        // migration 112 has dropped their foreign key.
+        // and payload rows are deleted by name in the same transaction: neither
+        // has a foreign key in a database a peer has migrated.
         let mut qb: QueryBuilder<Sqlite> = if delete_children {
             let mut qb = QueryBuilder::new(
                 "WITH RECURSIVE targets AS (
@@ -1963,7 +2010,7 @@ impl StateProvider for SqliteProvider {
         qb.push(" RETURNING workflow_uuid");
         let mut tx = self.pool.begin().await?;
         let deleted: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
-        delete_steps(&mut tx, &deleted).await?;
+        delete_dependents(&mut tx, &deleted).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1981,9 +2028,9 @@ impl StateProvider for SqliteProvider {
         // The canonical DBOS GC delete: rows that *finished* before the cutoff
         // go; in-flight work survives regardless of age, because it has no
         // `completed_at` for the bound to select. Events and streams cascade;
-        // steps go by name, as in `delete_workflows`. Batched so a large
-        // backlog is many short write transactions — under WAL, long writes
-        // starve every other writer in the process.
+        // steps and payload rows go by name, as in `delete_workflows`. Batched
+        // so a large backlog is many short write transactions — under WAL,
+        // long writes starve every other writer in the process.
         //
         // The status list is redundant given the `completed_at` bound and kept
         // as a second line of defence: a stray row with both a terminal-looking
@@ -2006,7 +2053,7 @@ impl StateProvider for SqliteProvider {
             .bind(crate::provider::GC_BATCH)
             .fetch_all(&mut *tx)
             .await?;
-            delete_steps(&mut tx, &deleted).await?;
+            delete_dependents(&mut tx, &deleted).await?;
             tx.commit().await?;
             total += deleted.len() as u64;
             if deleted.len() < crate::provider::GC_BATCH as usize {
@@ -2035,9 +2082,13 @@ impl StateProvider for SqliteProvider {
     ) -> Result<DebounceOutcome> {
         let inputs = serialize::encode_input(&self.serializer, req.input)?;
         // The deadline caps the push-back: CASE rather than min() so the
-        // statement reads the same on both dialects. One statement, no
-        // transaction: a miss is re-read by the holder lookup, and the caller
-        // bounces again on anything that moved in between.
+        // statement reads the same on both dialects. A miss is re-read by the
+        // holder lookup, and the caller bounces again on anything that moved
+        // in between.
+        //
+        // The new input also replaces the payload row of a run a peer created,
+        // which every reader would otherwise take over the column.
+        let mut tx = self.pool.begin().await?;
         let bounced: Option<String> = sqlx::query_scalar(
             "UPDATE workflow_status
              SET delay_until_epoch_ms = CASE
@@ -2051,7 +2102,7 @@ impl StateProvider for SqliteProvider {
              RETURNING workflow_uuid",
         )
         .bind(req.delay_until_ms)
-        .bind(inputs)
+        .bind(&inputs)
         .bind(self.serializer.name())
         .bind(Utc::now().timestamp_millis())
         .bind(req.workflow_name)
@@ -2060,11 +2111,18 @@ impl StateProvider for SqliteProvider {
         .bind(STATUS_DELAYED)
         .bind(req.class_name)
         .bind(req.config_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if let Some(id) = bounced {
+            sqlx::query("UPDATE workflow_input SET inputs = ? WHERE workflow_uuid = ?")
+                .bind(&inputs)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             return Ok(DebounceOutcome::Bounced(id));
         }
+        drop(tx);
         // The partial unique index admits at most one holder.
         let holder = sqlx::query_as(
             "SELECT name, is_debounced, class_name, config_name FROM workflow_status
@@ -2136,19 +2194,21 @@ impl StateProvider for SqliteProvider {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now().timestamp_millis();
 
-        let inserted = sqlx::query(
+        let inserted = sqlx::query(concat!(
             "INSERT INTO workflow_status
                  (workflow_uuid, status, name, inputs, serialization, executor_id,
                   application_version, application_id, forked_from, recovery_attempts,
                   authenticated_user, assumed_role, authenticated_roles,
                   class_name, config_name, queue_name, queue_partition_key,
                   attributes, created_at, updated_at, workflow_timeout_ms)
-             SELECT ?, ?, name, inputs, serialization, '',
+             SELECT ?, ?, name, ",
+            payload_col!("workflow_input", "inputs"),
+            ", serialization, '',
                     COALESCE(?, application_version), application_id, ?, 0,
                     authenticated_user, assumed_role, authenticated_roles,
                     class_name, config_name, ?, ?, attributes, ?, ?, ?
              FROM workflow_status WHERE workflow_uuid = ?",
-        )
+        ))
         .bind(new_id)
         .bind(STATUS_ENQUEUED)
         // Same normalization as `WorkflowStatus::app_version_opt`: an explicitly
@@ -2812,7 +2872,21 @@ impl StateProvider for SqliteProvider {
             let Some(status_row) = status_row else {
                 return Err(Error::nonexistent_workflow(id));
             };
-            let workflow_status = export_status_map(&status_row);
+            let mut workflow_status = export_status_map(&status_row);
+            // The payload tables win over the status columns, as on every read.
+            let payload = sqlx::query(
+                "SELECT (SELECT inputs FROM workflow_input WHERE workflow_uuid = ?1) AS inputs,
+                        (SELECT output FROM workflow_output WHERE workflow_uuid = ?1) AS output,
+                        (SELECT error FROM workflow_output WHERE workflow_uuid = ?1) AS error",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            for col in ["inputs", "output", "error"] {
+                if let Some(v) = payload.get::<Option<String>, _>(col) {
+                    workflow_status.insert(col.to_owned(), json!(v));
+                }
+            }
 
             let op_rows = sqlx::query(
                 "SELECT * FROM operation_outputs WHERE workflow_uuid = ? ORDER BY function_id ASC",
@@ -3199,20 +3273,23 @@ fn row_to_step(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Result
     })
 }
 
-/// Deletes the steps of the runs `ids` names, for a caller that has deleted
-/// the runs in `tx`. The ids travel as one JSON array, so the statement is the
-/// same text for any number of them and stays under the bound-parameter limit.
-async fn delete_steps(tx: &mut sqlx::Transaction<'_, Sqlite>, ids: &[String]) -> Result<()> {
+/// Deletes what hangs off the runs `ids` names without a foreign key, for a
+/// caller that has deleted the runs in `tx`: their steps and their payload
+/// rows. The ids travel as one JSON array, so each statement is the same text
+/// for any number of them and stays under the bound-parameter limit.
+async fn delete_dependents(tx: &mut sqlx::Transaction<'_, Sqlite>, ids: &[String]) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    sqlx::query(
-        "DELETE FROM operation_outputs
-         WHERE workflow_uuid IN (SELECT value FROM json_each(?))",
-    )
-    .bind(serde_json::to_string(ids)?)
-    .execute(&mut **tx)
-    .await?;
+    let ids = serde_json::to_string(ids)?;
+    for table in ["operation_outputs", "workflow_input", "workflow_output"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE workflow_uuid IN (SELECT value FROM json_each(?))"
+        ))
+        .bind(&ids)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -3467,20 +3544,31 @@ fn row_to_step_aggregate(
     }
 }
 
-/// The column list for `list_workflows`, substituting `NULL` for `inputs` /
-/// `output` the caller opted out of loading, so those payloads are never read.
+/// The column list for `list_workflows`, with `NULL` for a payload the
+/// caller opted out of loading, so it is never read.
 fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
     if filter.load_input && filter.load_output {
         return std::borrow::Cow::Borrowed(SELECT_COLS);
     }
-    let mut cols = SELECT_COLS.to_string();
-    if !filter.load_input {
-        cols = cols.replacen("inputs,", "NULL AS inputs,", 1);
-    }
-    if !filter.load_output {
-        cols = cols.replacen("output,", "NULL AS output,", 1);
-    }
-    std::borrow::Cow::Owned(cols)
+    let inputs = if filter.load_input {
+        payload_col!("workflow_input", "inputs")
+    } else {
+        "NULL AS inputs"
+    };
+    let output = if filter.load_output {
+        payload_col!("workflow_output", "output")
+    } else {
+        "NULL AS output"
+    };
+    std::borrow::Cow::Owned(format!(
+        concat!(
+            "{}, {}, ",
+            payload_col!("workflow_output", "error"),
+            ", ",
+            status_cols!()
+        ),
+        inputs, output
+    ))
 }
 
 #[cfg(test)]

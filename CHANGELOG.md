@@ -187,6 +187,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Runs written by a current reference SDK read correctly. Since shared
+  migration 109 those SDKs store a run's input and outcome in the
+  `workflow_input` and `workflow_output` tables, and durare read only the
+  `workflow_status` columns: a durare worker claiming a run a peer had enqueued
+  ran it with no input, and a peer's result read as absent. Migration 109
+  adds the tables, every read prefers the row there, and deleting, collecting,
+  exporting and forking a run cover it. durare still writes the columns, which
+  peers read. Migration 108 adds the per-partition queue limit columns, unused
+  so far (#274).
+
 - `delete_workflows` and `garbage_collect` delete a run's steps themselves on
   Postgres and SQLite. They used to rely on the foreign key from
   `operation_outputs` to `workflow_status`, which the reference SDKs drop in

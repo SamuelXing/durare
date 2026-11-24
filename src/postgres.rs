@@ -28,9 +28,10 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-/// Columns selected when materializing a [`WorkflowStatus`] from `workflow_status`.
+/// Columns selected when materializing a [`WorkflowStatus`] from `workflow_status`,
+/// after the three payload columns [`SystemTables::status_cols`] puts first.
 /// `serialization` drives how `inputs`/`output` are decoded (see [`crate::Serializer`]).
-const SELECT_COLS: &str = "workflow_uuid, name, inputs, output, status, error, executor_id, \
+const STATUS_COLS: &str = "workflow_uuid, name, status, executor_id, \
      application_version, queue_name, queue_partition_key, priority, deduplication_id, recovery_attempts, \
      parent_workflow_id, workflow_timeout_ms, workflow_deadline_epoch_ms, \
      started_at_epoch_ms, rate_limited, delay_until_epoch_ms, completed_at, forked_from, \
@@ -290,6 +291,10 @@ pub(crate) fn is_reserved_sql_keyword(s: &str) -> bool {
 struct SystemTables {
     workflow_status: String,
     operation_outputs: String,
+    /// Run inputs, where the reference SDKs write them since shared migration 109.
+    workflow_input: String,
+    /// Run outcomes, likewise.
+    workflow_output: String,
     notifications: String,
     workflow_events: String,
     workflow_events_history: String,
@@ -315,6 +320,8 @@ impl SystemTables {
         Self {
             workflow_status: name("workflow_status"),
             operation_outputs: name("operation_outputs"),
+            workflow_input: name("workflow_input"),
+            workflow_output: name("workflow_output"),
             notifications: name("notifications"),
             workflow_events: name("workflow_events"),
             workflow_events_history: name("workflow_events_history"),
@@ -325,6 +332,46 @@ impl SystemTables {
             dbos_migrations: name(crate::migrate::LEDGER),
             sqlx_migrations: name(crate::migrate::LEGACY_LEDGER),
         }
+    }
+
+    /// A run's payload column: the row in the payload table when there is
+    /// one, and the `workflow_status` column otherwise.
+    fn payload_col(&self, table: &str, col: &str) -> String {
+        format!(
+            "COALESCE((SELECT p.{col} FROM {table} p WHERE p.workflow_uuid = {ws}.workflow_uuid), \
+             {ws}.{col}) AS {col}",
+            ws = self.workflow_status
+        )
+    }
+
+    /// The columns [`row_to_status`] reads, for a statement whose target is
+    /// `workflow_status` under its own name. A payload the caller does not
+    /// want is selected as `NULL`, so it is never read.
+    fn status_cols(&self, load_input: bool, load_output: bool) -> String {
+        let null = |col: &str| format!("NULL AS {col}");
+        let inputs = if load_input {
+            self.payload_col(&self.workflow_input, "inputs")
+        } else {
+            null("inputs")
+        };
+        let output = if load_output {
+            self.payload_col(&self.workflow_output, "output")
+        } else {
+            null("output")
+        };
+        let error = self.payload_col(&self.workflow_output, "error");
+        format!("{inputs}, {output}, {error}, {STATUS_COLS}")
+    }
+
+    /// The deletes for what hangs off the runs `predicate` selects without a
+    /// foreign key, as data-modifying CTEs: their steps and payload rows.
+    fn delete_dependents(&self, predicate: &str) -> String {
+        format!(
+            "steps AS (DELETE FROM {} WHERE {predicate}),
+             inputs AS (DELETE FROM {} WHERE {predicate}),
+             outputs AS (DELETE FROM {} WHERE {predicate})",
+            self.operation_outputs, self.workflow_input, self.workflow_output
+        )
     }
 }
 
@@ -422,7 +469,8 @@ impl PostgresProvider {
             == 1;
 
         let row = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
+            "SELECT {cols} FROM {workflow_status} WHERE workflow_uuid = $1",
+            cols = self.tables.status_cols(true, true),
             workflow_status = self.tables.workflow_status
         ))
         .bind(&s.id)
@@ -1578,7 +1626,8 @@ impl StateProvider for PostgresProvider {
 
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
         let row = sqlx::query(&format!(
-            "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
+            "SELECT {cols} FROM {workflow_status} WHERE workflow_uuid = $1",
+            cols = self.tables.status_cols(true, true),
             workflow_status = self.tables.workflow_status
         ))
         .bind(id)
@@ -1615,15 +1664,29 @@ impl StateProvider for PostgresProvider {
         };
         // Reaching a terminal state frees the queue-scoped deduplication slot so
         // the same deduplication id can be enqueued again.
-        let res = sqlx::query(&format!(
-            "UPDATE {workflow_status}
-             SET status = $2,
-                 output = COALESCE($3, output),
-                 error  = COALESCE($4, error),
-                 completed_at = COALESCE($5, completed_at),
-                 deduplication_id = CASE WHEN $7 THEN NULL ELSE deduplication_id END,
-                 updated_at = $6
-             WHERE workflow_uuid = $1{guard}",
+        //
+        // An outcome recorded here lives in the status columns. A payload row
+        // an earlier execution by a peer left for the run would be read in
+        // its place, so it goes in the same statement.
+        let updated: i64 = sqlx::query_scalar(&format!(
+            "WITH updated AS (
+                 UPDATE {workflow_status}
+                 SET status = $2,
+                     output = COALESCE($3, output),
+                     error  = COALESCE($4, error),
+                     completed_at = COALESCE($5, completed_at),
+                     deduplication_id = CASE WHEN $7 THEN NULL ELSE deduplication_id END,
+                     updated_at = $6
+                 WHERE workflow_uuid = $1{guard}
+                 RETURNING workflow_uuid
+             ),
+             superseded AS (
+                 DELETE FROM {workflow_output}
+                 WHERE ($3::text IS NOT NULL OR $4::text IS NOT NULL)
+                   AND workflow_uuid IN (SELECT workflow_uuid FROM updated)
+             )
+             SELECT count(*) FROM updated",
+            workflow_output = self.tables.workflow_output,
             workflow_status = self.tables.workflow_status
         ))
         .bind(id)
@@ -1633,9 +1696,9 @@ impl StateProvider for PostgresProvider {
         .bind(completed)
         .bind(now)
         .bind(terminal)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(res.rows_affected() > 0)
+        Ok(updated > 0)
     }
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
@@ -2200,7 +2263,8 @@ impl StateProvider for PostgresProvider {
                      ELSE workflow_deadline_epoch_ms
                  END
              WHERE workflow_uuid = ANY($6) AND status = $7
-             RETURNING {SELECT_COLS}",
+             RETURNING {cols}",
+            cols = self.tables.status_cols(true, true),
             workflow_status = self.tables.workflow_status
         ))
         .bind(STATUS_PENDING)
@@ -2425,7 +2489,9 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn list_workflows(&self, filter: &ListFilter) -> Result<Vec<WorkflowStatus>> {
-        let cols = list_select_cols(filter);
+        let cols = self
+            .tables
+            .status_cols(filter.load_input, filter.load_output);
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
             "SELECT {cols} FROM {workflow_status}",
             workflow_status = self.tables.workflow_status
@@ -2693,8 +2759,8 @@ impl StateProvider for PostgresProvider {
             return Ok(());
         }
         // ON DELETE CASCADE removes each workflow's event / stream rows. Steps
-        // are deleted by name in the same statement: a peer past shared
-        // migration 112 has dropped their foreign key.
+        // and payload rows are deleted by name in the same statement: neither
+        // has a foreign key in a database a peer has migrated.
         let sql = if delete_children {
             format!(
                 "WITH RECURSIVE targets AS (
@@ -2703,22 +2769,19 @@ impl StateProvider for PostgresProvider {
                      SELECT w.workflow_uuid FROM {workflow_status} w
                        JOIN targets t ON w.parent_workflow_id = t.workflow_uuid
                  ),
-                 steps AS (
-                     DELETE FROM {operation_outputs}
-                     WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)
-                 )
+                 {dependents}
                  DELETE FROM {workflow_status}
                  WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
-                operation_outputs = self.tables.operation_outputs,
+                dependents = self
+                    .tables
+                    .delete_dependents("workflow_uuid IN (SELECT workflow_uuid FROM targets)"),
                 workflow_status = self.tables.workflow_status
             )
         } else {
             format!(
-                "WITH steps AS (
-                     DELETE FROM {operation_outputs} WHERE workflow_uuid = ANY($1)
-                 )
+                "WITH {dependents}
                  DELETE FROM {workflow_status} WHERE workflow_uuid = ANY($1)",
-                operation_outputs = self.tables.operation_outputs,
+                dependents = self.tables.delete_dependents("workflow_uuid = ANY($1)"),
                 workflow_status = self.tables.workflow_status
             )
         };
@@ -2739,9 +2802,9 @@ impl StateProvider for PostgresProvider {
         // The canonical DBOS GC delete: rows that *finished* before the cutoff
         // go; in-flight work survives regardless of age, because it has no
         // `completed_at` for the bound to select. Events and streams cascade;
-        // steps go by name, as in `delete_workflows`. Batched so a large
-        // backlog is many short transactions, not one long delete pinning the
-        // MVCC horizon of the hottest table.
+        // steps and payload rows go by name, as in `delete_workflows`. Batched
+        // so a large backlog is many short transactions, not one long delete
+        // pinning the MVCC horizon of the hottest table.
         //
         // The status list is redundant given the `completed_at` bound and kept
         // as a second line of defence: a stray row with both a terminal-looking
@@ -2754,13 +2817,12 @@ impl StateProvider for PostgresProvider {
                      WHERE completed_at < $1 AND status NOT IN ($2, $3, $4)
                      LIMIT $5
                  ),
-                 steps AS (
-                     DELETE FROM {operation_outputs}
-                     WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)
-                 )
+                 {dependents}
                  DELETE FROM {workflow_status}
                  WHERE workflow_uuid IN (SELECT workflow_uuid FROM targets)",
-                operation_outputs = self.tables.operation_outputs,
+                dependents = self
+                    .tables
+                    .delete_dependents("workflow_uuid IN (SELECT workflow_uuid FROM targets)"),
                 workflow_status = self.tables.workflow_status
             ))
             .bind(cutoff)
@@ -2803,17 +2865,28 @@ impl StateProvider for PostgresProvider {
         // statement reads the same on both dialects. One statement, no
         // transaction: a miss is re-read by the holder lookup, and the caller
         // bounces again on anything that moved in between.
+        //
+        // The new input also replaces the payload row of a run a peer created,
+        // which every reader would otherwise take over the column.
         let bounced: Option<String> = sqlx::query_scalar(&format!(
-            "UPDATE {workflow_status}
-             SET delay_until_epoch_ms = CASE
-                   WHEN debounce_deadline_epoch_ms IS NOT NULL AND debounce_deadline_epoch_ms < $1
-                   THEN debounce_deadline_epoch_ms ELSE $1 END,
-                 inputs = $2, serialization = $3, updated_at = $4
-             WHERE name = $5 AND queue_name = $6 AND deduplication_id = $7
-               AND status = $8 AND is_debounced = TRUE
-               AND COALESCE(class_name, '') = COALESCE($9, '')
-               AND COALESCE(config_name, '') = COALESCE($10, '')
-             RETURNING workflow_uuid",
+            "WITH bounced AS (
+                 UPDATE {workflow_status}
+                 SET delay_until_epoch_ms = CASE
+                       WHEN debounce_deadline_epoch_ms IS NOT NULL AND debounce_deadline_epoch_ms < $1
+                       THEN debounce_deadline_epoch_ms ELSE $1 END,
+                     inputs = $2, serialization = $3, updated_at = $4
+                 WHERE name = $5 AND queue_name = $6 AND deduplication_id = $7
+                   AND status = $8 AND is_debounced = TRUE
+                   AND COALESCE(class_name, '') = COALESCE($9, '')
+                   AND COALESCE(config_name, '') = COALESCE($10, '')
+                 RETURNING workflow_uuid
+             ),
+             payload AS (
+                 UPDATE {workflow_input} SET inputs = $2
+                 WHERE workflow_uuid IN (SELECT workflow_uuid FROM bounced)
+             )
+             SELECT workflow_uuid FROM bounced",
+            workflow_input = self.tables.workflow_input,
             workflow_status = self.tables.workflow_status
         ))
         .bind(req.delay_until_ms)
@@ -2911,11 +2984,14 @@ impl StateProvider for PostgresProvider {
                   authenticated_user, assumed_role, authenticated_roles,
                   class_name, config_name, queue_name, queue_partition_key,
                   attributes, created_at, updated_at, workflow_timeout_ms)
-             SELECT $1, $2, name, inputs, serialization, '',
+             SELECT $1, $2, name, {inputs}, serialization, '',
                     COALESCE($3, application_version), application_id, $4, 0,
                     authenticated_user, assumed_role, authenticated_roles,
                     class_name, config_name, $5, $6, attributes, $7, $7, $8
              FROM {workflow_status} WHERE workflow_uuid = $4",
+            inputs = self
+                .tables
+                .payload_col(&self.tables.workflow_input, "inputs"),
             workflow_status = self.tables.workflow_status
         ))
         .bind(new_id)
@@ -3069,8 +3145,9 @@ impl StateProvider for PostgresProvider {
             // Retry inside this transaction; no decision is exposed until the
             // parent checkpoint commits alongside it.
             if let Some(row) = sqlx::query(&format!(
-                "SELECT {SELECT_COLS} FROM {workflow_status}
+                "SELECT {cols} FROM {workflow_status}
                  WHERE queue_name = $1 AND deduplication_id = $2 FOR UPDATE",
+                cols = self.tables.status_cols(true, true),
                 workflow_status = self.tables.workflow_status,
             ))
             .bind(&child.queue_name)
@@ -3649,7 +3726,23 @@ impl StateProvider for PostgresProvider {
             let Some(status_row) = status_row else {
                 return Err(Error::nonexistent_workflow(id));
             };
-            let workflow_status = export_status_map(&status_row);
+            let mut workflow_status = export_status_map(&status_row);
+            // The payload tables win over the status columns, as on every read.
+            let payload = sqlx::query(&format!(
+                "SELECT (SELECT inputs FROM {workflow_input} WHERE workflow_uuid = $1) AS inputs,
+                        (SELECT output FROM {workflow_output} WHERE workflow_uuid = $1) AS output,
+                        (SELECT error FROM {workflow_output} WHERE workflow_uuid = $1) AS error",
+                workflow_input = self.tables.workflow_input,
+                workflow_output = self.tables.workflow_output
+            ))
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            for col in ["inputs", "output", "error"] {
+                if let Some(v) = payload.get::<Option<String>, _>(col) {
+                    workflow_status.insert(col.to_owned(), json!(v));
+                }
+            }
 
             let op_rows = sqlx::query(&format!("SELECT * FROM {operation_outputs} WHERE workflow_uuid = $1 ORDER BY function_id ASC", operation_outputs = self.tables.operation_outputs),
             )
@@ -4266,22 +4359,6 @@ fn row_to_step_aggregate(
             .then(|| row.try_get("max_dur").ok().flatten())
             .flatten(),
     }
-}
-
-/// The column list for `list_workflows`, substituting `NULL` for `inputs` /
-/// `output` the caller opted out of loading, so those payloads are never read.
-fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
-    if filter.load_input && filter.load_output {
-        return std::borrow::Cow::Borrowed(SELECT_COLS);
-    }
-    let mut cols = SELECT_COLS.to_string();
-    if !filter.load_input {
-        cols = cols.replacen("inputs,", "NULL AS inputs,", 1);
-    }
-    if !filter.load_output {
-        cols = cols.replacen("output,", "NULL AS output,", 1);
-    }
-    std::borrow::Cow::Owned(cols)
 }
 
 #[cfg(test)]

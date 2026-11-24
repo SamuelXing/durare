@@ -47,7 +47,7 @@ async fn pg_deletes_steps_without_the_foreign_key() -> Result<()> {
     let result = async {
         let db = PostgresProvider::connect(&url).await?;
         db.init().await?;
-        let pool = sqlx::PgPool::connect(&format!("{url}?options=-csearch_path%3Ddbos")).await?;
+        let pool = common::pg_raw_pool(&url).await;
         sqlx::raw_sql(
             "ALTER TABLE operation_outputs DROP CONSTRAINT operation_outputs_workflow_uuid_fkey",
         )
