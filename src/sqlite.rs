@@ -1970,7 +1970,7 @@ impl StateProvider for SqliteProvider {
         }
         // ON DELETE CASCADE removes each workflow's event / stream rows. Steps
         // and payload rows are deleted by name in the same transaction: neither
-        // has a foreign key in a database a peer has migrated.
+        // has a foreign key.
         let mut qb: QueryBuilder<Sqlite> = if delete_children {
             let mut qb = QueryBuilder::new(
                 "WITH RECURSIVE targets AS (
@@ -3259,7 +3259,7 @@ fn row_to_step(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Result
 }
 
 /// A step insert into `columns` for the run `?1`, written only while the run
-/// exists: peers drop the foreign key that used to refuse it. The values are
+/// exists: migration 112 dropped the foreign key that used to refuse it. The values are
 /// `?1` onwards, one per column. Read the rows it wrote with
 /// [`step_inserted`].
 pub(crate) fn insert_step(columns: &str) -> String {
@@ -3599,7 +3599,7 @@ fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
 #[cfg(test)]
 mod migration_set_tests {
     #[test]
-    fn embedded_migrations_are_plain_and_uniquely_versioned() {
+    fn embedded_migrations_are_well_formed() {
         crate::migrate::check_embedded(&super::MIGRATOR);
     }
 }

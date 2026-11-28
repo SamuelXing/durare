@@ -1,8 +1,8 @@
-//! A run's steps live and die with it without the database's help. Peers at
-//! shared migration 112 or later drop the foreign key from `operation_outputs`
-//! to `workflow_status`, and a durare process sharing that database must
-//! neither leave a deleted run's checkpoints behind nor record new ones for
-//! it: a later run of the same id would replay them.
+//! A run's steps live and die with it without the database's help. Shared
+//! migration 112 drops the foreign key from `operation_outputs` to
+//! `workflow_status`, so durare must neither leave a deleted run's checkpoints
+//! behind nor record new ones for it: a later run of the same id would replay
+//! them.
 use durare::{DurableContext, DurableEngine, Error, Result, StateProvider, WorkflowOptions};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -60,7 +60,7 @@ where
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn pg_deletes_steps_without_the_foreign_key() -> Result<()> {
+async fn pg_deletes_steps_with_their_run() -> Result<()> {
     use durare::PostgresProvider;
     let Ok(base) = std::env::var("DATABASE_URL") else {
         return Ok(());
@@ -69,13 +69,7 @@ async fn pg_deletes_steps_without_the_foreign_key() -> Result<()> {
     let result = async {
         let db = PostgresProvider::connect(&url).await?;
         db.init().await?;
-        let pool = common::pg_raw_pool(&url).await;
-        sqlx::raw_sql(
-            "ALTER TABLE operation_outputs DROP CONSTRAINT operation_outputs_workflow_uuid_fkey",
-        )
-        .execute(&pool)
-        .await?;
-        let pool = &pool;
+        let pool = &common::pg_raw_pool(&url).await;
         let run = |script| async move {
             sqlx::raw_sql(script).execute(pool).await.unwrap();
         };
@@ -145,24 +139,14 @@ async fn pg_deletes_steps_without_the_foreign_key() -> Result<()> {
     result
 }
 
-/// SQLite cannot drop a constraint in place; rebuild the table without it.
-#[cfg(feature = "sqlite")]
-const SQLITE_DROP_KEY: &str = "
-    CREATE TABLE operation_outputs_new AS SELECT * FROM operation_outputs;
-    DROP TABLE operation_outputs;
-    ALTER TABLE operation_outputs_new RENAME TO operation_outputs;
-    CREATE UNIQUE INDEX operation_outputs_key ON operation_outputs (workflow_uuid, function_id);";
-
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn sqlite_deletes_steps_without_the_foreign_key() -> Result<()> {
+async fn sqlite_deletes_steps_with_their_run() -> Result<()> {
     use durare::SqliteProvider;
     let (url, path) = common::temp_db_url("step_delete");
     let db = SqliteProvider::connect(&url).await?;
     db.init().await?;
-    let pool = sqlx::SqlitePool::connect(&url).await?;
-    sqlx::raw_sql(SQLITE_DROP_KEY).execute(&pool).await?;
-    let pool = &pool;
+    let pool = &sqlx::SqlitePool::connect(&url).await?;
     let run = |script| async move {
         sqlx::raw_sql(script).execute(pool).await.unwrap();
     };
@@ -190,7 +174,6 @@ async fn a_deleted_run_stops_executing() -> Result<()> {
     let ds = provider.system_datasource();
     let pool = ds.pool().clone();
     let mut engine = DurableEngine::new(Arc::new(provider)).await?;
-    sqlx::raw_sql(SQLITE_DROP_KEY).execute(&pool).await?;
     sqlx::raw_sql("CREATE TABLE effects (item TEXT NOT NULL)")
         .execute(&pool)
         .await?;

@@ -1774,8 +1774,8 @@ pub trait StateProvider: Send + Sync {
     /// the run was deleted, nothing is written and the call fails with
     /// [`Error::NonExistentWorkflow`](crate::Error::NonExistentWorkflow). This
     /// holds for every method that writes a step row, and an implementation
-    /// must enforce it itself: the system schema's foreign key is absent from
-    /// a database another SDK has migrated. A method that pairs a step with
+    /// must enforce it itself: the system schema has no foreign key from steps
+    /// to runs (shared migration 112 dropped it). A method that pairs a step with
     /// another write (a send, an event, a stream entry) must refuse both; the
     /// default bodies of those methods write the other row first and so leave
     /// it behind, which is one reason to override them.

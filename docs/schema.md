@@ -95,6 +95,8 @@ erDiagram
         BIGINT  started_at_epoch_ms
         BIGINT  completed_at_epoch_ms
         TEXT    serialization
+        TEXT    application_name
+        BIGINT  retention_timestamp
     }
 
     notifications {
@@ -213,13 +215,11 @@ active, not to completed ones.
 
 ## The tables that hang off it
 
-These five each have a foreign key back to `workflow_status` and are deleted
-with it (`ON DELETE CASCADE`). That's why deleting a workflow cleans up all of
-its history in one statement. `operation_outputs` is the exception in a
-database another SDK has taken to shared migration 112, which drops its
-foreign key; durare does not depend on it. It deletes a run's steps by name,
-and every step write checks that the run's row still exists, holding it
-against deletion until the step commits, so a deleted run gains no steps.
+Four of these five have a foreign key back to `workflow_status` and are
+deleted with it (`ON DELETE CASCADE`). `operation_outputs` had one until shared
+migration 112 dropped it. durare deletes a run's steps by name, and every step
+write checks that the run's row still exists, holding it against deletion
+until the step commits, so a deleted run gains no steps.
 
 Two more tables carry no foreign key at all: `workflow_input` and
 `workflow_output` (migration 109), keyed by `workflow_uuid`. The reference SDKs
@@ -305,13 +305,35 @@ dispatcher actually scans — pending, failed, in-flight. It keeps the hot path
 cheap as the table grows.
 
 Partitioned queues have their own partial index,
-`idx_workflow_status_partition_dequeue_v2` (migrations 45 to 47): the in-flight
-index with the partition key ahead of the sort columns and the workflow id
-behind them. The dispatcher lists a queue's active partitions by walking it,
-one seek per distinct key, so the listing costs as much as there are
-partitions, not as much as there is backlog. Migration 45 is a placeholder:
-peers build a first version of the index there and drop it in 47, and durare
-skips building what it would drop in the same transaction.
+`idx_workflow_status_partition_dequeue_v3` (migrations 45 to 47, rebuilt by
+117 and 118): the in-flight index with the partition key ahead of the sort
+columns and the workflow id behind them. The dispatcher lists a queue's active
+partitions by walking it, one seek per distinct key, so the listing costs as
+much as there are partitions, not as much as there is backlog. Migration 45
+is a placeholder: peers build a first version of the index there and drop it
+in 47, and durare skips building what it would drop in the same transaction.
+
+Migrations 110 to 130 bring the schema to where the reference SDKs have it.
+Most of them are for those SDKs' benefit and change nothing durare does:
+
+- `operation_outputs.retention_timestamp` (110, 111) orders a sweep of steps
+  left without a run. That sweep is not part of any SDK. durare leaves the
+  column at its default, the time of the write.
+- Three indexes are rebuilt with `application_name` included (115 to 120): the
+  in-flight index, the partition dequeue index and the step-completion index.
+  Their key columns are unchanged.
+- `notifications.consumed_by_function_id` (121), `workflow_status.creator_xid`
+  (123) and `workflow_status.suspend_key` (126) are columns the reference SDKs
+  write. durare does not write them yet.
+- `enqueue_workflow()` (113) stores the input in `workflow_input`, and
+  `send_message()` (130) also wakes a `SUSPENDED` receiver.
+- A few versions do no work. 122 builds an index that 129 drops, so durare
+  skips it as it skips 45. On SQLite, 111 is skipped because 112 rebuilds the
+  table, and 105 and 113 because they rewrite a SQL function it does not have.
+  The resulting indexes are the same as the reference SDKs'.
+
+Applying them pauses the engine on a database that already holds data; the
+changelog entry for these migrations says for how long and what to do.
 
 **`application_name`** (migrations 100 to 107) lets several applications share
 one system database. Five tables carry it: `workflow_status`, `queues`,
