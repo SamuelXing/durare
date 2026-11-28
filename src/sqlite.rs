@@ -403,47 +403,44 @@ impl SqliteProvider {
     /// Record `step_name` at `(workflow_id, seq)` on `executor` with the given
     /// encoded output, reporting whether this call wrote it; `false` means a
     /// rival already holds the position.
-    async fn checkpoint_on<'e, E: sqlx::SqliteExecutor<'e>>(
+    async fn checkpoint_on(
         &self,
-        executor: E,
+        conn: &mut sqlx::SqliteConnection,
         workflow_id: &str,
         seq: i32,
         step_name: &str,
         output: &str,
         serialization: Option<&str>,
     ) -> Result<bool> {
-        let inserted = sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, serialization,
-                  completed_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
+        let inserted = sqlx::query(&insert_step(
+            "workflow_uuid, function_id, function_name, output, serialization,
+             completed_at_epoch_ms",
+        ))
         .bind(workflow_id)
         .bind(seq)
         .bind(step_name)
         .bind(output)
         .bind(serialization)
         .bind(Utc::now().timestamp_millis())
-        .execute(executor)
+        .execute(&mut *conn)
         .await?
         .rows_affected();
-        Ok(inserted == 1)
+        step_inserted(conn, workflow_id, inserted).await
     }
 
     /// [`checkpoint_on`](Self::checkpoint_on) with a null output: the record a
     /// send or stream write leaves. It does not refresh the workflow's
     /// executor id.
-    async fn checkpoint_null_on<'e, E: sqlx::SqliteExecutor<'e>>(
+    async fn checkpoint_null_on(
         &self,
-        executor: E,
+        conn: &mut sqlx::SqliteConnection,
         workflow_id: &str,
         seq: i32,
         step_name: &str,
     ) -> Result<bool> {
         let output = self.serializer.encode(&Value::Null)?;
         self.checkpoint_on(
-            executor,
+            conn,
             workflow_id,
             seq,
             step_name,
@@ -466,7 +463,7 @@ impl SqliteProvider {
         step_name: &str,
     ) -> Result<Option<sqlx::Transaction<'c, sqlx::Sqlite>>> {
         if self
-            .checkpoint_null_on(&mut *tx, workflow_id, seq, step_name)
+            .checkpoint_null_on(&mut tx, workflow_id, seq, step_name)
             .await?
         {
             return Ok(Some(tx));
@@ -1077,13 +1074,10 @@ impl StateProvider for SqliteProvider {
             Some(e) => (None, Some(e.to_string())),
             None => (Some(self.serializer.encode(&value)?), None),
         };
-        let won = sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, output, error, serialization,
-                  started_at_epoch_ms, completed_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
+        let won = sqlx::query(&insert_step(
+            "workflow_uuid, function_id, function_name, output, error, serialization,
+             started_at_epoch_ms, completed_at_epoch_ms",
+        ))
         .bind(workflow_id)
         .bind(seq)
         .bind(name)
@@ -1094,8 +1088,8 @@ impl StateProvider for SqliteProvider {
         .bind(completed_at_ms)
         .execute(&self.pool)
         .await?
-        .rows_affected()
-            > 0;
+        .rows_affected();
+        let won = step_inserted(&self.pool, workflow_id, won).await?;
 
         // Winning the checkpoint proves this executor is the one actually
         // running the workflow; refresh the row's executor_id so it reports
@@ -1259,13 +1253,10 @@ impl StateProvider for SqliteProvider {
                         // the body's writes and the checkpoint commit atomically.
                         Ok(value) => {
                             let encoded = self.serializer.encode(&value)?;
-                            let won = sqlx::query(
-                                "INSERT INTO operation_outputs
-                                     (workflow_uuid, function_id, function_name, output, serialization,
-                                      started_at_epoch_ms, completed_at_epoch_ms)
-                                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                                 ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-                            )
+                            let won = sqlx::query(&insert_step(
+                                "workflow_uuid, function_id, function_name, output, serialization,
+                                 started_at_epoch_ms, completed_at_epoch_ms",
+                            ))
                             .bind(workflow_id)
                             .bind(seq)
                             .bind(name)
@@ -1275,9 +1266,8 @@ impl StateProvider for SqliteProvider {
                             .bind(Utc::now().timestamp_millis())
                             .execute(&mut *tx)
                             .await?
-                            .rows_affected()
-                                > 0;
-                            if !won {
+                            .rows_affected();
+                            if !step_inserted(&mut *tx, workflow_id, won).await? {
                                 // Another execution checkpointed this step while
                                 // this transaction was open. Committing would
                                 // apply the body's writes a second time: roll
@@ -1358,13 +1348,10 @@ impl StateProvider for SqliteProvider {
                 continue;
             }
             let encoded_err = serialize::encode_error(&self.serializer, &body_err)?;
-            let won = sqlx::query(
-                "INSERT INTO operation_outputs
-                     (workflow_uuid, function_id, function_name, error, serialization,
-                      started_at_epoch_ms, completed_at_epoch_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-            )
+            let won = sqlx::query(&insert_step(
+                "workflow_uuid, function_id, function_name, error, serialization,
+                 started_at_epoch_ms, completed_at_epoch_ms",
+            ))
             .bind(workflow_id)
             .bind(seq)
             .bind(name)
@@ -1374,9 +1361,8 @@ impl StateProvider for SqliteProvider {
             .bind(Utc::now().timestamp_millis())
             .execute(&self.pool)
             .await?
-            .rows_affected()
-                > 0;
-            if !won {
+            .rows_affected();
+            if !step_inserted(&self.pool, workflow_id, won).await? {
                 // Another execution recorded this step first — commonly its
                 // success. An identical recorded failure still surfaces
                 // `body_err`; anything else is the rival's outcome, and this
@@ -1654,7 +1640,7 @@ impl StateProvider for SqliteProvider {
         // replay decodes it the same way.
         let inserted = self
             .checkpoint_on(
-                &mut *tx,
+                &mut tx,
                 workflow_id,
                 seq,
                 step_name,
@@ -2009,8 +1995,10 @@ impl StateProvider for SqliteProvider {
         };
         qb.push(" RETURNING workflow_uuid");
         let mut tx = self.pool.begin().await?;
-        let deleted: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
-        delete_dependents(&mut tx, &deleted).await?;
+        let mut gone: Vec<String> = qb.build_query_scalar().fetch_all(&mut *tx).await?;
+        // The ids asked for go too, so a run already gone leaves nothing.
+        gone.extend_from_slice(ids);
+        delete_dependents(&mut tx, &gone).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2381,18 +2369,17 @@ impl StateProvider for SqliteProvider {
         name: &str,
         child_id: &str,
     ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO operation_outputs
-                 (workflow_uuid, function_id, function_name, child_workflow_id)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
+        let won = sqlx::query(&insert_step(
+            "workflow_uuid, function_id, function_name, child_workflow_id",
+        ))
         .bind(parent_id)
         .bind(seq)
         .bind(name)
         .bind(child_id)
         .execute(&self.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        step_inserted(&self.pool, parent_id, won).await?;
         Ok(())
     }
 
@@ -2460,16 +2447,14 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO operation_outputs (workflow_uuid, function_id, function_name)
-             VALUES (?, ?, ?)
-             ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
-        )
-        .bind(workflow_id)
-        .bind(seq)
-        .bind(name)
-        .execute(&self.pool)
-        .await?;
+        let won = sqlx::query(&insert_step("workflow_uuid, function_id, function_name"))
+            .bind(workflow_id)
+            .bind(seq)
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        step_inserted(&self.pool, workflow_id, won).await?;
         Ok(())
     }
 
@@ -3271,6 +3256,46 @@ fn row_to_step(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Result
             .flatten()
             .map(ms_to_dt),
     })
+}
+
+/// A step insert into `columns` for the run `?1`, written only while the run
+/// exists: peers drop the foreign key that used to refuse it. The values are
+/// `?1` onwards, one per column. Read the rows it wrote with
+/// [`step_inserted`].
+pub(crate) fn insert_step(columns: &str) -> String {
+    let values: Vec<String> = (1..=columns.split(',').count())
+        .map(|n| format!("?{n}"))
+        .collect();
+    format!(
+        "INSERT INTO operation_outputs ({columns})
+         SELECT {values}
+         WHERE EXISTS (SELECT 1 FROM workflow_status WHERE workflow_uuid = ?1)
+         ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
+        values = values.join(", ")
+    )
+}
+
+/// Whether an [`insert_step`] statement that wrote `rows` rows landed;
+/// `false` means a row already holds the position. A run that no longer
+/// exists is [`Error::NonExistentWorkflow`].
+pub(crate) async fn step_inserted<'e, E: sqlx::SqliteExecutor<'e>>(
+    executor: E,
+    workflow_id: &str,
+    rows: u64,
+) -> Result<bool> {
+    if rows > 0 {
+        return Ok(true);
+    }
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workflow_status WHERE workflow_uuid = ?)")
+            .bind(workflow_id)
+            .fetch_one(executor)
+            .await?;
+    if exists {
+        Ok(false)
+    } else {
+        Err(Error::nonexistent_workflow(workflow_id))
+    }
 }
 
 /// Deletes what hangs off the runs `ids` names without a foreign key, for a
