@@ -208,6 +208,14 @@ A run moves through a small set of states:
 ENQUEUED → DELAYED → PENDING → SUCCESS | ERROR | CANCELLED | MAX_RECOVERY_ATTEMPTS_EXCEEDED
 ```
 
+The reference SDKs have one more, `SUSPENDED`, for a run parked in the database
+while its `recv` or sleep waits: `suspend_key` holds the topic and
+`delay_until_epoch_ms` the time it is due, and a pass of theirs re-enqueues it
+then (migrations 126 and 127). durare never parks a run. It treats a parked one
+as active, and every durare send sets the wake time of a receiver parked on its
+topic to zero, as the reference SDKs' sends do, so the message is not left
+waiting for the receiver's timeout.
+
 One bit of history that can trip you up: there used to be a unique constraint on
 `(queue_name, deduplication_id)`, but migration 28 replaced it with a partial
 index (migration 27). So deduplication now only applies to rows that are still
@@ -324,7 +332,7 @@ Most of them are for those SDKs' benefit and change nothing durare does:
   Their key columns are unchanged.
 - `notifications.consumed_by_function_id` (121), `workflow_status.creator_xid`
   (123) and `workflow_status.suspend_key` (126) are columns the reference SDKs
-  write. durare does not write them yet.
+  write. durare does not write them; it reads `suspend_key` when it sends.
 - `enqueue_workflow()` (113) stores the input in `workflow_input`, and
   `send_message()` (130) also wakes a `SUSPENDED` receiver.
 - A few versions do no work. 122 builds an index that 129 drops, so durare

@@ -209,6 +209,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A send wakes a receiver another DBOS SDK parked. With suspend mode on, the
+  reference SDKs park a waiting `recv` in the database as `SUSPENDED` and rely
+  on every sender to make it due. durare's sends only stored the message, so
+  such a receiver got it when its own timeout passed. Every send path on
+  Postgres and SQLite now sets the wake time of the receivers parked on its
+  topics, in the transaction that stores the messages. A send outside a
+  workflow therefore runs in a transaction of its own, three more round trips
+  than before; a send from a workflow gains one statement. `STATUS_SUSPENDED`
+  is exported, and garbage collection never collects a run in that status
+  (#282).
+
 - Runs written by a current reference SDK read correctly. Since shared
   migration 109 those SDKs store a run's input and outcome in the
   `workflow_input` and `workflow_output` tables, and durare read only the

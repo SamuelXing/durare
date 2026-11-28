@@ -9,7 +9,7 @@ use crate::provider::{
     WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, EXPORT_STATUS_BIGINT_COLS,
     EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS, NOTIFICATIONS_CHANNEL, STATUS_CANCELLED,
     STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
+    STATUS_PENDING, STATUS_SUCCESS, STATUS_SUSPENDED, STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
     WORKFLOW_EVENTS_CHANNEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
@@ -425,11 +425,12 @@ pub(crate) fn step_inserted(workflow_id: &str, won: Option<bool>) -> Result<bool
     won.ok_or_else(|| Error::nonexistent_workflow(workflow_id))
 }
 
-/// Opens the transaction that deletes runs. Its second statement must see
-/// what committed while the first waited (see
-/// [`delete_dependents`](PostgresProvider::delete_dependents)), which a
-/// server defaulting to a stricter level would not give it.
-const DELETE_BEGIN: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
+/// Opens a transaction whose second statement must see what committed while
+/// the first waited on a row: the delete of runs (see
+/// [`delete_dependents`](PostgresProvider::delete_dependents)) and the send
+/// (see [`insert_notifications_on`](PostgresProvider::insert_notifications_on)).
+/// A server defaulting to a stricter level would not give it that.
+const READ_COMMITTED_BEGIN: &str = "BEGIN ISOLATION LEVEL READ COMMITTED";
 
 /// Postgres-backed [`StateProvider`], built on sqlx and the canonical DBOS
 /// schema (`workflow_status` / `operation_outputs`).
@@ -1446,19 +1447,23 @@ impl PostgresProvider {
         Ok(())
     }
 
-    /// [`StateProvider::insert_notifications`] on `executor`, so a workflow
-    /// send can share the transaction that checkpoints it.
-    async fn insert_notifications_on<'e, E: sqlx::PgExecutor<'e>>(
+    /// [`StateProvider::insert_notifications`] in the transaction on `conn`,
+    /// so a workflow send can share the one that checkpoints it. The messages
+    /// go in first, and then every receiver another SDK parked on one of
+    /// their topics is made due, for that SDK to re-enqueue. The order and
+    /// the separate statements matter: a receiver parking while the insert
+    /// waits on its row has committed by the time the wake takes its snapshot.
+    async fn insert_notifications_on(
         &self,
-        executor: E,
+        conn: &mut sqlx::PgConnection,
         rows: &[NotificationInsert],
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
         // Serialize up front (fallible), then build one multi-row INSERT — the
-        // whole batch commits or fails together, and each keyed row keeps the
-        // singular path's `{key}::{destination}` at-most-once id.
+        // whole batch commits or fails together, and each keyed row's id is
+        // `{key}::{destination}`, so a repeat conflicts and is dropped.
         let mut prepared = Vec::with_capacity(rows.len());
         for r in rows {
             let message_uuid = match &r.idempotency_key {
@@ -1482,12 +1487,31 @@ impl PostgresProvider {
                 .push_bind(now);
         });
         qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
-        qb.build().execute(executor).await.map_err(|e| {
-            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
-            dests.sort_unstable();
-            dests.dedup();
-            nonexistent_or(e, &dests.join(", "))
-        })?;
+        let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
+        dests.sort_unstable();
+        dests.dedup();
+        qb.build()
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| nonexistent_or(e, &dests.join(", ")))?;
+        // Destinations and topics are matched as two sets, so a batch can wake
+        // a receiver for a topic only another destination was sent; it finds
+        // no message and parks again. The status is tested in SET, as the
+        // reference SDKs do: the row is then re-read when a park commits under
+        // this statement, and the planner is kept off the suspended index.
+        let topics: Vec<&str> = rows.iter().map(|r| r.topic.as_str()).collect();
+        sqlx::query(&format!(
+            "UPDATE {workflow_status}
+             SET delay_until_epoch_ms =
+                 CASE WHEN status = $3 THEN 0 ELSE delay_until_epoch_ms END
+             WHERE workflow_uuid = ANY($1) AND suspend_key = ANY($2)",
+            workflow_status = self.tables.workflow_status
+        ))
+        .bind(&dests)
+        .bind(&topics)
+        .bind(STATUS_SUSPENDED)
+        .execute(conn)
+        .await?;
         Ok(())
     }
 
@@ -2348,33 +2372,20 @@ impl StateProvider for PostgresProvider {
         message: Value,
         idempotency_key: Option<&str>,
     ) -> Result<()> {
-        // A keyed send derives its primary key so a retry conflicts and is
-        // dropped (at-most-once); an unkeyed send gets a fresh id every time.
-        let message_uuid = match idempotency_key {
-            Some(k) => format!("{k}::{destination_id}"),
-            None => uuid::Uuid::new_v4().to_string(),
-        };
-        // The FK on destination_uuid rejects sends to nonexistent workflows; a
-        // duplicate keyed message_uuid is silently ignored.
-        sqlx::query(&format!("INSERT INTO {notifications}
-                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (message_uuid) DO NOTHING", notifications = self.tables.notifications),
-        )
-        .bind(message_uuid)
-        .bind(destination_id)
-        .bind(topic)
-        .bind(self.serializer.encode(&message)?)
-        .bind(self.serializer.name())
-        .bind(Utc::now().timestamp_millis())
-        .execute(&self.pool)
+        self.insert_notifications(&[NotificationInsert::stored(
+            destination_id,
+            topic,
+            message,
+            idempotency_key,
+        )])
         .await
-        .map_err(|e| nonexistent_or(e, destination_id))?;
-        Ok(())
     }
 
     async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
-        self.insert_notifications_on(&self.pool, rows).await
+        let mut tx = self.pool.begin_with(READ_COMMITTED_BEGIN).await?;
+        self.insert_notifications_on(&mut tx, rows).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn send_from_workflow(
@@ -2384,11 +2395,11 @@ impl StateProvider for PostgresProvider {
         step_name: &str,
         rows: &[NotificationInsert],
     ) -> Result<()> {
-        let tx = self.pool.begin().await?;
+        let tx = self.pool.begin_with(READ_COMMITTED_BEGIN).await?;
         let Some(mut tx) = self.claim_step(tx, workflow_id, seq, step_name).await? else {
             return Ok(());
         };
-        self.insert_notifications_on(&mut *tx, rows).await?;
+        self.insert_notifications_on(&mut tx, rows).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2808,7 +2819,7 @@ impl StateProvider for PostgresProvider {
                 workflow_status = self.tables.workflow_status
             )
         };
-        let mut tx = self.pool.begin_with(DELETE_BEGIN).await?;
+        let mut tx = self.pool.begin_with(READ_COMMITTED_BEGIN).await?;
         let mut gone: Vec<String> = sqlx::query_scalar(&sql)
             .bind(ids)
             .fetch_all(&mut *tx)
@@ -2842,13 +2853,13 @@ impl StateProvider for PostgresProvider {
         // `completed_at` and a live status must never be collected.
         let mut total = 0u64;
         loop {
-            let mut tx = self.pool.begin_with(DELETE_BEGIN).await?;
+            let mut tx = self.pool.begin_with(READ_COMMITTED_BEGIN).await?;
             let gone: Vec<String> = sqlx::query_scalar(&format!(
                 "DELETE FROM {workflow_status}
                  WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM {workflow_status}
-                     WHERE completed_at < $1 AND status NOT IN ($2, $3, $4)
-                     LIMIT $5
+                     WHERE completed_at < $1 AND status NOT IN ($2, $3, $4, $5)
+                     LIMIT $6
                  )
                  RETURNING workflow_uuid",
                 workflow_status = self.tables.workflow_status
@@ -2857,6 +2868,7 @@ impl StateProvider for PostgresProvider {
             .bind(STATUS_PENDING)
             .bind(STATUS_ENQUEUED)
             .bind(STATUS_DELAYED)
+            .bind(STATUS_SUSPENDED)
             .bind(crate::provider::GC_BATCH)
             .fetch_all(&mut *tx)
             .await?;

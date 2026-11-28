@@ -81,25 +81,8 @@ async fn pg_deletes_steps_with_their_run() -> Result<()> {
         };
         contract(&db, run, steps).await?;
 
-        // The two writers wait for each other on the run's row: one holds its
-        // transaction open until the other is seen waiting, or for long enough
-        // that a writer which does not wait has finished.
-        let release = |holder: sqlx::Transaction<'static, sqlx::Postgres>| async {
-            for _ in 0..200 {
-                let waiting: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-                     WHERE datname = current_database() AND wait_event_type = 'Lock')",
-                )
-                .fetch_one(pool)
-                .await
-                .unwrap();
-                if waiting {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            holder.commit().await.unwrap();
-        };
+        // The two writers below wait for each other on the run's row.
+        let release = |holder| common::commit_when_awaited(pool, holder);
         run("DELETE FROM operation_outputs; DELETE FROM workflow_status").await;
 
         // A step written while its run is being deleted is refused.
