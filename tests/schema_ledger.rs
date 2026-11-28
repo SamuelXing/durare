@@ -3,11 +3,11 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds. Both dialects end at 109; SQLite
-/// skips 43, 44 and 105, which touch triggers and a function it never had, as
-/// the Go and Python SDKs' SQLite chains do. Versions 48 to 99 are unused.
-const PG_LATEST: i64 = 109;
-const SQLITE_LATEST: i64 = 109;
+/// The newest migration this build embeds. SQLite skips 43, 44, 105, 113 and
+/// 130, which touch triggers and functions it never had, as the Go and Python
+/// SDKs' SQLite chains do. Versions 48 to 99 are unused.
+const PG_LATEST: i64 = 130;
+const SQLITE_LATEST: i64 = 129;
 
 /// The tables migrations 100 to 104 add `application_name` to.
 const APPLICATION_NAME_TABLES: [&str; 5] = [
@@ -17,6 +17,15 @@ const APPLICATION_NAME_TABLES: [&str; 5] = [
     "workflow_schedules",
     "workflow_status",
 ];
+
+/// The columns migrations 110 to 126 add, as `table.column`.
+const PEER_COLUMNS: [&str; 4] = [
+    "notifications.consumed_by_function_id",
+    "operation_outputs.retention_timestamp",
+    "workflow_status.creator_xid",
+    "workflow_status.suspend_key",
+];
+
 /// The keys migrations 106 and 107 put on `application_versions`.
 const VERSION_KEYS: [&str; 2] = [
     "uq_application_versions_owner_version",
@@ -70,7 +79,8 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
             "the notifications trigger stays"
         );
 
-        // Migrations 45 to 47 leave exactly one partition dequeue index.
+        // Migrations 45 to 47, then 117 and 118, leave exactly one partition
+        // dequeue index.
         let partition_indexes: Vec<String> = sqlx::query_scalar(
             "SELECT indexname FROM pg_indexes WHERE schemaname = 'dbos'
              AND indexname LIKE 'idx_workflow_status_partition_dequeue%'",
@@ -79,7 +89,7 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         .await?;
         assert_eq!(
             partition_indexes,
-            ["idx_workflow_status_partition_dequeue_v2"]
+            ["idx_workflow_status_partition_dequeue_v3"]
         );
 
         let owned: Vec<String> = sqlx::query_scalar(
@@ -97,6 +107,23 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         .fetch_all(&pool)
         .await?;
         assert_eq!(keys, VERSION_KEYS);
+
+        let added: Vec<String> = sqlx::query_scalar(
+            "SELECT table_name || '.' || column_name FROM information_schema.columns
+             WHERE table_schema = 'dbos' AND table_name || '.' || column_name = ANY($1)
+             ORDER BY 1",
+        )
+        .bind(PEER_COLUMNS.as_slice())
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(added, PEER_COLUMNS);
+        let step_keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint
+             WHERE conrelid = 'dbos.operation_outputs'::regclass AND contype = 'f'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(step_keys, 0, "migration 112 dropped the steps' foreign key");
 
         // Migration 105 leaves one enqueue_workflow, taking a trailing
         // application_name: omitted, the run is unclaimed; given, it is owned.
@@ -179,12 +206,12 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
 
 
         // A database a newer peer moved ahead is healthy and left alone.
-        sqlx::query("UPDATE dbos.dbos_migrations SET version = 125")
+        sqlx::query("UPDATE dbos.dbos_migrations SET version = 500")
             .execute(&pool)
             .await?;
         provider.init().await?;
         provider.ping().await?;
-        assert_eq!(ledger_rows(&pool).await?, vec![125]);
+        assert_eq!(ledger_rows(&pool).await?, vec![500]);
 
         // A database durare migrated before it kept the shared ledger: only
         // sqlx's table records the version. It is adopted, and nothing is
@@ -236,7 +263,8 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
             .await
     }
     assert_eq!(ledger_rows(&pool).await?, vec![SQLITE_LATEST]);
-    // Migrations 45 to 47 leave exactly one partition dequeue index.
+    // Migrations 45 to 47, then 117 and 118, leave exactly one partition
+    // dequeue index.
     let partition_indexes: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master WHERE type = 'index'
          AND name LIKE 'idx_workflow_status_partition_dequeue%'",
@@ -245,7 +273,7 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     .await?;
     assert_eq!(
         partition_indexes,
-        ["idx_workflow_status_partition_dequeue_v2"]
+        ["idx_workflow_status_partition_dequeue_v3"]
     );
 
     let owned: Vec<String> = sqlx::query_scalar(
@@ -263,6 +291,21 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     .await?;
     assert_eq!(keys, VERSION_KEYS);
 
+    let added: Vec<String> = sqlx::query_scalar(
+        "SELECT m.name || '.' || c.name FROM sqlite_master m JOIN pragma_table_info(m.name) c
+         WHERE m.type = 'table' AND m.name || '.' || c.name IN (SELECT value FROM json_each(?))
+         ORDER BY 1",
+    )
+    .bind(serde_json::to_string(&PEER_COLUMNS)?)
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(added, PEER_COLUMNS);
+    let step_keys: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pragma_foreign_key_list('operation_outputs')")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(step_keys, 0, "migration 112 dropped the steps' foreign key");
+
     // Behind, then caught up: a database left at 47 crosses the unused
     // versions to the newest one.
     let behind = SqlitePool::connect("sqlite::memory:").await?;
@@ -276,16 +319,31 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     )
     .execute(&behind)
     .await?;
+    sqlx::raw_sql(
+        "INSERT INTO workflow_status (workflow_uuid, name, status, created_at, updated_at)
+         VALUES ('kept', 'wf', 'SUCCESS', 1, 1);
+         INSERT INTO operation_outputs (workflow_uuid, function_id, function_name)
+         VALUES ('kept', 0, 'step')",
+    )
+    .execute(&behind)
+    .await?;
     SqliteProvider::from_pool(behind.clone()).init().await?;
     assert_eq!(ledger_rows(&behind).await?, vec![SQLITE_LATEST]);
+    // Migration 112 rebuilds the step table; its rows come along, stamped.
+    let kept: Vec<String> = sqlx::query_scalar(
+        "SELECT workflow_uuid FROM operation_outputs WHERE retention_timestamp > 0",
+    )
+    .fetch_all(&behind)
+    .await?;
+    assert_eq!(kept, ["kept"]);
     behind.close().await;
 
     // Ahead: left alone.
-    sqlx::query("UPDATE dbos_migrations SET version = 125")
+    sqlx::query("UPDATE dbos_migrations SET version = 500")
         .execute(&pool)
         .await?;
     provider.init().await?;
-    assert_eq!(ledger_rows(&pool).await?, vec![125]);
+    assert_eq!(ledger_rows(&pool).await?, vec![500]);
 
     // Legacy sqlx ledger only: adopted, nothing re-applied.
     sqlx::raw_sql(&format!(

@@ -8,6 +8,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Migrations 110 to 130, which bring the system schema level with the Go SDK's.
+  This is schema only: new columns durare does not write yet
+  (`operation_outputs.retention_timestamp`,
+  `notifications.consumed_by_function_id`, `workflow_status.creator_xid` and
+  `suspend_key`), three indexes rebuilt with `application_name` included, the
+  `enqueue_workflow()` and `send_message()` SQL functions as the reference
+  SDKs now define them, and the foreign key from `operation_outputs` to
+  `workflow_status` dropped, which durare stopped depending on in #273 and
+  #279. They land together because the ledger records one version: a database
+  durare had taken to 126 alone would never get 110 to 125 from a peer.
+
+  **Upgrade note.** The migrations run in one transaction, which keeps every
+  lock it takes until it commits. On Postgres it locks `operation_outputs`,
+  `workflow_status` and `notifications` against reads and writes while it
+  builds two indexes over all of `operation_outputs` (111, 119) and four
+  partial indexes over `workflow_status` (115, 117, 127, 128), so workers on
+  the old version stall for that long. A worker writing a step at that moment
+  can also deadlock with the migration; if Postgres aborts the migration, the
+  start fails and can be retried. On SQLite, 112 copies `operation_outputs`.
+  On a database with a large history, stop the old workers or start the new
+  version in a quiet window.
+
 - Migrations 100 to 107, the first of the history every DBOS SDK defines at
   the same version: an `application_name` column on `workflow_status`,
   `queues`, `workflow_schedules`, `application_versions` and

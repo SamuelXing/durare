@@ -377,7 +377,7 @@ impl SystemTables {
 /// A step insert into `columns` of `operation_outputs` for the run `$1`, which
 /// must still exist in `workflow_status`; the values are `$1` onwards, one per
 /// column. The run's row is locked against deletion until the insert commits,
-/// as the foreign key did before peers dropped it, so a delete either sees the
+/// as the foreign key did before migration 112 dropped it, so a delete either sees the
 /// step or stops it. With `refresh`, an insert that lands also sets the run's
 /// `executor_id` to the parameter after the values. The statement yields NULL
 /// when the run is gone and otherwise whether the insert landed; read it with
@@ -4432,7 +4432,7 @@ mod notify_hub_tests {
 mod migration_set_tests {
     #[test]
     fn embedded_migrations_are_plain_and_uniquely_versioned() {
-        crate::migrate::check_embedded(&super::MIGRATOR);
+        crate::migrate::check_embedded(&super::MIGRATOR, &[]);
     }
 }
 
