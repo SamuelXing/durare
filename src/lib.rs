@@ -253,7 +253,7 @@ pub use provider::{
     StateProvider, StepAggregate, StepAggregateQuery, StepInfo, StepListOptions, StepOutcome,
     VersionInfo, WorkflowAggregate, WorkflowAggregateQuery, WorkflowStatus, STATUS_CANCELLED,
     STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR, STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED,
-    STATUS_PENDING, STATUS_SUCCESS,
+    STATUS_PENDING, STATUS_SUCCESS, STATUS_SUSPENDED,
 };
 pub use queue::{RateLimiter, WorkflowQueue};
 pub use replay::{Divergence, ReplayReport};

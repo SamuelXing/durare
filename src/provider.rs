@@ -88,6 +88,10 @@ pub const STATUS_ENQUEUED: &str = "ENQUEUED";
 pub const STATUS_DELAYED: &str = "DELAYED";
 /// Claimed by an executor and currently running.
 pub const STATUS_PENDING: &str = "PENDING";
+/// Parked in the database by another DBOS SDK while it waits, for a message
+/// or a timer, and re-enqueued by that SDK when the wait is over. durare never
+/// parks a run; it treats one as active, and its sends wake a parked receiver.
+pub const STATUS_SUSPENDED: &str = "SUSPENDED";
 /// Terminal: the workflow completed and its output is recorded.
 pub const STATUS_SUCCESS: &str = "SUCCESS";
 /// Terminal: the workflow failed and its error is recorded.
@@ -1081,9 +1085,19 @@ impl NotificationInsert {
         message: Value,
         idempotency_key: Option<&str>,
     ) -> Self {
+        Self::stored(destination_id, wire_topic(topic), message, idempotency_key)
+    }
+
+    /// A row whose `topic` is already what the `notifications` table stores.
+    pub(crate) fn stored(
+        destination_id: &str,
+        topic: &str,
+        message: Value,
+        idempotency_key: Option<&str>,
+    ) -> Self {
         Self {
             destination_id: destination_id.to_owned(),
-            topic: wire_topic(topic).to_owned(),
+            topic: topic.to_owned(),
             message,
             idempotency_key: idempotency_key.map(str::to_owned),
         }
@@ -1922,6 +1936,12 @@ pub trait StateProvider: Send + Sync {
     /// (`{key}::{destination_id}`) and a repeated insert is a silent no-op, so a
     /// caller that retries the send delivers the message **at most once**; `None`
     /// assigns a fresh id, so every send delivers.
+    ///
+    /// A provider over a database shared with other DBOS SDKs also wakes a
+    /// receiver one of them parked: in the same transaction, a run in
+    /// [`STATUS_SUSPENDED`] whose `suspend_key` is this topic gets
+    /// `delay_until_epoch_ms = 0`. The same holds for every method that
+    /// delivers messages.
     async fn insert_notification(
         &self,
         destination_id: &str,
@@ -1935,8 +1955,8 @@ pub trait StateProvider: Send + Sync {
     /// per-row semantics (FK-checked destinations; a keyed row's id derives
     /// from `{key}::{destination_id}`, so a repeat is a silent no-op).
     ///
-    /// The SQL backends deliver the whole batch **atomically** in a single
-    /// multi-row statement: one nonexistent destination rejects the entire
+    /// The SQL backends deliver the whole batch **atomically** in one
+    /// transaction: one nonexistent destination rejects the entire
     /// batch and nothing is delivered. The default implementation inserts
     /// sequentially — same per-row semantics but no all-or-nothing guarantee;
     /// providers that can should override atomically. An empty slice is a

@@ -8,8 +8,8 @@ use crate::provider::{
     StepListOptions, StepOutcome, VersionInfo, WorkflowAggregate, WorkflowAggregateQuery,
     WorkflowStatus, EXPORT_STATUS_BIGINT_COLS, EXPORT_STATUS_BOOL_COLS, EXPORT_STATUS_STR_COLS,
     STATUS_CANCELLED, STATUS_DELAYED, STATUS_ENQUEUED, STATUS_ERROR,
-    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STEP_STATUS_EXPR,
-    STREAM_CLOSED_SENTINEL,
+    STATUS_MAX_RECOVERY_ATTEMPTS_EXCEEDED, STATUS_PENDING, STATUS_SUCCESS, STATUS_SUSPENDED,
+    STEP_STATUS_EXPR, STREAM_CLOSED_SENTINEL,
 };
 use crate::schedule::{ScheduleFilter, ScheduleStatus, ScheduleUpdate, WorkflowSchedule};
 use crate::serialize::{self, Serializer};
@@ -488,19 +488,21 @@ impl SqliteProvider {
         Ok(())
     }
 
-    /// [`StateProvider::insert_notifications`] on `executor`, so a workflow
-    /// send can share the transaction that checkpoints it.
-    async fn insert_notifications_on<'e, E: sqlx::SqliteExecutor<'e>>(
+    /// [`StateProvider::insert_notifications`] in the transaction on `conn`,
+    /// so a workflow send can share the one that checkpoints it. After the
+    /// messages, every receiver another SDK parked on one of their topics is
+    /// made due, for that SDK to re-enqueue.
+    async fn insert_notifications_on(
         &self,
-        executor: E,
+        conn: &mut sqlx::SqliteConnection,
         rows: &[NotificationInsert],
     ) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
         // Serialize up front (fallible), then build one multi-row INSERT — the
-        // whole batch commits or fails together, and each keyed row keeps the
-        // singular path's `{key}::{destination}` at-most-once id.
+        // whole batch commits or fails together, and each keyed row's id is
+        // `{key}::{destination}`, so a repeat conflicts and is dropped.
         let mut prepared = Vec::with_capacity(rows.len());
         for r in rows {
             let message_uuid = match &r.idempotency_key {
@@ -523,12 +525,27 @@ impl SqliteProvider {
                 .push_bind(now);
         });
         qb.push(" ON CONFLICT (message_uuid) DO NOTHING");
-        qb.build().execute(executor).await.map_err(|e| {
-            let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
-            dests.sort_unstable();
-            dests.dedup();
-            nonexistent_or(e, &dests.join(", "))
-        })?;
+        let mut dests: Vec<&str> = rows.iter().map(|r| r.destination_id.as_str()).collect();
+        dests.sort_unstable();
+        dests.dedup();
+        qb.build()
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| nonexistent_or(e, &dests.join(", ")))?;
+        // Destinations and topics are matched as two sets, as on Postgres. The
+        // status can be tested in WHERE here: there is one writer at a time.
+        let topics: Vec<&str> = rows.iter().map(|r| r.topic.as_str()).collect();
+        sqlx::query(
+            "UPDATE workflow_status SET delay_until_epoch_ms = 0
+             WHERE status = ?3
+               AND workflow_uuid IN (SELECT value FROM json_each(?1))
+               AND suspend_key IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(serde_json::to_string(&dests)?)
+        .bind(serde_json::to_string(&topics)?)
+        .bind(STATUS_SUSPENDED)
+        .execute(conn)
+        .await?;
         Ok(())
     }
 
@@ -1546,34 +1563,20 @@ impl StateProvider for SqliteProvider {
         message: Value,
         idempotency_key: Option<&str>,
     ) -> Result<()> {
-        // A keyed send derives its primary key so a retry conflicts and is
-        // dropped (at-most-once); an unkeyed send gets a fresh id every time.
-        let message_uuid = match idempotency_key {
-            Some(k) => format!("{k}::{destination_id}"),
-            None => uuid::Uuid::new_v4().to_string(),
-        };
-        // The FK on destination_uuid rejects sends to nonexistent workflows; a
-        // duplicate keyed message_uuid is silently ignored.
-        sqlx::query(
-            "INSERT INTO notifications
-                 (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT (message_uuid) DO NOTHING",
-        )
-        .bind(message_uuid)
-        .bind(destination_id)
-        .bind(topic)
-        .bind(self.serializer.encode(&message)?)
-        .bind(self.serializer.name())
-        .bind(Utc::now().timestamp_millis())
-        .execute(&self.pool)
+        self.insert_notifications(&[NotificationInsert::stored(
+            destination_id,
+            topic,
+            message,
+            idempotency_key,
+        )])
         .await
-        .map_err(|e| nonexistent_or(e, destination_id))?;
-        Ok(())
     }
 
     async fn insert_notifications(&self, rows: &[NotificationInsert]) -> Result<()> {
-        self.insert_notifications_on(&self.pool, rows).await
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        self.insert_notifications_on(&mut tx, rows).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn send_from_workflow(
@@ -1587,7 +1590,7 @@ impl StateProvider for SqliteProvider {
         let Some(mut tx) = self.claim_step(tx, workflow_id, seq, step_name).await? else {
             return Ok(());
         };
-        self.insert_notifications_on(&mut *tx, rows).await?;
+        self.insert_notifications_on(&mut tx, rows).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2030,7 +2033,7 @@ impl StateProvider for SqliteProvider {
                 "DELETE FROM workflow_status
                  WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM workflow_status
-                     WHERE completed_at < ? AND status NOT IN (?, ?, ?)
+                     WHERE completed_at < ? AND status NOT IN (?, ?, ?, ?)
                      LIMIT ?)
                  RETURNING workflow_uuid",
             )
@@ -2038,6 +2041,7 @@ impl StateProvider for SqliteProvider {
             .bind(STATUS_PENDING)
             .bind(STATUS_ENQUEUED)
             .bind(STATUS_DELAYED)
+            .bind(STATUS_SUSPENDED)
             .bind(crate::provider::GC_BATCH)
             .fetch_all(&mut *tx)
             .await?;

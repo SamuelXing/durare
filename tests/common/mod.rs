@@ -100,6 +100,30 @@ pub async fn pg_raw_pool(url: &str) -> PgPool {
         .expect("connect to the hermetic database")
 }
 
+/// Commit `holder` once another session of this database is seen waiting on a
+/// lock, or after long enough that a session which does not wait has finished.
+/// For tests of two writers that must wait for each other on a row.
+#[cfg(feature = "postgres")]
+pub async fn commit_when_awaited(pool: &PgPool, holder: sqlx::Transaction<'_, sqlx::Postgres>) {
+    for _ in 0..200 {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read lock waits");
+        if waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    holder
+        .commit()
+        .await
+        .expect("commit the holding transaction");
+}
+
 /// Best-effort teardown; `FORCE` terminates any connection a pool has not
 /// finished closing yet (Postgres 13+).
 #[cfg(feature = "postgres")]
