@@ -3599,8 +3599,7 @@ fn list_select_cols(filter: &ListFilter) -> std::borrow::Cow<'static, str> {
 #[cfg(test)]
 mod migration_set_tests {
     #[test]
-    fn embedded_migrations_are_plain_and_uniquely_versioned() {
-        // Postgres-only: these rewrite SQL functions SQLite does not have.
-        crate::migrate::check_embedded(&super::MIGRATOR, &[105, 113]);
+    fn embedded_migrations_are_well_formed() {
+        crate::migrate::check_embedded(&super::MIGRATOR);
     }
 }

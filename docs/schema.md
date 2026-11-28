@@ -309,10 +309,9 @@ Partitioned queues have their own partial index,
 117 and 118): the in-flight index with the partition key ahead of the sort
 columns and the workflow id behind them. The dispatcher lists a queue's active
 partitions by walking it, one seek per distinct key, so the listing costs as
-much as there are partitions, not as much as there is backlog. Migrations 45
-and 122 are placeholders: peers build an index there and drop it a few
-versions later, and durare skips building what it would drop in the same
-transaction.
+much as there are partitions, not as much as there is backlog. Migration 45
+is a placeholder: peers build a first version of the index there and drop it
+in 47, and durare skips building what it would drop in the same transaction.
 
 Migrations 110 to 130 bring the schema to where the reference SDKs have it.
 Most of them are for those SDKs' benefit and change nothing durare does:
@@ -328,6 +327,10 @@ Most of them are for those SDKs' benefit and change nothing durare does:
   write. durare does not write them yet.
 - `enqueue_workflow()` (113) stores the input in `workflow_input`, and
   `send_message()` (130) also wakes a `SUSPENDED` receiver.
+- A few versions do no work. 122 builds an index that 129 drops, so durare
+  skips it as it skips 45. On SQLite, 111 is skipped because 112 rebuilds the
+  table, and 105 and 113 because they rewrite a SQL function it does not have.
+  The resulting indexes are the same as the reference SDKs'.
 
 Applying them pauses the engine on a database that already holds data; the
 changelog entry for these migrations says for how long and what to do.

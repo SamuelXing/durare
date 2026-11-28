@@ -60,7 +60,7 @@ where
 
 #[cfg(feature = "postgres")]
 #[tokio::test]
-async fn pg_deletes_steps_without_the_foreign_key() -> Result<()> {
+async fn pg_deletes_steps_with_their_run() -> Result<()> {
     use durare::PostgresProvider;
     let Ok(base) = std::env::var("DATABASE_URL") else {
         return Ok(());
@@ -141,7 +141,7 @@ async fn pg_deletes_steps_without_the_foreign_key() -> Result<()> {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn sqlite_deletes_steps_without_the_foreign_key() -> Result<()> {
+async fn sqlite_deletes_steps_with_their_run() -> Result<()> {
     use durare::SqliteProvider;
     let (url, path) = common::temp_db_url("step_delete");
     let db = SqliteProvider::connect(&url).await?;

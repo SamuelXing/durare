@@ -1,5 +1,5 @@
--- Migration 111: index the step sweep order. Built inside the migration
--- transaction, which holds off step writes for one scan of the table.
+-- Migration 111: Index the step sweep order. Built inside the migration
+-- transaction, with the table locked for one scan of it.
 
 CREATE INDEX IF NOT EXISTS "idx_operation_outputs_retention"
     ON "operation_outputs" ("retention_timestamp");

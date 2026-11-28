@@ -1,4 +1,5 @@
--- Rebuild without the workflow_status foreign key; SQLite cannot drop a constraint in place.
+-- Migration 112: rebuild operation_outputs without the workflow_status
+-- foreign key; SQLite cannot drop a constraint in place.
 
 CREATE TABLE operation_outputs_new (
     workflow_uuid TEXT NOT NULL,

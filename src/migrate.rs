@@ -32,15 +32,13 @@ pub(crate) const UNRECORDED_SCHEMA: &str = "dbos schema exists but records no mi
 /// misrecorded. And no migration sits between durare's own history, which
 /// ended at 47, and the shared one, which starts at 100: a database already at
 /// 100 or later would skip it without an error. The shared history itself has
-/// no holes except `absent`, the versions that do nothing in this dialect: the
-/// ledger is one high-water mark, so embedding 126 without 121 would stop a
-/// peer that arrives later from ever applying 121. Checked by each backend's
-/// unit tests.
+/// no holes: the ledger is one high-water mark, so embedding 126 without 121
+/// would stop a peer that arrives later from ever applying 121. A version
+/// that does nothing in a dialect is a file that does nothing. Checked by each
+/// backend's unit tests.
 #[cfg(test)]
-pub(crate) fn check_embedded(migrator: &Migrator, absent: &[i64]) {
-    let shared: Vec<i64> = (100..=latest(migrator))
-        .filter(|v| !absent.contains(v))
-        .collect();
+pub(crate) fn check_embedded(migrator: &Migrator) {
+    let shared: Vec<i64> = (100..=latest(migrator)).collect();
     let embedded: Vec<i64> = pending(migrator, 99).map(|m| m.version).collect();
     assert_eq!(embedded, shared, "the shared history has a hole");
     let mut versions = std::collections::HashSet::new();

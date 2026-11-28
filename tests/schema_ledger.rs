@@ -3,9 +3,9 @@
 use durare::{Result, StateProvider};
 mod common;
 
-/// The newest migration this build embeds. SQLite skips 43, 44, 105, 113 and
-/// 130, which touch triggers and functions it never had, as the Go and Python
-/// SDKs' SQLite chains do. Versions 48 to 99 are unused.
+/// The newest migration this build embeds. SQLite ends one short: 130
+/// rewrites a SQL function, which it does not have. Versions 48 to 99 are
+/// unused.
 const PG_LATEST: i64 = 130;
 const SQLITE_LATEST: i64 = 129;
 
@@ -16,6 +16,39 @@ const APPLICATION_NAME_TABLES: [&str; 5] = [
     "queues",
     "workflow_schedules",
     "workflow_status",
+];
+
+/// Every index a database at the newest version has besides those behind a
+/// primary key or a unique constraint, derived from the Go SDK's migrations:
+/// each index they create that none of them drops. Several migrations here
+/// skip building an index a later one removes, which is only right if the
+/// result is this set. SQLite has all but the GIN index on `attributes`.
+const INDEXES: [&str; 25] = [
+    "idx_application_versions_owner_timestamp",
+    "idx_application_versions_timestamp",
+    "idx_operation_outputs_completed_at_function_name_v2",
+    "idx_operation_outputs_retention",
+    "idx_workflow_input_retention",
+    "idx_workflow_output_retention",
+    "idx_workflow_status_attributes",
+    "idx_workflow_status_completed_at",
+    "idx_workflow_status_deadline_v2",
+    "idx_workflow_status_delayed",
+    "idx_workflow_status_failed",
+    "idx_workflow_status_forked_from",
+    "idx_workflow_status_in_flight_v2",
+    "idx_workflow_status_parent_workflow_id",
+    "idx_workflow_status_partition_dequeue_v3",
+    "idx_workflow_status_pending",
+    "idx_workflow_status_rate_limited",
+    "idx_workflow_status_schedule_name",
+    "idx_workflow_status_started_at",
+    "idx_workflow_status_suspended",
+    "idx_workflow_topic",
+    "uq_application_versions_owner_version",
+    "uq_application_versions_unclaimed_version",
+    "uq_workflow_status_dedup_id",
+    "workflow_status_created_at_index",
 ];
 
 /// The columns migrations 110 to 126 add, as `table.column`.
@@ -124,6 +157,15 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         .fetch_one(&pool)
         .await?;
         assert_eq!(step_keys, 0, "migration 112 dropped the steps' foreign key");
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname::text FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+             WHERE c.relnamespace = 'dbos'::regnamespace
+               AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
+             ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(indexes, INDEXES);
 
         // Migration 105 leaves one enqueue_workflow, taking a trailing
         // application_name: omitted, the run is unclaimed; given, it is owned.
@@ -305,6 +347,16 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
             .fetch_one(&pool)
             .await?;
     assert_eq!(step_keys, 0, "migration 112 dropped the steps' foreign key");
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await?;
+    let expected: Vec<&str> = INDEXES
+        .into_iter()
+        .filter(|name| *name != "idx_workflow_status_attributes")
+        .collect();
+    assert_eq!(indexes, expected);
 
     // Behind, then caught up: a database left at 47 crosses the unused
     // versions to the newest one.

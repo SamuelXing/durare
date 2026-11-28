@@ -1,3 +1,3 @@
--- Duplicate of idx_workflow_topic, which covers the same columns in the same order.
+-- Migration 114: drop idx_notifications, a duplicate of idx_workflow_topic.
 
 DROP INDEX IF EXISTS "idx_notifications";
